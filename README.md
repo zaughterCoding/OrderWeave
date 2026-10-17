@@ -1,6 +1,6 @@
 # AgentEcommerce
 
-基于 Anthropic 兼容协议与多路融合的电商客服 Agent 项目。当前提供工程基础、意图识别、多 Agent 编排、Skills、ChromaDB 知识库检索与分层记忆；监控评测及 HTTP/CLI 接口在后续阶段加入。
+基于 Anthropic 兼容协议与多路融合的电商客服 Agent 项目。当前提供工程基础、意图识别、多 Agent 编排、Skills、ChromaDB 知识库检索、分层记忆、性能监控与回复评测；HTTP/CLI 接口在后续阶段加入。
 
 ## 环境要求
 
@@ -36,11 +36,20 @@ docker compose -f compose.yml stop
 - 摘要生成或情景记忆写入失败时保留原消息，不会静默丢失。
 - Embedding 缓存默认位于项目内 `data/chroma_cache`，可用 `CHROMA_EMBEDDING_CACHE` 覆盖。
 
+## 监控与评测
+
+- `PerformanceMonitor` 定时读取 `AgentOrchestrator.get_stats()` 与 `MCPToolManager.get_stats()`，按阈值产生告警，并把成功率与平均延迟折算为路由惩罚回传给编排器。
+- 告警可选通过 webhook 发送，指标可选通过 Prometheus 暴露；自动化测试不会向外部发送 webhook。
+- `EndToEndEvaluator` 计算意图识别 Accuracy／Macro-F1，并使用 LLM-as-Judge 评估相关性、准确性、完整性与有用性。
+- Judge 解析失败的结果记录 `GRADER_ERROR`、`passed=False` 和空 `scores`；报告保留结果总数并统计 `grader_errors`，平均值只使用有效评分。
+- `baseline_path` 只读；每次评测写入新的 `report_<timestamp>.json`，不会覆盖基线或已有报告。
+- 工具平均延迟只对实际记录延迟的调用求平均，样本数通过 `latency_samples` 暴露。
+
 ## 测试
 
 ```powershell
 # 单元测试，不访问网络
-uv run --locked --offline pytest tests/test_memory.py tests/test_retrieval.py tests/test_agents.py -q
+uv run --locked --offline pytest tests/test_memory.py tests/test_retrieval.py tests/test_agents.py tests/test_monitor_eval.py -q
 
 # 真实 ChromaDB 集成测试，需先启动 chromadb
 uv run --locked --offline pytest tests/integration/test_retrieval.py -q
@@ -66,6 +75,11 @@ uv run --locked --offline pytest tests -q
 - `CHROMA_HOST`、`CHROMA_PORT`：独立 ChromaDB 地址
 - `CHROMA_PERSIST_DIRECTORY`：ChromaDB 服务不可用时的本地回退目录
 - `CHROMA_EMBEDDING_CACHE`：Embedding 模型缓存目录（可选，默认项目内 `data/chroma_cache`）
+- `MONITOR_INTERVAL_S`：监控采集间隔秒数（可选，默认 10）
+- `MONITOR_WEBHOOK_URL`：告警 webhook 地址（可选，留空不发送）
+- `MONITOR_PROMETHEUS_PORT`：Prometheus 暴露端口（可选，留空不启动）
+- `EVAL_BASELINE_PATH`：只读评测基线文件（可选）
+- `EVAL_REPORT_DIR`：评测报告目录（可选；设置基线时默认基线同级的 `reports/`）
 
 真实模型调用会产生费用，自动化测试不读取这些配置。
 
@@ -79,11 +93,13 @@ uv run --locked --offline pytest tests -q
 - `mcp/tool_manager.py`：工具注册、查询改写、并行召回、去重、LLM 重排、TTL 缓存、熔断与降级。降级结果标记 `degraded=True` 且不计为成功命中。
 - `mcp/knowledge_base.py`：ChromaDB 文档切片、幂等导入与语义检索；返回文档 ID、标题、内容、相似度与片段序号。
 - `memory/conversation_memory.py`：Redis 工作记忆、会话摘要、ChromaDB 情景记忆与用户画像；压缩与追加按会话加锁。
+- `monitor/performance_monitor.py`：Agent／工具统计采样、Z-score 异常检测、阈值告警、路由惩罚反馈、优化建议、Prometheus 与 webhook。
+- `evaluation/evaluator.py`：意图 Accuracy／Macro-F1、LLM-as-Judge 对话评分、回归检测、只读基线与独立报告文件。
 - `compose.yml`：独立的本地 Redis 与 ChromaDB 服务。
 - `tests/`：单元测试与真实 Redis／ChromaDB 集成测试。
 
 ## 当前限制
 
-- 尚未提供 HTTP API、监控与评测。
-- 真实模型未验证；自动化测试只使用 Fake 客户端生成摘要与画像。
+- 尚未提供 HTTP API 与 CLI 接口，监控与评测尚未接入服务启动流程。
+- 真实模型未验证；自动化测试只使用 Fake 客户端生成摘要、画像与 Judge 评分。
 - 记忆压缩与追加只在单进程内互斥，不提供分布式锁。

@@ -48,6 +48,7 @@ class ToolStats:
     success: int = 0
     failed: int = 0
     total_latency_ms: float = 0.0
+    latency_samples: int = 0
     consecutive_fails: int = 0
 
     @property
@@ -56,7 +57,10 @@ class ToolStats:
 
     @property
     def avg_latency_ms(self) -> float:
-        return self.total_latency_ms / self.total if self.total else 0.0
+        """Average over calls that actually recorded a latency sample."""
+        if not self.latency_samples:
+            return 0.0
+        return self.total_latency_ms / self.latency_samples
 
 
 class CircuitBreaker:
@@ -179,6 +183,7 @@ class MCPToolManager:
             tool.stats.success += 1
             tool.stats.consecutive_fails = 0
             tool.stats.total_latency_ms += latency
+            tool.stats.latency_samples += 1
             tool.breaker.record_success()
 
             reranked = False
@@ -473,6 +478,7 @@ class MCPToolManager:
                 "total": tool.stats.total,
                 "success_rate": round(tool.stats.success_rate, 3),
                 "avg_latency_ms": round(tool.stats.avg_latency_ms, 1),
+                "latency_samples": tool.stats.latency_samples,
                 "consecutive_fails": tool.stats.consecutive_fails,
                 "circuit_state": tool.breaker.state.value,
             }
