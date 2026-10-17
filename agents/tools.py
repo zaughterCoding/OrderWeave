@@ -1,13 +1,12 @@
-"""Agent tool definitions and implementations.
+"""Agent 工具的定义与实现。
 
-All agent tools live here. The orchestrator only manages tool whitelists,
-executes returned tool_use blocks, and sends results back to the model.
+所有 Agent 工具都集中在此。编排器只负责管理工具白名单、执行模型返回的
+tool_use 块，并把结果回传给模型。
 
-Tools stay deterministic and testable. They cover current-request inspection,
-technical guidance, billing field checks, handoff summaries and shared RAG.
+工具保持确定性和可测试性，覆盖当前请求查看、技术指导、账单字段检查、
+交接摘要和共享 RAG。
 
-Order lookup, refund execution and billing changes require real business
-system authorization and are not simulated here.
+订单查询、退款执行和账单变更需要真实业务系统授权，这里不做模拟。
 """
 
 from __future__ import annotations
@@ -24,7 +23,7 @@ AgentToolHandler = Callable[["Request", Dict[str, Any]], Union[Any, Awaitable[An
 
 @dataclass(frozen=True)
 class AgentToolSpec:
-    """Definition and handler for a tool visible to an agent."""
+    """Agent 可见工具的定义与处理函数。"""
 
     name: str
     description: str
@@ -39,7 +38,7 @@ def make_tool(
     handler: AgentToolHandler,
     required: Optional[List[str]] = None,
 ) -> AgentToolSpec:
-    """Create an agent tool with a JSON Schema."""
+    """按 JSON Schema 创建 Agent 工具。"""
     return AgentToolSpec(
         name=name,
         description=description,
@@ -54,7 +53,7 @@ def make_tool(
 
 
 def inspect_request_context(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """General tool: return a redacted snapshot of the current request."""
+    """通用工具：返回当前请求的脱敏快照。"""
     return {
         "intent": req.intent.value if req.intent else None,
         "intent_group": req.intent_group,
@@ -67,7 +66,7 @@ def inspect_request_context(req: Request, args: Dict[str, Any]) -> Dict[str, Any
 
 
 def suggest_required_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """General tool: list the fields that the next turn only needs to ask for."""
+    """通用工具：列出下一轮只需向用户询问的字段。"""
     intent = req.intent.value if req.intent else "other"
     fields: List[str] = []
     if intent in {"order_status", "logistics"}:
@@ -86,7 +85,7 @@ def suggest_required_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any
 
 
 def lookup_error_code(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Technical tool: explain common error codes without claiming log access."""
+    """技术工具：解释常见错误码，但不声称能访问日志。"""
     code = str(args.get("error_code", "")).upper().strip()
     mapping = {
         "401": ("认证失败", ["确认 Token/API Key 是否过期", "确认请求时间戳和签名", "确认账号登录状态"]),
@@ -107,7 +106,7 @@ def lookup_error_code(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_diagnostic_plan(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Technical tool: produce a low-risk diagnostic sequence."""
+    """技术工具：生成低风险的排查步骤。"""
     environment = str(args.get("environment", "unknown"))[:80]
     reproduced = bool(args.get("reproduced", False))
     steps = [
@@ -125,7 +124,7 @@ def build_diagnostic_plan(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def check_billing_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Billing tool: check whether required verification fields are present."""
+    """账单工具：检查必需的核验字段是否齐全。"""
     fields = {
         "order_id": bool(req.entities.get("order_id")),
         "amount": bool(req.entities.get("amount")),
@@ -141,7 +140,7 @@ def check_billing_fields(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def compare_amounts(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Billing tool: only computes the difference between user-provided amounts."""
+    """账单工具：只计算用户提供金额之间的差值。"""
     try:
         first = float(args["amount_a"])
         second = float(args["amount_b"])
@@ -157,7 +156,7 @@ def compare_amounts(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
-    """Escalation tool: build a structured summary for a human agent."""
+    """升级工具：为人工客服生成结构化摘要。"""
     return {
         "request_id": req.request_id,
         "reason": str(args.get("reason", "需要人工客服继续核验"))[:120],
@@ -169,7 +168,7 @@ def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]
 
 
 def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
-    """Build the RAG tools shared by every agent."""
+    """构造所有 Agent 共用的 RAG 工具。"""
 
     async def search_knowledge_base(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         query = str(args.get("query") or req.message or "").strip()

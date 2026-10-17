@@ -1,8 +1,8 @@
-"""Tool execution with query rewriting, reranking, caching and fallback.
+"""带查询改写、重排、缓存和降级的工具执行。
 
-The manager handles the retrieval optimization chain:
-query rewriting -> parallel recall -> merge/deduplicate -> rerank -> top-k.
-It is an in-process tool registry, not an MCP protocol server.
+管理器负责检索优化链：
+查询改写 -> 并行召回 -> 合并去重 -> 重排 -> top-k。
+它是进程内工具注册表，不是 MCP 协议服务器。
 """
 import asyncio
 import hashlib
@@ -36,13 +36,13 @@ class ToolResult:
     cached: bool = False
     latency_ms: float = 0.0
     reranked: bool = False
-    # True when data came from a fallback path and must not count as a real hit.
+    # 数据来自降级路径时为 True，不能算作真实命中。
     degraded: bool = False
 
 
 @dataclass
 class ToolStats:
-    """Runtime counters exposed to the monitor."""
+    """暴露给监控的运行时计数器。"""
 
     total: int = 0
     success: int = 0
@@ -57,14 +57,14 @@ class ToolStats:
 
     @property
     def avg_latency_ms(self) -> float:
-        """Average over calls that actually recorded a latency sample."""
+        """只对实际记录了延迟样本的调用求平均。"""
         if not self.latency_samples:
             return 0.0
         return self.total_latency_ms / self.latency_samples
 
 
 class CircuitBreaker:
-    """Three-state circuit breaker: CLOSED -> OPEN -> HALF_OPEN -> CLOSED."""
+    """三态熔断器：CLOSED -> OPEN -> HALF_OPEN -> CLOSED。"""
 
     def __init__(self, failure_threshold: int = 5, recovery_s: float = 60.0):
         self.threshold = failure_threshold
@@ -111,7 +111,7 @@ class Tool:
 
 
 class MCPToolManager:
-    """In-process tool registry with cache, circuit breaker and fallback."""
+    """带缓存、熔断和降级的进程内工具注册表。"""
 
     def __init__(
         self,
@@ -145,7 +145,7 @@ class MCPToolManager:
         use_cache: bool = True,
         rerank_top_k: int = 0,
     ) -> ToolResult:
-        """Execute a tool through cache, breaker, handler, rerank and fallback."""
+        """依次经过缓存、熔断、处理函数、重排和降级来执行工具。"""
         tool = self._tools.get(name)
         if not tool:
             return ToolResult(success=False, data=None, tool_name=name, error=f"工具不存在: {name}")
@@ -191,7 +191,7 @@ class MCPToolManager:
                 query = params.get("query", "")
                 data, reranked = await self._rerank(query, data, rerank_top_k)
 
-            # Cache the final result so a later hit cannot bypass reranking.
+            # 缓存最终结果，避免后续命中绕过重排。
             if tool.cache_ttl > 0:
                 self._set_cache(
                     name,
@@ -231,7 +231,7 @@ class MCPToolManager:
         context: Optional[Dict[str, Any]],
         error: str,
     ) -> ToolResult:
-        """Return a degraded result; fallback content is never a successful hit."""
+        """返回降级结果；降级内容永远不算成功命中。"""
         if tool.fallback is None:
             return ToolResult(
                 success=False,
@@ -267,7 +267,7 @@ class MCPToolManager:
         params: Dict[str, Any],
         context: Optional[Dict[str, Any]],
     ) -> Any:
-        """Run async handlers directly and sync handlers in a worker thread."""
+        """异步处理函数直接执行，同步处理函数放入线程池。"""
         if inspect.iscoroutinefunction(tool.handler):
             return await tool.handler(params, context)
         result = await asyncio.to_thread(tool.handler, params, context)
@@ -276,7 +276,7 @@ class MCPToolManager:
         return result
 
     async def rewrite_query(self, query: str, n: int = 3) -> List[str]:
-        """Expand a query into n sub-queries while keeping the original query."""
+        """把查询扩展为 n 个子查询，同时保留原查询。"""
         prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
 要求：每个子查询角度不同，覆盖原始问题的不同方面。
 原始查询: "{query}"
@@ -306,7 +306,7 @@ class MCPToolManager:
         top_k: int = 5,
         context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
-        """Run rewrite, parallel recall, merge/deduplicate and rerank."""
+        """执行改写、并行召回、合并去重和重排。"""
         sub_queries = await self.rewrite_query(query, n=3)
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
@@ -329,11 +329,10 @@ class MCPToolManager:
                 degraded = True
                 continue
             degraded = degraded or result.degraded
-            # Fallback payloads are informative text, not retrieval hits.
+            # 降级载荷只是提示文本，不是检索命中。
             if result.success and not result.degraded and isinstance(result.data, list):
                 for item in result.data:
-                    # Scores differ per sub-query, so identity must exclude
-                    # dynamic fields; keep the highest score for one fragment.
+                    # score 是动态字段，不能进入身份键；同一片段只保留最高分。
                     key = self._fragment_key(item)
                     index = seen.get(key)
                     if index is None:
@@ -363,7 +362,7 @@ class MCPToolManager:
 
     @staticmethod
     def _fragment_key(item: Any) -> Tuple[str, ...]:
-        """Identify a fragment by stable fields only."""
+        """只用稳定字段标识一个片段。"""
         if isinstance(item, dict):
             fragment_id = item.get("id")
             if fragment_id not in (None, ""):
@@ -391,7 +390,7 @@ class MCPToolManager:
         items: List[Any],
         top_k: int,
     ) -> Tuple[List[Any], bool]:
-        """Rerank items with the LLM; the second value reports whether it ran."""
+        """用 LLM 对结果重排；第二个返回值表示是否实际执行了重排。"""
         if len(items) <= top_k:
             return items, False
 
@@ -474,7 +473,7 @@ class MCPToolManager:
     }
 
     def _validate_params(self, tool: Tool, params: Dict[str, Any]) -> None:
-        """Validate required and typed fields from the tool JSON Schema."""
+        """按工具的 JSON Schema 校验必填字段和类型。"""
         schema = tool.schema
         required = schema.get("required", [])
         properties = schema.get("properties", {})
@@ -495,7 +494,7 @@ class MCPToolManager:
 
     @staticmethod
     def _clean_text(value: Any) -> str:
-        """Remove surrogate characters that break LLM request encoding."""
+        """移除会破坏 LLM 请求编码的代理项字符。"""
         if value is None:
             return ""
         if not isinstance(value, str):

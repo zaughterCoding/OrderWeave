@@ -1,8 +1,7 @@
-"""End-to-end assistant evaluation.
+"""端到端的助手评测。
 
-Intent recognition is measured with accuracy and macro-F1. Dialog quality is
-scored by an LLM judge. Judge failures are recorded as grader errors and never
-enter score averages or the baseline file.
+意图识别用准确率和 macro-F1 衡量。对话质量由 LLM Judge 打分。Judge 失败
+记录为评分器错误，绝不进入分数均值或基线文件。
 """
 import json
 import logging
@@ -29,7 +28,7 @@ class IntentTestCase:
 
 @dataclass
 class QualityScores:
-    """LLM-as-Judge score for one response."""
+    """单个响应的 LLM-as-Judge 评分。"""
 
     relevance: float
     accuracy: float
@@ -75,7 +74,7 @@ class EvalReport:
 
 
 class LLMJudge:
-    """Score one response on relevance, accuracy, completeness and helpfulness."""
+    """从相关性、准确性、完整性和有用性四个维度给响应打分。"""
 
     JUDGE_PROMPT = """你是一个客服质量评估专家。请对以下客服响应进行评分。
 
@@ -153,7 +152,7 @@ Agent 响应: {response}
 
     @staticmethod
     def _clean_text(value: Any) -> str:
-        """Remove surrogate characters before sending the judge prompt."""
+        """发送 Judge prompt 前移除代理项字符。"""
         if value is None:
             return ""
         if not isinstance(value, str):
@@ -162,7 +161,7 @@ Agent 响应: {response}
 
 
 class IntentEvaluator:
-    """Measure intent recognition accuracy and macro-F1."""
+    """衡量意图识别的准确率和 macro-F1。"""
 
     def __init__(self, recognizer: IntentRecognizer):
         self._recognizer = recognizer
@@ -237,7 +236,7 @@ class IntentEvaluator:
 
 
 class EndToEndEvaluator:
-    """Run intent and dialog evaluation and save each report separately."""
+    """运行意图与对话评测，并分别保存报告。"""
 
     PASS_THRESHOLD = 0.75
 
@@ -277,7 +276,7 @@ class EndToEndEvaluator:
         intent_cases: Optional[List[IntentTestCase]] = None,
         dialog_cases: Optional[List[Dict[str, Any]]] = None,
     ) -> EvalReport:
-        """Run the configured evaluation cases and return one report."""
+        """运行配置的评测用例并返回一份报告。"""
         results: List[EvalResult] = []
         all_scores: Dict[str, List[float]] = {
             "relevance": [],
@@ -356,7 +355,7 @@ class EndToEndEvaluator:
     async def _evaluate_dialog_case(
         self, case: Dict[str, Any], case_idx: int
     ) -> List[EvalResult]:
-        """Evaluate one single-turn or multi-turn dialog case."""
+        """评测一个单轮或多轮对话用例。"""
         from agents.agent_orchestrator import Request as OrcRequest
 
         questions = self._dialog_turns(case)
@@ -455,7 +454,7 @@ class EndToEndEvaluator:
         return "[评测多轮历史]\n" + "\n".join(lines)
 
     def _detect_regressions(self, current: Dict[str, float]) -> List[str]:
-        """Compare with the read-only baseline, or the previous run if none exists."""
+        """与只读基线比较；没有基线时与上一次运行比较。"""
         previous = self._baseline
         if previous is None and self._history:
             previous = self._history[-1]
@@ -533,7 +532,7 @@ class EndToEndEvaluator:
             return None
 
     def _save_report(self, report: EvalReport) -> None:
-        """Write a new report file without touching the baseline."""
+        """写入新的报告文件，不改动基线。"""
         if self._report_dir is None:
             return
         try:

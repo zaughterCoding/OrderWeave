@@ -1,7 +1,7 @@
-"""Integration coverage for the HTTP API and interactive CLI.
+"""HTTP API 与交互式 CLI 的集成测试。
 
-The test uses a deterministic fake model with the real independent Redis and
-ChromaDB services. It never calls a paid model endpoint.
+测试使用确定性 Fake 模型，配合真实的独立 Redis 和 ChromaDB 服务，
+绝不调用付费模型端点。
 """
 import asyncio
 import builtins
@@ -50,7 +50,7 @@ def _has_tool_result(kwargs):
 
 
 class FakeMessages:
-    """Reply by prompt shape so every component can share one fake client."""
+    """按 prompt 形态回复，使各组件可共用一个 Fake 客户端。"""
 
     def __init__(self):
         self.calls = []
@@ -375,7 +375,7 @@ def test_cli_quit_exits_and_closes_memory(monkeypatch):
 
 
 class _CliFakeMessages(FakeMessages):
-    """Ask the knowledge tool for the unique marker, then answer normally."""
+    """先向知识工具请求唯一标记，再正常作答。"""
 
     def __init__(self, marker: str):
         super().__init__()

@@ -38,9 +38,9 @@ def test_pattern_cannot_refine_a_different_intent_group():
 def test_coarse_and_fine_scores_choose_the_same_group_together():
     intent, confidence, sources = vote(
         make_recognizer(threshold=0.2),
-        (IntentCategory.BILLING, 0.3),       # weighted score 0.21
-        (IntentCategory.TECHNICAL_LOGIN, 0.9),  # weighted score 0.18
-        (IntentCategory.TECHNICAL, 0.4),     # weighted score 0.04
+        (IntentCategory.BILLING, 0.3),       # 加权得分 0.21
+        (IntentCategory.TECHNICAL_LOGIN, 0.9),  # 加权得分 0.18
+        (IntentCategory.TECHNICAL, 0.4),     # 加权得分 0.04
     )
 
     assert intent is IntentCategory.TECHNICAL_LOGIN
@@ -96,7 +96,7 @@ class _FakeClient:
 
 
 class _PromptFakeMessages:
-    """Return a different intent depending on a marker in the prompt."""
+    """根据 prompt 中的标记返回不同意图。"""
 
     def __init__(self):
         self.calls = []

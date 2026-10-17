@@ -107,7 +107,7 @@ def test_composer_fallback_preserves_primary_and_supporting_results():
 
 
 def test_routing_decision_can_target_escalation_pool():
-    # Keep this assertion close to the public data contract used by the API.
+    # 该断言贴近 API 依赖的公开数据契约。
     decision = RoutingDecision(
         primary_agent=AgentType.ESCALATION,
         reason="critical request",
@@ -366,7 +366,7 @@ def test_recognize_intent_is_exposed_independently():
 
 
 class _BillingToolClient:
-    """Call check_billing_fields once, then return a final text response."""
+    """调用一次 check_billing_fields，然后返回最终文本响应。"""
 
     def __init__(self):
         self.calls = []
@@ -498,7 +498,7 @@ def test_prefilled_intent_skips_extra_recognition():
 
 
 class _KnowledgeToolClient:
-    """Request the knowledge tool once, then answer with plain text."""
+    """请求一次知识工具，然后用纯文本作答。"""
 
     def __init__(self, fail_final=False):
         self.calls = []
@@ -532,7 +532,7 @@ class _KnowledgeToolClient:
 
 
 class _PlainClient:
-    """Answer without requesting any tool."""
+    """不请求任何工具，直接作答。"""
 
     def __init__(self):
         self.calls = []

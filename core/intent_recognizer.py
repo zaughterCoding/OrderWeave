@@ -1,12 +1,12 @@
-"""End-to-end intent recognition.
+"""端到端的意图识别。
 
-Three signals are combined by weighted voting:
-  1. LLM semantic understanding (70%): handles complex phrasing and context.
-  2. Embedding similarity (20%): fast match against template utterances.
-  3. Keyword patterns (10%): zero-latency fallback.
+三路信号通过加权投票融合：
+  1. LLM 语义理解（70%）：处理复杂表述和上下文。
+  2. Embedding 相似度（20%）：快速匹配模板话术。
+  3. 关键词模式（10%）：零延迟兜底。
 
-Confidence below the threshold degrades to OTHER. The LLM and embedding
-branches run concurrently; pattern matching runs inline.
+置信度低于阈值时降级为 OTHER。LLM 与 Embedding 分支并发执行，
+关键词匹配同步运行。
 """
 import asyncio
 import hashlib
@@ -24,26 +24,26 @@ from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
 
-# ── Intent result data structures ─────────────────────────────────────────────
+# ── 意图结果数据结构 ─────────────────────────────────────────────────────────
 class IntentCategory(Enum):
-    QUERY      = "query"       # information lookup
-    COMPLAINT  = "complaint"   # dissatisfaction
-    REQUEST    = "request"     # action request
-    GREETING   = "greeting"    # greeting
-    ESCALATION = "escalation"  # escalation or human handoff request
-    TECHNICAL  = "technical"   # technical problem
-    BILLING    = "billing"     # billing or refund
-    ACCOUNT    = "account"     # account management
-    FEEDBACK   = "feedback"    # positive feedback
-    ORDER_STATUS = "order_status"        # order status
-    LOGISTICS = "logistics"              # shipping and delivery
-    REFUND = "refund"                    # refund or return
-    INVOICE = "invoice"                  # invoice
-    PAYMENT_ISSUE = "payment_issue"      # payment or charge anomaly
-    ACCOUNT_SECURITY = "account_security" # account security
-    TECHNICAL_LOGIN = "technical_login"  # login and authentication failure
-    TECHNICAL_CRASH = "technical_crash"  # crash or error code
-    HUMAN_HANDOFF = "human_handoff"      # human handoff
+    QUERY      = "query"       # 信息查询
+    COMPLAINT  = "complaint"   # 不满与抱怨
+    REQUEST    = "request"     # 操作请求
+    GREETING   = "greeting"    # 问候
+    ESCALATION = "escalation"  # 升级或转人工请求
+    TECHNICAL  = "technical"   # 技术问题
+    BILLING    = "billing"     # 账单或退款
+    ACCOUNT    = "account"     # 账户管理
+    FEEDBACK   = "feedback"    # 正面反馈
+    ORDER_STATUS = "order_status"        # 订单状态
+    LOGISTICS = "logistics"              # 物流配送
+    REFUND = "refund"                    # 退款或退货
+    INVOICE = "invoice"                  # 发票
+    PAYMENT_ISSUE = "payment_issue"      # 支付或扣款异常
+    ACCOUNT_SECURITY = "account_security" # 账户安全
+    TECHNICAL_LOGIN = "technical_login"  # 登录与认证失败
+    TECHNICAL_CRASH = "technical_crash"  # 崩溃或错误码
+    HUMAN_HANDOFF = "human_handoff"      # 转人工
     OTHER      = "other"
 
 
@@ -55,17 +55,17 @@ class UrgencyLevel(Enum):
 
 @dataclass
 class IntentResult:
-    intent:     IntentCategory # recognized intent category
-    confidence: float # confidence in the range 0-1
-    urgency:    UrgencyLevel # urgency level
-    intent_group: str # broad group: query, billing, technical, account or escalation
-    entities:   Dict[str, List[str]]   # entities extracted from the message
-    reasoning:  str # short explanation returned by the LLM
-    latency_ms: float # recognition latency in milliseconds
-    source_scores: Dict[str, float] = field(default_factory=dict) # per-signal confidence: llm, embedding, pattern, refined_by_pattern
+    intent:     IntentCategory # 识别出的意图类别
+    confidence: float # 置信度，范围 0-1
+    urgency:    UrgencyLevel # 紧急程度
+    intent_group: str # 所属大类：query、billing、technical、account 或 escalation
+    entities:   Dict[str, List[str]]   # 从消息中抽取的实体
+    reasoning:  str # LLM 返回的简短说明
+    latency_ms: float # 识别耗时（毫秒）
+    source_scores: Dict[str, float] = field(default_factory=dict) # 各信号置信度：llm、embedding、pattern、refined_by_pattern
 
 
-# Few-shot templates shared by the LLM examples and embedding matching.
+# LLM 示例与 Embedding 匹配共用的少样本模板。
 _TEMPLATES: Dict[IntentCategory, List[str]] = {
     IntentCategory.QUERY:      ["我的订单状态是什么？", "如何重置密码？", "快递什么时候到？"],
     IntentCategory.COMPLAINT:  ["等了好几个小时！", "服务太差了！", "一直没人处理！"],
@@ -119,7 +119,7 @@ _INTENT_GROUPS: Dict[IntentCategory, IntentCategory] = {
     IntentCategory.HUMAN_HANDOFF: IntentCategory.ESCALATION,
 }
 
-# Urgency keywords.
+# 紧急度关键词。
 _URGENCY_KEYWORDS = {
     UrgencyLevel.CRITICAL: ["紧急", "emergency", "urgent", "asap", "立刻"],
     UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
@@ -128,7 +128,7 @@ _URGENCY_KEYWORDS = {
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
-    """Pure-Python cosine similarity; avoids a numpy dependency."""
+    """纯 Python 余弦相似度，避免引入 numpy 依赖。"""
     dot = sum(x * y for x, y in zip(a, b))
     na  = sum(x * x for x in a) ** 0.5
     nb  = sum(x * x for x in b) ** 0.5
@@ -136,10 +136,9 @@ def _cosine(a: List[float], b: List[float]) -> float:
 
 
 class IntentRecognizer:
-    """Intent recognizer backed by an Anthropic-compatible API.
+    """基于 Anthropic 兼容 API 的意图识别器。
 
-    No local model is loaded. Template embeddings are computed lazily on the
-    first request and reused afterwards.
+    不加载本地模型。模板 Embedding 在首次请求时惰性计算，之后复用。
     """
 
     def __init__(
@@ -157,9 +156,8 @@ class IntentRecognizer:
         self.client    = AsyncAnthropic(**kwargs)
         self.model     = model
         self.threshold = confidence_threshold
-        # Local character n-gram vectors are always available. If the client
-        # exposes an embeddings resource, _embed_text prefers it and otherwise
-        # falls back to local vectors.
+        # 本地字符 n-gram 向量始终可用。若客户端暴露 embeddings 资源，
+        # _embed_text 会优先使用它，否则退回本地向量。
         self._embedding_enabled = True
 
         self._tpl_embeddings: Dict[IntentCategory, List[List[float]]] = {}
@@ -167,16 +165,16 @@ class IntentRecognizer:
         self.cache_hits   = 0
         self.cache_misses = 0
 
-    # ── Public interface ──────────────────────────────────────────────────────
+    # ── 公共接口 ──────────────────────────────────────────────────────────────
 
     async def recognize(
         self,
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
     ) -> IntentResult:
-        """Recognize the user's intent.
+        """识别用户意图。
 
-        history format: [{"role": "user"/"assistant", "content": "..."}].
+        history 格式：[{"role": "user"/"assistant", "content": "..."}]。
         """
         key = self._cache_key(message, history)
         if key in self._cache:
@@ -186,7 +184,7 @@ class IntentRecognizer:
 
         t0 = time.monotonic()
 
-        # Run the LLM and embedding branches concurrently; skip embeddings when disabled.
+        # LLM 与 Embedding 分支并发执行；禁用时跳过 Embedding。
         llm_task = asyncio.create_task(self._llm_recognize(message, history))
         emb_task = asyncio.create_task(self._embedding_recognize(message)) if self._embedding_enabled else None
         pat      = self._pattern_recognize(message)
@@ -211,17 +209,17 @@ class IntentRecognizer:
             source_scores=source_scores,
         )
 
-        # Keep the cache bounded: drop the oldest half once it reaches 1000 entries.
+        # 缓存需要上限：达到 1000 条时丢弃最旧的一半。
         if len(self._cache) >= 1000:
             for k in list(self._cache)[:500]:
                 del self._cache[k]
         self._cache[key] = result
         return result
 
-    # ── Online learning ───────────────────────────────────────────────────────
+    # ── 在线学习 ──────────────────────────────────────────────────────────────
 
     def learn(self, message: str, correct: IntentCategory) -> None:
-        """Add a corrected sample to the templates and invalidate affected caches."""
+        """把纠正后的样本加入模板，并使相关缓存失效。"""
         tpls = _TEMPLATES.setdefault(correct, [])
         if message not in tpls:
             tpls.append(message)
@@ -229,19 +227,19 @@ class IntentRecognizer:
             self._cache.clear()
             logger.info(f"学习新样本 → {correct.value}: {message[:40]}")
 
-    # ── Three recognition signals ─────────────────────────────────────────────
+    # ── 三路识别信号 ──────────────────────────────────────────────────────────
 
     async def _llm_recognize(
         self,
         message: str,
         history: Optional[List[Dict[str, str]]],
     ) -> Dict[str, Any]:
-        """Signal 1: LLM semantic understanding with few-shot examples and context."""
+        """信号 1：结合少样本示例和上下文的 LLM 语义理解。"""
         message = self._clean_text(message)
         examples = "\n".join(
             f'  消息: "{t}" → 意图: {cat.value}'
             for cat, tpls in _TEMPLATES.items()
-            for t in tpls[:1]  # one example per category keeps the prompt short
+            for t in tpls[:1]  # 每个类别只取一个示例，保持 prompt 简短
         )
         ctx = ""
         if history:
@@ -283,7 +281,7 @@ class IntentRecognizer:
             return {"intent": IntentCategory.OTHER, "confidence": 0.0, "reasoning": "LLM 失败", "failed": True}
 
     async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
-        """Signal 2: embedding similarity against template utterances."""
+        """信号 2：与模板话术做 Embedding 相似度匹配。"""
         try:
             await self._load_template_embeddings()
             msg_vec = await self._embed_text(message)
@@ -300,7 +298,7 @@ class IntentRecognizer:
             return {"intent": IntentCategory.OTHER, "confidence": 0.0}
 
     def _pattern_recognize(self, message: str) -> Dict[str, Any]:
-        """Signal 3: synchronous keyword fallback."""
+        """信号 3：同步的关键词兜底。"""
         msg = message.lower()
         specific_patterns = {
             IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "找人工"],
@@ -331,10 +329,10 @@ class IntentRecognizer:
         best_cat, best_score = self._best_pattern_match(msg, generic_patterns)
         return {"intent": best_cat, "confidence": best_score}
 
-    # ── Vote fusion ───────────────────────────────────────────────────────────
+    # ── 投票融合 ──────────────────────────────────────────────────────────────
 
     def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> tuple[IntentCategory, float, Dict[str, float]]:
-        """Weighted vote. Returns the final intent, fused confidence and per-signal scores."""
+        """加权投票。返回最终意图、融合置信度和各信号得分。"""
         source_scores = {
             "llm": float(llm.get("confidence", 0.0) or 0.0),
             "embedding": float(emb.get("confidence", 0.0) or 0.0),
@@ -361,7 +359,7 @@ class IntentRecognizer:
             group = _INTENT_GROUPS.get(cat, cat)
             group_scores[group] = group_scores.get(group, 0.0) + weighted_score
 
-        # Select the winning group first, then the best specific intent inside it.
+        # 先选出胜出的大类，再在该类内选出最佳的具体意图。
         best_group = max(group_scores, key=group_scores.get)
         best_score = group_scores[best_group]
         best = max(
@@ -379,10 +377,10 @@ class IntentRecognizer:
             return IntentCategory.OTHER, best_score, source_scores
         return best, best_score, source_scores
 
-    # ── Entity extraction ─────────────────────────────────────────────────────
+    # ── 实体抽取 ──────────────────────────────────────────────────────────────
 
     def _extract_entities(self, message: str) -> Dict[str, List[str]]:
-        """Extract high-value entities with rules to avoid extra LLM calls."""
+        """用规则抽取高价值实体，避免额外的 LLM 调用。"""
         message = self._clean_text(message)
         return {
             "order_id": self._unique(re.findall(r"(?:订单号?|order(?:_id)?|#)\s*[:：#]?\s*([A-Za-z0-9_-]{4,32})", message, re.I)),
@@ -395,10 +393,10 @@ class IntentRecognizer:
             ),
         }
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    # ── 辅助方法 ──────────────────────────────────────────────────────────────
 
     async def _load_template_embeddings(self) -> None:
-        """Embed all templates lazily; runs only once per category."""
+        """惰性计算全部模板的 Embedding；每个类别只执行一次。"""
         missing = [cat for cat in _TEMPLATES if cat not in self._tpl_embeddings]
         if not missing:
             return
@@ -412,11 +410,10 @@ class IntentRecognizer:
             idx += n
 
     async def _embed_text(self, text: str) -> List[float]:
-        """Build a text vector.
+        """构造文本向量。
 
-        Use the client's embeddings resource when available; otherwise fall
-        back to the local character n-gram vector so fusion keeps working
-        without an embedding service.
+        客户端提供 embeddings 资源时优先使用；否则退回本地字符 n-gram
+        向量，使融合逻辑在无 Embedding 服务时仍可工作。
         """
         embeddings = getattr(self.client, "embeddings", None)
         if embeddings is not None:
@@ -430,7 +427,7 @@ class IntentRecognizer:
 
     @staticmethod
     def _local_embedding(text: str, dims: int = 256) -> List[float]:
-        """Stable hashed character n-gram vector used without a remote embedding service."""
+        """无远端 Embedding 服务时使用的稳定哈希字符 n-gram 向量。"""
         normalized = text.lower().strip()
         vec = [0.0] * dims
         tokens = set()
@@ -459,8 +456,8 @@ class IntentRecognizer:
         return UrgencyLevel.LOW
 
     def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        # The cache stores entities and urgency, so the key must cover every
-        # input character that can affect recognition within the history window.
+        # 缓存包含实体和紧急度，因此键必须覆盖历史窗口内所有可能
+        # 影响识别的输入字符。
         payload = {"message": self._clean_text(message)}
         if history:
             payload["history"] = [
@@ -487,7 +484,7 @@ class IntentRecognizer:
             hits = sum(1 for kw in kws if kw in message)
             if not hits:
                 continue
-            # One clear business keyword is enough for a usable confidence; more hits raise it.
+            # 一个明确的业务关键词即可给出可用置信度；命中越多分数越高。
             score = min(1.0, 0.5 + 0.25 * (hits - 1))
             if score > best_score:
                 best_score, best_cat = score, cat
@@ -499,7 +496,7 @@ class IntentRecognizer:
 
     @staticmethod
     def _clean_text(value: Any) -> str:
-        """Drop characters that cannot be encoded as UTF-8 (for example lone surrogates)."""
+        """丢弃无法编码为 UTF-8 的字符（例如孤立代理项）。"""
         if value is None:
             return ""
         if not isinstance(value, str):

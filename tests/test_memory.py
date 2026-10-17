@@ -5,7 +5,7 @@ from memory.conversation_memory import MemoryManager, MsgRole
 
 
 class FakeRedis:
-    """Minimal async Redis list/key store with LPUSH newest-at-head semantics."""
+    """最小异步 Redis 列表/键存储，LPUSH 的最新消息位于头部。"""
 
     def __init__(self):
         self.lists = {}

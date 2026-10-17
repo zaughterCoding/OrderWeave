@@ -116,7 +116,7 @@ def test_real_chroma_two_subqueries_return_unique_fragments(monkeypatch):
             "independent Chroma server is required at "
             f"{CHROMA_HOST}:{CHROMA_PORT}; run compose.yml first"
         )
-        # Start from an empty collection so both subqueries see the same six docs.
+        # 从空集合开始，确保两个子查询看到相同的六篇文档。
         existing = kb._collection.get()["ids"]
         if existing:
             kb._collection.delete(ids=existing)

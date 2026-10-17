@@ -1,12 +1,12 @@
-"""Multi-agent routing and orchestration.
+"""多 Agent 路由与编排。
 
-Routing uses three layers:
-  1. Intent routing: map IntentCategory to a specialist agent.
-  2. Performance routing: choose the best instance by success rate and latency.
-  3. Fallback routing: degrade to GeneralAgent when a specialist is unavailable.
+路由分三层：
+  1. 意图路由：把 IntentCategory 映射到专属 Agent。
+  2. 性能路由：按成功率和延迟选择最佳实例。
+  3. 降级路由：专属 Agent 不可用时退回 GeneralAgent。
 
-Complex requests can be dispatched to several agents in parallel. Escalation
-requests produce a deterministic handoff response instead of another LLM turn.
+复杂请求可并行分派给多个 Agent。升级请求直接产生确定性的交接回复，
+不再调用一次 LLM。
 """
 import asyncio
 import inspect
@@ -37,13 +37,13 @@ from core.llm_utils import extract_text_content
 logger = logging.getLogger(__name__)
 
 
-# ── Data structures ───────────────────────────────────────────────────────────
+# ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class AgentType(Enum):
-    GENERAL   = "general"    # general customer service
-    TECHNICAL = "technical"  # technical support
-    BILLING   = "billing"    # billing and refunds
-    ESCALATION = "escalation" # human escalation and handoff
+    GENERAL   = "general"    # 通用客服
+    TECHNICAL = "technical"  # 技术支持
+    BILLING   = "billing"    # 账单与退款
+    ESCALATION = "escalation" # 人工升级与交接
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,7 @@ class AgentProfile:
 
 
 def _env_float(name: str, default: float) -> float:
-    """Read an optional float setting; a bad value must not block startup."""
+    """读取可选浮点配置；非法值不应阻塞启动。"""
     try:
         return float(os.getenv(name, str(default)))
     except (TypeError, ValueError):
@@ -71,7 +71,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 def _env_int(name: str, default: int) -> int:
-    """Read an optional integer setting; a bad value must not block startup."""
+    """读取可选整数配置；非法值不应阻塞启动。"""
     try:
         return int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
@@ -81,7 +81,7 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass
 class AgentStats:
-    """Runtime statistics used by the monitor and routing decisions."""
+    """供监控和路由决策使用的运行时统计。"""
     total:     int   = 0
     success:   int   = 0
     total_ms:  float = 0.0
@@ -96,7 +96,7 @@ class AgentStats:
         return self.total_ms / self.total if self.total else 0.0
 
     def routing_score(self) -> float:
-        """Higher success and lower latency produce a higher routing score."""
+        """成功率越高、延迟越低，路由得分越高。"""
         latency_score = 1.0 / (1.0 + self.avg_ms / 1000)
         base_score = self.success_rate * 0.7 + latency_score * 0.3
         return base_score * max(0.0, 1.0 - self.monitor_penalty)
@@ -109,7 +109,7 @@ class AgentResponse:
     success:     bool
     confidence:  float = 1.0
     latency_ms:  float = 0.0
-    escalate:    bool  = False   # whether escalation is required
+    escalate:    bool  = False   # 是否需要升级
     tools_used:  List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     knowledge_hits: int = 0
@@ -117,7 +117,7 @@ class AgentResponse:
 
 @dataclass
 class AgentCallResult:
-    """Per-request result of one LLM call; no state is stored on shared agents."""
+    """单次 LLM 调用的请求级结果；共享 Agent 上不保存状态。"""
     content: str
     tools_used: List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
@@ -125,7 +125,7 @@ class AgentCallResult:
 
 
 class AgentCallError(RuntimeError):
-    """Keep tool calls made before a failure so the request trace stays accurate."""
+    """保留失败前已执行的工具调用，使请求追踪保持准确。"""
 
     def __init__(
         self,
@@ -145,8 +145,8 @@ class Request:
     message:     str
     user_id:     str
     conv_id:     str
-    context:     str = ""        # formatted context from MemoryManager
-    history:     Optional[List[Dict[str, str]]] = None  # dialogue history for intent recognition
+    context:     str = ""        # MemoryManager 格式化后的上下文
+    history:     Optional[List[Dict[str, str]]] = None  # 用于意图识别的对话历史
     entities:    Dict[str, List[str]] = field(default_factory=dict)
     intent:      Optional[IntentCategory] = None
     intent_group: Optional[str] = None
@@ -175,7 +175,7 @@ class OrchestratorResult:
 
 @dataclass
 class RoutingDecision:
-    """Structured routing decision for one request."""
+    """单个请求的结构化路由决策。"""
     primary_agent: AgentType
     supporting_agents: List[AgentType] = field(default_factory=list)
     reason: str = ""
@@ -190,10 +190,10 @@ class RoutingDecision:
         return bool(self.supporting_agents)
 
 
-# ── Base agent ────────────────────────────────────────────────────────────────
+# ── 基础 Agent ────────────────────────────────────────────────────────────────
 
 class BaseAgent:
-    """Shared LLM call, role contract and statistics for all agents."""
+    """所有 Agent 共用的 LLM 调用、角色契约与统计。"""
 
     agent_type: AgentType
     system_prompt: str
@@ -214,7 +214,7 @@ class BaseAgent:
         self._shared_tools: Dict[str, AgentToolSpec] = {}
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
-        """Return the tool whitelist available to this role."""
+        """返回该角色可用的工具白名单。"""
         return dict(self._shared_tools)
 
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
@@ -377,7 +377,7 @@ class BaseAgent:
 
     @staticmethod
     def _knowledge_hit_count(name: str, result: Any) -> int:
-        """Count usable knowledge fragments, ignoring failed or empty calls."""
+        """统计可用的知识片段数，忽略失败或空结果的调用。"""
         if name != "search_knowledge_base" or not isinstance(result, dict):
             return 0
         if result.get("success") is not True:
@@ -421,7 +421,7 @@ class BaseAgent:
             prop = properties.get(key, {})
             expected = prop.get("type")
             if expected in type_map:
-                # bool subclasses int, so it must never satisfy numeric schemas.
+                # bool 是 int 的子类，因此不能通过数值类型的校验。
                 if isinstance(value, bool) and expected in ("integer", "number"):
                     raise ValueError(f"参数 {key} 类型错误，期望 {expected}")
                 if not isinstance(value, type_map[expected]):
@@ -435,7 +435,7 @@ class BaseAgent:
                     raise ValueError(f"参数 {key} 大于最大值 {maximum}")
 
     def _build_system_prompt(self, req: Request) -> str:
-        """Combine the role contract and dynamic Skills into the system prompt."""
+        """把角色契约与动态 Skills 合并进 system prompt。"""
         profile_prompt = (
             f"\n\n[角色契约]\n"
             f"角色：{self.profile.role}\n"
@@ -456,7 +456,7 @@ class BaseAgent:
         return f"{base_prompt}\n\n[动态 Skills]\n{skill_prompt}"
 
     def _build_role_packet(self, req: Request) -> str:
-        """Deterministic input packet for a sub-agent; subclasses add domain fields."""
+        """给子 Agent 的确定性输入包；子类可追加领域字段。"""
         packet = {
             "agent_type": self.agent_type.value,
             "intent": req.intent.value if req.intent else None,
@@ -468,7 +468,7 @@ class BaseAgent:
         return json.dumps(packet, ensure_ascii=False)
 
     def _needs_escalation(self, content: str) -> bool:
-        """Detect escalation suggestions with simple keyword matching."""
+        """用简单关键词匹配检测升级建议。"""
         keywords = ["转人工", "人工客服", "escalate", "specialist", "无法处理"]
         return any(kw in content for kw in keywords)
 
@@ -577,11 +577,10 @@ class BillingAgent(BaseAgent):
 
 
 class EscalationAgent(BaseAgent):
-    """Human escalation node.
+    """人工升级节点。
 
-    Escalation is not a normal question-answering prompt: it produces a
-    standardized handoff and stops other agents from inventing an answer.
-    A production deployment can connect a ticket system, human queue or webhook.
+    升级不是普通的问答提示：它产出标准化的交接内容，并阻止其他 Agent
+    凭空编造答案。生产环境可在此接入工单系统、人工队列或 webhook。
     """
 
     agent_type = AgentType.ESCALATION
@@ -629,7 +628,7 @@ class EscalationAgent(BaseAgent):
 
 
 class ResponseComposer:
-    """Merge multiple agent responses into one reply with a clear primary result."""
+    """把多个 Agent 的响应合并为一条主次分明的回复。"""
 
     def __init__(self, client: AsyncAnthropic, model: str, skill_manager: Optional[Any] = None):
         self._client = client
@@ -673,25 +672,25 @@ class ResponseComposer:
         except Exception as ex:
             logger.warning("Response Composer 失败，使用确定性合并: %s", ex)
 
-        # If the composer is unavailable, preserve the primary and supporting labels.
+        # Composer 不可用时，保留主 Agent 与补充 Agent 的标注。
         return "\n\n".join(
             f"{response.content}" if index == 0 else f"补充说明：\n{response.content}"
             for index, response in enumerate(successful)
         )
 
 
-# ── Orchestrator ──────────────────────────────────────────────────────────────
+# ── 编排器 ────────────────────────────────────────────────────────────────────
 
 class AgentOrchestrator:
-    """Multi-agent orchestrator.
+    """多 Agent 编排器。
 
-    Routing layers:
-      1. Intent to agent type mapping.
-      2. Best instance by routing_score() when a type has several instances.
-      3. GeneralAgent fallback when a specialist fails or is unavailable.
+    路由层次：
+      1. 意图到 Agent 类型的映射。
+      2. 同一类型有多个实例时，按 routing_score() 选最佳实例。
+      3. 专属 Agent 失败或不可用时退回 GeneralAgent。
     """
 
-    # Static intent-to-agent routing table.
+    # 静态的意图到 Agent 路由表。
     _INTENT_ROUTING: Dict[IntentCategory, AgentType] = {
         IntentCategory.TECHNICAL:  AgentType.TECHNICAL,
         IntentCategory.TECHNICAL_LOGIN: AgentType.TECHNICAL,
@@ -704,11 +703,11 @@ class AgentOrchestrator:
         IntentCategory.ACCOUNT_SECURITY: AgentType.BILLING,
         IntentCategory.ESCALATION: AgentType.ESCALATION,
         IntentCategory.HUMAN_HANDOFF: AgentType.ESCALATION,
-        # All other intents default to GENERAL.
+        # 其余意图默认走 GENERAL。
     }
 
-    # When the monitor penalty for a specialist reaches this value, new requests
-    # fall back to GeneralAgent. The default matches the monitor's severe penalty cap.
+    # 专属 Agent 的监控惩罚达到该值时，新请求退回 GeneralAgent。
+    # 默认值与监控模块的严重惩罚上限一致。
     MONITOR_FALLBACK_PENALTY = 0.5
 
     def __init__(
@@ -732,7 +731,7 @@ class AgentOrchestrator:
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._recent_tool_traces = deque(maxlen=_env_int("ECHOMIND_TOOL_TRACE_MAX", 200))
 
-        # Agent pool: every type may hold several instances for horizontal scaling.
+        # Agent 池：每种类型可包含多个实例以支持横向扩展。
         self._pool: Dict[AgentType, List[BaseAgent]] = {
             AgentType.GENERAL: [self._make_agent(GeneralAgent, client, model, skill_manager)],
             AgentType.TECHNICAL: [self._make_agent(TechnicalAgent, client, model, skill_manager)],
@@ -748,10 +747,10 @@ class AgentOrchestrator:
         default_model: str,
         skill_manager: Optional[Any],
     ) -> BaseAgent:
-        """Create a role agent, allowing an environment override for its model.
+        """创建角色 Agent，允许通过环境变量覆盖其模型。
 
-        A stronger model can serve specialist roles while general intake uses a
-        faster one; the escalation node does not call the LLM.
+        可用更强的模型服务专属角色，而通用接待使用更快的模型；
+        升级节点不调用 LLM。
         """
         profile = agent_cls.profile
         env_name = f"ECHOMIND_{agent_cls.agent_type.value.upper()}_MODEL"
@@ -760,7 +759,7 @@ class AgentOrchestrator:
         return agent_cls(client, default_model, skill_manager, profile=configured_profile)
 
     def set_skill_manager(self, skill_manager: Optional[Any]) -> None:
-        """Replace the SkillManager reference after a runtime reload."""
+        """运行时重载后替换 SkillManager 引用。"""
         self._skill_manager = skill_manager
         self._composer._skill_manager = skill_manager
         for agents in self._pool.values():
@@ -768,7 +767,7 @@ class AgentOrchestrator:
                 agent._skill_manager = skill_manager
 
     def set_shared_tools(self, tools: Optional[Dict[str, AgentToolSpec]]) -> None:
-        """Update the shared tool whitelist for every agent."""
+        """更新所有 Agent 共用的工具白名单。"""
         self._shared_tools = dict(tools or {})
         for agents in self._pool.values():
             for agent in agents:
@@ -779,7 +778,7 @@ class AgentOrchestrator:
         message: str,
         history: Optional[List[Dict[str, str]]] = None,
     ):
-        """Expose intent recognition so the API can decide whether RAG is needed."""
+        """暴露意图识别，供 API 判断是否需要 RAG。"""
         return await self._intent_recognizer.recognize(message, history=history)
 
     def _record_tool_trace(self, result: OrchestratorResult) -> None:
@@ -808,21 +807,20 @@ class AgentOrchestrator:
         limit = max(1, min(int(limit or 20), len(self._recent_tool_traces)))
         return list(reversed(list(self._recent_tool_traces)[-limit:]))
 
-    # ── Main entry ────────────────────────────────────────────────────────────
+    # ── 主入口 ────────────────────────────────────────────────────────────────
 
     async def run(self, req: Request) -> OrchestratorResult:
-        """Process one request: recognize intent, route, execute, check escalation."""
+        """处理单个请求：识别意图、路由、执行、检查升级。"""
         t0 = time.monotonic()
 
-        # 1. Recognize intent unless the caller already did.
+        # 1. 调用方未识别过意图时，这里识别。
         if req.intent is None:
             intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
             req.intent  = intent_result.intent
             req.intent_group = intent_result.intent_group
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
-            # Callers that pass explicit entities already know their values;
-            # recognized fields only fill the gaps.
+            # 调用方显式传入的实体可信度更高，识别出的字段只用于补缺。
             recognized_entities = dict(intent_result.entities or {})
             if req.entities:
                 recognized_entities.update(req.entities)
@@ -844,16 +842,16 @@ class AgentOrchestrator:
             self._record_tool_trace(result)
             return result
 
-        # Complex requests may involve several agents, e.g. a login failure plus
-        # a duplicate charge in the same message.
+        # 复杂请求可能涉及多个 Agent，例如同一条消息里既有登录失败
+        # 又有重复扣款。
         decision = self._route_decision(req)
         if decision.multi_agent:
             return await self.run_parallel(req, decision)
 
-        # 2. Execute the primary agent (with fallback).
+        # 2. 执行主 Agent（含降级）。
         response = await self._execute(req, decision.primary_agent)
 
-        # 3. Escalation check.
+        # 3. 检查升级。
         escalated = False
         if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent in (
             IntentCategory.ESCALATION,
@@ -861,7 +859,7 @@ class AgentOrchestrator:
         ):
             escalated = True
             logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # Production: create a ticket and notify a human agent here.
+            # 生产环境：在此创建工单并通知人工客服。
 
         result = OrchestratorResult(
             request_id=req.request_id,
@@ -883,7 +881,7 @@ class AgentOrchestrator:
         return result
 
     async def run_parallel(self, req: Request, decision: RoutingDecision) -> OrchestratorResult:
-        """Dispatch to several agents and merge the responses."""
+        """分派给多个 Agent 并合并响应。"""
         t0 = time.monotonic()
         agent_types = decision.agent_types
         tasks = [self._execute(req, at) for at in agent_types]
@@ -902,7 +900,7 @@ class AgentOrchestrator:
             for response in valid_responses
             for trace in response.tool_traces
         ]
-        # A valid hit from any contributing agent makes the request knowledge-backed.
+        # 任一参与 Agent 的有效命中都算作本次请求有知识库依据。
         knowledge_hits = sum(
             response.knowledge_hits
             for response in valid_responses
@@ -930,28 +928,27 @@ class AgentOrchestrator:
         self._record_tool_trace(result)
         return result
 
-    # ── Routing ───────────────────────────────────────────────────────────────
+    # ── 路由 ──────────────────────────────────────────────────────────────────
 
     def _route(self, intent: Optional[IntentCategory], urgency: Optional[UrgencyLevel]) -> AgentType:
-        """Three-layer route: intent mapping, critical override, then GENERAL."""
+        """三层路由：意图映射、紧急度覆盖，最后回退到 GENERAL。"""
         if urgency == UrgencyLevel.CRITICAL:
             return AgentType.ESCALATION
 
         if intent and intent in self._INTENT_ROUTING:
             target = self._INTENT_ROUTING[intent]
-            # Use the target type only when it has an available instance.
+            # 仅当目标类型存在可用实例时才使用它。
             if target in self._pool and self._pool[target]:
                 return target
 
         return AgentType.GENERAL
 
     def _route_decision(self, req: Request) -> RoutingDecision:
-        """Build a structured route decision.
+        """构造结构化路由决策。
 
-        Critical and handoff requests are resolved first. Domain scores then
-        choose a primary and optional supporting agents, expressing
-        "primary handling plus supporting diagnosis" instead of concatenating
-        every keyword match without priority.
+        先处理紧急和交接请求。随后由领域得分选出主 Agent 和可选的
+        协作 Agent，表达“主处理加辅助诊断”的关系，避免把命中的每个
+        关键词都不分优先级地拼在一起。
         """
         if req.urgency == UrgencyLevel.CRITICAL:
             return RoutingDecision(
@@ -1017,7 +1014,7 @@ class AgentOrchestrator:
         )
 
     def _domain_scores(self, req: Request) -> Dict[AgentType, float]:
-        """Score each domain agent from intent, keywords and entities."""
+        """根据意图、关键词和实体为各领域 Agent 打分。"""
         msg = req.message.lower()
         scores = {
             AgentType.GENERAL: 0.1,
@@ -1095,11 +1092,10 @@ class AgentOrchestrator:
         )
 
     def _collaboration_targets(self, req: Request) -> List[AgentType]:
-        """Detect composite requests that need several agents.
+        """检测需要多个 Agent 的复合请求。
 
-        Intent recognition returns a single primary intent, so domain keywords
-        supplement it. For example, "login error and duplicate charge" needs
-        both technical and billing handling.
+        意图识别只返回一个主意图，因此用领域关键词补充。例如
+        “登录报错并且重复扣款”需要技术和账单两方处理。
         """
         msg = req.message.lower()
         targets: List[AgentType] = []
@@ -1123,13 +1119,13 @@ class AgentOrchestrator:
         ) or any(kw in msg for kw in billing_kws):
             targets.append(AgentType.BILLING)
 
-        # Keep order, remove duplicates, and only return types with instances.
+        # 保留顺序、去重，并且只返回存在实例的类型。
         deduped = list(dict.fromkeys(targets))
         return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
 
     @staticmethod
     def _needs_clarification(req: Request) -> bool:
-        """Ask a clarifying question for low-confidence OTHER intents."""
+        """对低置信度的 OTHER 意图提出澄清问题。"""
         if req.intent != IntentCategory.OTHER:
             return False
         text = (req.message or "").strip()
@@ -1138,14 +1134,14 @@ class AgentOrchestrator:
         return req.intent_confidence < 0.5
 
     def _best_agent(self, agent_type: AgentType) -> Optional[BaseAgent]:
-        """Performance route: pick the instance with the highest routing_score()."""
+        """性能路由：选择 routing_score() 最高的实例。"""
         agents = self._pool.get(agent_type, [])
         if not agents:
             return None
         return max(agents, key=lambda a: a.stats.routing_score())
 
     def _monitor_degraded(self, agent_type: AgentType) -> bool:
-        """Fall back when every specialist instance has a high monitor penalty."""
+        """所有专属实例的监控惩罚都很高时触发降级。"""
         if agent_type in (AgentType.GENERAL, AgentType.ESCALATION):
             return False
         agents = self._pool.get(agent_type, [])
@@ -1159,11 +1155,11 @@ class AgentOrchestrator:
             float(getattr(getattr(agent, "stats", None), "monitor_penalty", 0.0) or 0.0)
             for agent in agents
         ]
-        # Keep using the specialist type while any healthy instance remains.
+        # 只要还有健康实例，就继续使用该专属类型。
         return min(penalties) >= min(max(threshold, 0.0), 0.9)
 
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
-        """Execute an agent and fall back to GeneralAgent on failure."""
+        """执行 Agent，失败时回退到 GeneralAgent。"""
         agent = self._best_agent(agent_type)
         if agent is None:
             agent = self._best_agent(AgentType.GENERAL)
@@ -1176,7 +1172,7 @@ class AgentOrchestrator:
 
         response = await agent.handle(req)
 
-        # Fall back to GeneralAgent when a specialist fails.
+        # 专属 Agent 失败时回退到 GeneralAgent。
         if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
@@ -1185,7 +1181,7 @@ class AgentOrchestrator:
 
         return response
 
-    # ── Statistics (read by the monitor) ──────────────────────────────────────
+    # ── 统计（供监控读取） ────────────────────────────────────────────────────
 
     def get_stats(self) -> Dict[str, Any]:
         result = {}
@@ -1207,9 +1203,9 @@ class AgentOrchestrator:
         return result
 
     def update_routing_penalties(self, penalties: Dict[str, float]) -> None:
-        """Apply monitor feedback to routing penalties.
+        """把监控反馈应用到路由惩罚。
 
-        Keys use the agent keys from get_stats(), for example technical_0.
+        键使用 get_stats() 中的 Agent 键，例如 technical_0。
         """
         for agent_type, agents in self._pool.items():
             for i, agent in enumerate(agents):

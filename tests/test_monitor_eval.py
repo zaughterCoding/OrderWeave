@@ -1,4 +1,4 @@
-"""Tests for performance monitoring and response evaluation."""
+"""性能监控与回复评测的测试。"""
 import asyncio
 import json
 from collections import deque
@@ -98,7 +98,7 @@ def test_monitor_collects_stats_and_feeds_routing_penalties():
 
     asyncio.run(monitor._collect())
 
-    # 0.2 from success rate and 0.1 from the latency excess over 3000 ms.
+    # 成功率贡献 0.2，超过 3000 ms 的延迟贡献 0.1。
     assert orchestrator.penalties == {"general_0": pytest.approx(0.3)}
 
     summary = monitor.summary()

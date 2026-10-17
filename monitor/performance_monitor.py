@@ -1,8 +1,7 @@
-"""Online performance monitoring for agents and tools.
+"""Agent 与工具的在线性能监控。
 
-The monitor samples the stats already maintained by the orchestrator and tool
-manager, raises threshold alerts, feeds routing penalties back to the
-orchestrator, and optionally exposes Prometheus metrics or a webhook.
+监控器采样编排器和工具管理器已维护的统计数据，触发阈值告警，把路由惩罚
+反馈给编排器，并可选地暴露 Prometheus 指标或发送 webhook。
 """
 import asyncio
 import logging
@@ -39,7 +38,7 @@ class Alert:
 
 @dataclass
 class Suggestion:
-    """An actionable optimization suggestion."""
+    """可执行的优化建议。"""
 
     title: str
     detail: str
@@ -48,7 +47,7 @@ class Suggestion:
 
 
 class AnomalyDetector:
-    """Sliding-window Z-score anomaly detection."""
+    """滑动窗口 Z 分数异常检测。"""
 
     def __init__(self, window: int = 60, sensitivity: float = 2.5):
         self._window = window
@@ -58,7 +57,7 @@ class AnomalyDetector:
         )
 
     def record(self, metric: str, value: float) -> Optional[Dict[str, Any]]:
-        """Record one point and return anomaly details when the z-score exceeds the threshold."""
+        """记录一个数据点；z 分数超过阈值时返回异常详情。"""
         buf = self._history[metric]
         buf.append(value)
 
@@ -83,7 +82,7 @@ class AnomalyDetector:
 
 
 class PerformanceMonitor:
-    """Sample online agent and tool statistics and feed routing penalties back."""
+    """采样 Agent 与工具的在线统计，并回传路由惩罚。"""
 
     THRESHOLDS = {
         "agent_success_rate": (0.90, Severity.ERROR, "less_than"),
@@ -130,8 +129,8 @@ class PerformanceMonitor:
                 ["agent"],
                 **metric_kwargs,
             ),
-            # Only a current average is available per agent, so a Gauge avoids
-            # pretending that polling produces request latency samples.
+            # 每个 Agent 只有当前平均值，因此用 Gauge 表示，
+            # 而不是假装轮询能产生请求延迟样本。
             "agent_avg_latency_ms": Gauge(
                 "agent_avg_latency_ms",
                 "Average agent latency in milliseconds",
@@ -184,7 +183,7 @@ class PerformanceMonitor:
             await asyncio.sleep(self._interval)
 
     async def _collect(self) -> None:
-        """Read current stats, detect anomalies, raise alerts and update routing."""
+        """读取当前统计、检测异常、触发告警并更新路由。"""
         agent_stats = self._orchestrator.get_stats()
         tool_stats = self._tool_manager.get_stats()
         routing_penalties: Dict[str, float] = {}
@@ -284,7 +283,7 @@ class PerformanceMonitor:
 
     @staticmethod
     def _routing_penalty(success_rate: float, avg_ms: float) -> float:
-        """Map online performance to a routing penalty in the range 0-0.9."""
+        """把在线表现映射为 0-0.9 范围内的路由惩罚。"""
         penalty = 0.0
         if success_rate < 0.90:
             penalty += min(0.5, (0.90 - success_rate) * 2)
@@ -378,7 +377,7 @@ class PerformanceMonitor:
             logger.error(f"Webhook 发送失败: {ex}")
 
     def summary(self) -> Dict[str, Any]:
-        """Return the current monitoring summary for the API layer."""
+        """返回给 API 层使用的当前监控摘要。"""
         return {
             "agent_stats": self._orchestrator.get_stats(),
             "tool_stats": self._tool_manager.get_stats(),

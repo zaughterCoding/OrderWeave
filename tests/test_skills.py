@@ -22,7 +22,7 @@ def test_three_skills_load_and_match_their_agents():
     assert "技术支持处理规范" in manager.prompt_for("接口报 500 错误", "technical")
     assert "账单退款处理规范" in manager.prompt_for("我要申请退款", "billing")
 
-    # Skills scoped to another agent must not leak into this agent's prompt.
+    # 限定给其他 Agent 的 Skills 不得泄漏进当前 Agent 的 prompt。
     assert "技术支持处理规范" not in manager.prompt_for("接口报 500 错误", "general")
 
 

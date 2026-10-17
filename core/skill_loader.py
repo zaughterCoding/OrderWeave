@@ -1,8 +1,7 @@
-"""Skill loader.
+"""Skill 加载器。
 
-A Skill is a hot-reloadable business instruction that augments an agent's
-system prompt. Skills carry tone, process, compliance boundaries and support
-procedures that operations need to change without a code release.
+Skill 是可在运行时热重载的业务指令，用于增强 Agent 的 system prompt。
+它承载语气、流程、合规边界和客服话术，让运营无需发版即可调整。
 """
 import json
 import logging
@@ -18,7 +17,7 @@ _DEFAULT_SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
 @dataclass
 class Skill:
-    """Normalized Skill independent of the Markdown/JSON source format."""
+    """与 Markdown/JSON 源格式无关的规范化 Skill。"""
     name: str
     description: str
     content: str
@@ -28,10 +27,10 @@ class Skill:
     enabled: bool = True
 
     def matches(self, message: str, agent_type: Optional[str] = None) -> bool:
-        """Return whether the Skill should be injected for this request.
+        """返回该 Skill 是否应注入本次请求。
 
-        Empty agents means every agent; empty keywords means a global Skill.
-        Otherwise at least one keyword must appear in the message.
+        agents 为空表示适用于所有 Agent；keywords 为空表示全局 Skill。
+        否则消息中至少命中一个关键词才注入。
         """
         if not self.enabled:
             return False
@@ -46,7 +45,7 @@ class Skill:
         return any(keyword.lower() in lowered for keyword in self.keywords)
 
     def to_prompt_block(self, max_chars: int = 3200) -> str:
-        """Format the Skill as a prompt block and cap its length."""
+        """把 Skill 格式化为 prompt 块并限制长度。"""
         body = self.content.strip()
         if len(body) > max_chars:
             body = body[:max_chars].rstrip() + "\n..."
@@ -54,7 +53,7 @@ class Skill:
         return f"### {self.name}{description}\n{body}"
 
     def to_summary(self) -> Dict[str, Any]:
-        """Return an API-serializable summary without the full content."""
+        """返回可被 API 序列化的摘要，不含完整内容。"""
         return {
             "name": self.name,
             "description": self.description,
@@ -67,9 +66,9 @@ class Skill:
 
 
 class SkillManager:
-    """Discover, parse and manage Skills from a directory.
+    """从目录中发现、解析和管理 Skill。
 
-    Supported layouts:
+    支持的布局：
       1. skills/refund/SKILL.md
       2. skills/refund.json / skills/refund.md / skills/refund.txt
     """
@@ -92,7 +91,7 @@ class SkillManager:
         return list(self._errors)
 
     def load(self) -> List[Skill]:
-        """Rescan the directory; one broken file does not disable the others."""
+        """重新扫描目录；单个文件损坏不影响其他文件。"""
         loaded: List[Skill] = []
         errors: List[str] = []
 
@@ -118,14 +117,13 @@ class SkillManager:
         return self.skills
 
     def reload(self) -> List[Skill]:
-        """Hot-reload entry point used by the API."""
+        """供 API 使用的热重载入口。"""
         return self.load()
 
     def prompt_for(self, message: str, agent_type: Optional[str] = None) -> str:
-        """Build the Skill prompt for a request.
+        """为一次请求构造 Skill prompt。
 
-        Only matching Skills are injected. The combined text is truncated to
-        avoid crowding out the main conversation context.
+        只注入匹配的 Skill。合并后的文本会被截断，避免挤占主对话上下文。
         """
         blocks: List[str] = []
         matched: List[tuple[Skill, List[str]]] = []
@@ -174,7 +172,7 @@ class SkillManager:
         )
 
     def summary(self) -> Dict[str, Any]:
-        """Return manager state for the /skills endpoint and diagnostics."""
+        """返回供 /skills 端点和诊断使用的管理器状态。"""
         return {
             "root_dir": str(self.root_dir),
             "count": len(self._skills),
@@ -183,7 +181,7 @@ class SkillManager:
         }
 
     def _log_loaded_skills(self) -> None:
-        """Print a visible load summary for startup and hot reload."""
+        """输出启动和热重载时可读的加载摘要。"""
         lines = [
             "",
             "================ EchoMind Skills Loaded ================",
@@ -214,7 +212,7 @@ class SkillManager:
         logger.info("\n".join(lines))
 
     def _discover_files(self, root_dir: Path) -> Iterable[Path]:
-        """Discover loadable files, preferring the directory convention SKILL.md."""
+        """发现可加载的文件，优先采用 SKILL.md 目录约定。"""
         skill_md_files = sorted(root_dir.rglob("SKILL.md"))
         yielded = {path.resolve() for path in skill_md_files}
         for path in skill_md_files:
@@ -263,7 +261,7 @@ class SkillManager:
         default_name = path.parent.name if path.name == "SKILL.md" else path.stem
         name = str(meta.get("name") or self._first_heading(body) or default_name)
 
-        # Drop the leading heading when it only repeats the Skill name.
+        # 仅当前导标题与 Skill 名称重复时才去掉标题。
         body = self._strip_first_heading(body, name)
 
         return Skill(
@@ -277,10 +275,9 @@ class SkillManager:
         )
 
     def _split_front_matter(self, raw: str) -> tuple[Dict[str, Any], str]:
-        """Parse the simple front matter at the top of a Markdown file.
+        """解析 Markdown 文件顶部的简单 front matter。
 
-        PyYAML is intentionally avoided so this light format adds no runtime
-        dependency.
+        刻意不引入 PyYAML，使这种轻量格式不增加运行时依赖。
         """
         text = raw.lstrip()
         if not text.startswith("---"):

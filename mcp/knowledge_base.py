@@ -1,7 +1,6 @@
-"""ChromaDB-backed knowledge base for document storage and semantic search.
+"""基于 ChromaDB 的知识库，用于文档存储和语义检索。
 
-The same ChromaDB service is also used for conversation memory later, but
-this module keeps its documents in a separate collection.
+同一个 ChromaDB 服务之后也会用于对话记忆，但本模块把文档放在独立的集合中。
 """
 import asyncio
 import hashlib
@@ -20,7 +19,7 @@ _DEFAULT_EMBEDDING_CACHE = _PROJECT_ROOT / "data" / "chroma_cache"
 
 
 class _ProjectEmbeddingFunction(ONNXMiniLM_L6_V2):
-    """Keep the ONNX model cache inside the project instead of the user profile."""
+    """把 ONNX 模型缓存放在项目内，而不是用户目录。"""
 
     DOWNLOAD_PATH = (
         Path(
@@ -34,7 +33,7 @@ class _ProjectEmbeddingFunction(ONNXMiniLM_L6_V2):
 
 
 class KnowledgeBase:
-    """RAG knowledge base backed by a ChromaDB server or local persistence."""
+    """由 ChromaDB 服务或本地持久化支撑的 RAG 知识库。"""
 
     COLLECTION_NAME = "knowledge_base"
 
@@ -45,8 +44,8 @@ class KnowledgeBase:
         chroma_path: str = "./data/chroma",
         collection_name: Optional[str] = None,
     ):
-        # Prefer an independent ChromaDB server. Its embedding model runs on the
-        # server, so the client does not need to download one.
+        # 优先使用独立的 ChromaDB 服务。Embedding 模型在服务端运行，
+        # 客户端无需下载模型。
         self._use_server = False
         try:
             self._client = chromadb.HttpClient(
@@ -75,7 +74,7 @@ class KnowledgeBase:
             self._load_default_docs()
 
     def add_documents(self, documents: List[Dict[str, str]]) -> int:
-        """Chunk and upsert documents; returns the number of written chunks."""
+        """切分并 upsert 文档；返回写入的片段数。"""
         ids, docs, metas = [], [], []
 
         for doc in documents:
@@ -92,18 +91,18 @@ class KnowledgeBase:
                 )
 
         if ids:
-            # Stable IDs make repeated imports idempotent and allow updates.
+            # 稳定的 ID 使重复导入保持幂等，并支持更新。
             self._collection.upsert(ids=ids, documents=docs, metadatas=metas)
             logger.info(f"知识库写入 {len(ids)} 个文档片段")
 
         return len(ids)
 
     async def add_documents_async(self, documents: List[Dict[str, str]]) -> int:
-        """Run the synchronous ChromaDB write in a worker thread."""
+        """在线程池中执行同步的 ChromaDB 写入。"""
         return await asyncio.to_thread(self.add_documents, documents)
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Return the most relevant chunks for a query."""
+        """返回与查询最相关的片段。"""
         results = self._collection.query(
             query_texts=[query],
             n_results=top_k,
@@ -129,7 +128,7 @@ class KnowledgeBase:
         return items
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Run the synchronous ChromaDB query in a worker thread."""
+        """在线程池中执行同步的 ChromaDB 查询。"""
         return await asyncio.to_thread(self.search, query, top_k)
 
     @property
@@ -137,7 +136,7 @@ class KnowledgeBase:
         return self._collection.count()
 
     async def doc_count_async(self) -> int:
-        """Return the number of stored chunks without blocking the event loop."""
+        """在不阻塞事件循环的情况下返回已存片段数。"""
         return await asyncio.to_thread(self._collection.count)
 
     async def search_handler(
@@ -145,13 +144,13 @@ class KnowledgeBase:
         params: Dict[str, Any],
         context: Any,
     ) -> List[Dict[str, Any]]:
-        """Handler used when this knowledge base is registered as a tool."""
+        """本知识库注册为工具时使用的处理函数。"""
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
         return await self.search_async(query, top_k=top_k)
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
-        """Split long text by sentence-like boundaries."""
+        """按近似句子边界切分长文本。"""
         if len(text) <= chunk_size:
             return [text] if text.strip() else []
 
@@ -175,7 +174,7 @@ class KnowledgeBase:
         return chunks
 
     def _load_default_docs(self) -> None:
-        """Seed a new collection with common customer-service documents."""
+        """为新集合写入常见客服文档作为初始数据。"""
         default_docs = [
             {
                 "title": "退款政策",

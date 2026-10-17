@@ -1,7 +1,7 @@
-"""FastAPI entry point for the AgentEcommerce customer service system.
+"""AgentEcommerce 客服系统的 FastAPI 入口。
 
-Core components are created in the lifespan handler. Importing this module
-does not connect to Redis, ChromaDB or a paid model endpoint.
+核心组件在 lifespan 处理器中创建。导入本模块不会连接 Redis、
+ChromaDB 或付费模型端点。
 """
 import asyncio
 import json
@@ -85,7 +85,7 @@ def _build_knowledge_tooling(
     chroma_port: int,
     chroma_path: str,
 ):
-    """Build the knowledge search tool chain used by both the API and the CLI."""
+    """构造 API 与 CLI 共用的知识检索工具链。"""
     from mcp.knowledge_base import KnowledgeBase
     from mcp.tool_manager import MCPToolManager, Tool
 
@@ -651,8 +651,8 @@ async def _cli() -> None:
     chroma_path = os.getenv("CHROMA_PERSIST_DIRECTORY", "").strip() or str(
         _project_path("data", "chroma")
     )
-    # The CLI needs the same knowledge chain as the API so tool calls do not
-    # silently drop into "tool not found" during manual verification.
+    # CLI 需要与 API 相同的知识链，否则手工验证时工具调用会静默
+    # 退化为“找不到工具”。
     tool_manager, _knowledge_base = _build_knowledge_tooling(
         cfg, chroma_host, chroma_port, chroma_path
     )

@@ -1,8 +1,7 @@
-"""Three-tier conversation memory.
+"""三层对话记忆。
 
-Working memory uses Redis, episodic memory and user profiles use ChromaDB.
-Compression keeps the latest messages in time order and never drops them when
-summary generation or episodic storage fails.
+工作记忆使用 Redis，情景记忆和用户画像使用 ChromaDB。压缩按时间顺序保留
+最新消息；摘要生成或情景存储失败时绝不丢弃这些消息。
 """
 import asyncio
 import hashlib
@@ -30,7 +29,7 @@ _DEFAULT_EMBEDDING_CACHE = _PROJECT_ROOT / "data" / "chroma_cache"
 
 
 class _MemoryEmbeddingFunction(ONNXMiniLM_L6_V2):
-    """Keep the ONNX model cache inside the project instead of the user profile."""
+    """把 ONNX 模型缓存放在项目内，而不是用户目录。"""
 
     DOWNLOAD_PATH = (
         Path(
@@ -59,7 +58,7 @@ class Message:
 
 @dataclass
 class MemoryContext:
-    """Memory data passed to an agent for one request."""
+    """单次请求传给 Agent 的记忆数据。"""
 
     recent_messages: List[Message]
     relevant_history: List[str]
@@ -68,11 +67,11 @@ class MemoryContext:
 
     @staticmethod
     def _clean(text: str) -> str:
-        """Remove surrogate characters before prompt construction."""
+        """构造 prompt 前移除代理项字符。"""
         return text.encode("utf-8", errors="ignore").decode("utf-8")
 
     def to_prompt_text(self) -> str:
-        """Format the memory context as prompt text."""
+        """把记忆上下文格式化为 prompt 文本。"""
         parts = []
         if self.summary:
             parts.append(f"[会话摘要]\n{self._clean(self.summary)}")
@@ -93,7 +92,7 @@ class MemoryContext:
 
 
 class MemoryManager:
-    """Redis working memory plus ChromaDB episodic memory and profiles."""
+    """Redis 工作记忆，加上 ChromaDB 情景记忆与用户画像。"""
 
     WORKING_MAX = 20
     COMPRESS_AT = 15
@@ -158,7 +157,7 @@ class MemoryManager:
         content: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Append a message and compress while holding the conversation lock."""
+        """在持有会话锁的情况下追加消息并按需压缩。"""
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         clean_metadata = {
@@ -190,7 +189,7 @@ class MemoryManager:
                 await self._compress_locked(user_id, conv_id)
 
     async def update_profile(self, user_id: str, conv_id: str) -> None:
-        """Extract profile data from recent messages and store it in ChromaDB."""
+        """从最近消息中提取画像数据并存入 ChromaDB。"""
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         messages = await self._get_working_memory(user_id, conv_id)
@@ -256,7 +255,7 @@ class MemoryManager:
         conv_id: str,
         query: str = "",
     ) -> MemoryContext:
-        """Build the memory context used by one agent request."""
+        """构造一次 Agent 请求使用的记忆上下文。"""
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         query = self._safe_text(query)
@@ -278,16 +277,16 @@ class MemoryManager:
         )
 
     async def _compress(self, user_id: str, conv_id: str) -> None:
-        """Compress one conversation under its lock."""
+        """在会话锁内压缩一个会话。"""
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         async with self._lock_for(user_id, conv_id):
             await self._compress_locked(user_id, conv_id)
 
     async def _compress_locked(self, user_id: str, conv_id: str) -> None:
-        """Compress working memory while the caller holds the conversation lock."""
-        # Compression removes the whole list, so it must inspect every pending
-        # message, including a backlog left by earlier summary failures.
+        """调用方已持有会话锁时，执行工作记忆压缩。"""
+        # 压缩会删除整个列表，因此必须检查所有待处理消息，
+        # 包括此前摘要失败留下的积压。
         messages = await self._read_working_messages(
             user_id, conv_id, limit=None
         )
@@ -350,7 +349,7 @@ class MemoryManager:
         )
 
     async def _get_working_memory(self, user_id: str, conv_id: str) -> List[Message]:
-        """Return the latest messages used as the normal context window."""
+        """返回作为常规上下文窗口的最新消息。"""
         return await self._read_working_messages(
             user_id, conv_id, limit=self.WORKING_MAX
         )
@@ -383,7 +382,7 @@ class MemoryManager:
         conv_id: str,
         query: str,
     ) -> List[str]:
-        """Search the current conversation first, then the same user's history."""
+        """先检索当前会话，再检索同一用户的历史记录。"""
         query_text = self._safe_text(query).strip()
         if not query_text:
             return []
@@ -418,7 +417,7 @@ class MemoryManager:
         text: str,
         summary: str,
     ) -> bool:
-        """Store a compressed conversation; return False so callers keep messages."""
+        """存储压缩后的会话；失败返回 False，以便调用方保留消息。"""
         try:
             user_id = self._safe_text(user_id)
             conv_id = self._safe_text(conv_id)
@@ -446,7 +445,7 @@ class MemoryManager:
             return False
 
     async def _get_profile(self, user_id: str) -> Dict[str, Any]:
-        """Return the latest stored profile for a user."""
+        """返回用户最近一次存储的画像。"""
         try:
             doc_id = self._profile_doc_id(user_id)
             direct = await asyncio.to_thread(self._profile.get, ids=[doc_id])
@@ -463,7 +462,7 @@ class MemoryManager:
         return {}
 
     async def close(self) -> None:
-        """Close the async Redis connection."""
+        """关闭异步 Redis 连接。"""
         await self._redis.aclose()
 
     def _lock_for(self, user_id: str, conv_id: str) -> asyncio.Lock:
@@ -488,7 +487,7 @@ class MemoryManager:
 
     @staticmethod
     def _safe_text(value: Any) -> str:
-        """Convert a value to plain UTF-8 text acceptable to Redis and ChromaDB."""
+        """把值转换为 Redis 和 ChromaDB 可接受的纯 UTF-8 文本。"""
         if value is None:
             return ""
         if not isinstance(value, str):
@@ -497,7 +496,7 @@ class MemoryManager:
 
     @classmethod
     def _safe_metadata_value(cls, value: Any) -> Any:
-        """Recursively clean metadata strings."""
+        """递归清理元数据中的字符串。"""
         if isinstance(value, str):
             return cls._safe_text(value)
         if isinstance(value, dict):

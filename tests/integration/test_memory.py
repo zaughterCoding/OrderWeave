@@ -13,7 +13,7 @@ CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8002"))
 
 
 class PromptFakeMessages:
-    """Deterministic fake model for summaries and profile extraction."""
+    """用于摘要和画像抽取的确定性 Fake 模型。"""
 
     def __init__(self, marker):
         self.marker = marker
@@ -40,7 +40,7 @@ class PromptFakeAnthropic:
 
 
 class ToggleSummaryMessages:
-    """Fail summary calls until the test recovers the backend."""
+    """在测试恢复后端之前，让摘要调用持续失败。"""
 
     def __init__(self):
         self.fail_summary = True
