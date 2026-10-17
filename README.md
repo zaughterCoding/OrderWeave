@@ -1,6 +1,6 @@
 # AgentEcommerce
 
-基于 Anthropic 兼容协议与多路融合的电商客服 Agent 项目。当前提供工程基础、意图识别、多 Agent 编排、Skills、ChromaDB 知识库检索、分层记忆、性能监控与回复评测；HTTP/CLI 接口在后续阶段加入。
+基于 Anthropic 兼容协议与多路融合的电商客服 Agent 项目。当前提供 HTTP API 与交互式 CLI，接通意图识别、多 Agent 编排、Skills、ChromaDB 知识库检索、分层记忆、性能监控与回复评测。
 
 ## 环境要求
 
@@ -27,6 +27,48 @@ docker compose -f compose.yml stop
 ```
 
 默认端口：Redis `6380`，ChromaDB `8002`。卷为 `agent-ecommerce-redis-data`、`agent-ecommerce-chromadb-data`。
+
+## 启动 API 与 CLI
+
+先启动 Redis 与 ChromaDB，并配置 `.env`。API 默认只绑定本机回环地址：
+
+```powershell
+uv run --locked --offline python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+```
+
+Swagger 位于 `http://127.0.0.1:8000/docs`，健康检查为 `GET /health`。也可以直接运行：
+
+```powershell
+uv run --locked --offline python -m api.main
+```
+
+交互式 CLI：
+
+```powershell
+uv run --locked --offline python -m api.main --cli
+```
+
+输入 `quit`、`exit` 或 `退出` 结束 CLI。导入 `api.main` 只加载配置，不连接 Redis、ChromaDB 或付费模型；组件在应用启动时创建，停机时关闭。
+
+### HTTP 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health` | 服务状态与 Agent 统计 |
+| GET | `/skills` | 当前已加载的 Skills |
+| POST | `/skills/reload` | 重新扫描并热重载 Skills |
+| POST | `/chat` | 主对话：记忆读取、意图识别、Agent 路由、记忆写回 |
+| GET | `/monitor` | 监控摘要、告警与优化建议 |
+| GET | `/trace/tool/{request_id}` | 单次请求的工具调用明细 |
+| GET | `/trace/tools` | 最近请求的工具调用明细 |
+| GET | `/metrics` | Prometheus 文本指标 |
+| POST | `/search` | 查询改写、并行召回与重排 |
+| GET | `/knowledge/stats` | 知识库片段总数 |
+| POST | `/knowledge/add` | 批量导入 `{title, content}` 文档 |
+| POST | `/knowledge/upload` | 上传 `.txt`／`.md` 或 JSON 数组，限制 10MB |
+| POST | `/eval/run` | 运行意图与对话质量评测 |
+
+`POST /chat` 接受 `message`、`user_id` 和可选的 `conv_id`；未提供 `conv_id` 时由服务生成。`user_id`／`conv_id` 是原接口参数，不是已认证身份，本项目没有登录、权限控制或支付功能。
 
 ## 分层记忆
 
@@ -57,11 +99,14 @@ uv run --locked --offline pytest tests/integration/test_retrieval.py -q
 # 真实 Redis／ChromaDB 记忆集成测试，需先启动 redis 与 chromadb
 uv run --locked --offline pytest tests/integration/test_memory.py -q
 
+# HTTP API 与 CLI 集成测试，需先启动 redis 与 chromadb，使用 Fake 模型
+uv run --locked --offline pytest tests/integration/test_api.py -q
+
 # 当前全部测试
 uv run --locked --offline pytest tests -q
 ```
 
-测试模型使用 Fake 客户端。集成测试连接独立 Redis／ChromaDB，使用随机用户标识和随机测试集合，结束后只删除本次写入的键与记录。
+测试模型使用 Fake 客户端。API 集成测试通过 Fake 模型完成两轮对话、知识检索与记忆回读，覆盖全部 13 个路由和 CLI 退出。集成测试连接独立 Redis／ChromaDB，使用随机用户标识和随机测试集合，结束后只删除本次写入的键与记录。
 
 ## 配置
 
@@ -71,6 +116,10 @@ uv run --locked --offline pytest tests -q
 - `ANTHROPIC_BASE_URL`：Anthropic 兼容端点（可选）
 - `LLM_MODEL`：端点支持的模型标识
 - `ECHOMIND_SKILLS_DIR`：Skill 目录（可选，默认项目内 `skills/`）
+- `ECHOMIND_SKILLS_MAX_PROMPT_CHARS`：注入 Agent 的 Skill 内容上限（可选，默认 5000）
+- `API_HOST`、`API_PORT`：API 监听地址（默认 `127.0.0.1:8000`）
+- `APP_ENV`：设为 `development` 时启用 uvicorn 自动重载（可选）
+- `LOG_LEVEL`：日志级别（可选，默认 `INFO`）
 - `REDIS_URL`：独立 Redis 连接地址
 - `CHROMA_HOST`、`CHROMA_PORT`：独立 ChromaDB 地址
 - `CHROMA_PERSIST_DIRECTORY`：ChromaDB 服务不可用时的本地回退目录
@@ -81,10 +130,11 @@ uv run --locked --offline pytest tests -q
 - `EVAL_BASELINE_PATH`：只读评测基线文件（可选）
 - `EVAL_REPORT_DIR`：评测报告目录（可选；设置基线时默认基线同级的 `reports/`）
 
-真实模型调用会产生费用，自动化测试不读取这些配置。
+真实模型调用会产生费用；自动化测试只使用 Fake 客户端，不调用真实模型。
 
 ## 当前内容
 
+- `api/main.py`：FastAPI 入口、13 个路由、lifespan 组件装配与交互式 CLI。
 - `core/llm_utils.py`：从 Anthropic 风格响应中提取文本块。
 - `core/intent_recognizer.py`：LLM、Embedding 与关键词三路融合的意图识别，含本地 n-gram 回退与结果缓存。
 - `agents/agent_orchestrator.py`：General、Technical、Billing、Escalation 四类角色，意图路由、复合问题协作、工具往返、升级与响应合并。
@@ -100,6 +150,8 @@ uv run --locked --offline pytest tests -q
 
 ## 当前限制
 
-- 尚未提供 HTTP API 与 CLI 接口，监控与评测尚未接入服务启动流程。
-- 真实模型未验证；自动化测试只使用 Fake 客户端生成摘要、画像与 Judge 评分。
+- 真实模型未验证；自动化测试与本地烟测只使用 Fake 客户端或占位密钥，不构成模型质量结论。
+- 没有登录、RBAC、支付、订单查询或退款执行；`user_id`／`conv_id` 不是认证身份。
+- CORS 允许任意来源，API 默认仅监听 `127.0.0.1`，不适合直接作为生产部署。
 - 记忆压缩与追加只在单进程内互斥，不提供分布式锁。
+- 监控与评测已接入 API 启动流程；真实 webhook、Prometheus 外部抓取和真实 Judge 评分尚未验证。
