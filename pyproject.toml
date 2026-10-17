@@ -1,0 +1,30 @@
+[project]
+name = "agent-ecommerce"
+version = "0.1.0"
+description = "Customer service agent with intent recognition, skills, retrieval and layered memory."
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "anthropic==0.40.0",
+    "fastapi==0.115.5",
+    "uvicorn[standard]==0.32.1",
+    "pydantic==2.10.3",
+    "python-multipart==0.0.12",
+    "redis==5.2.1",
+    "chromadb==0.5.23",
+    "prometheus-client==0.21.1",
+    "httpx==0.28.1",
+    "python-dotenv==1.0.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
