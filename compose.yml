@@ -1,0 +1,54 @@
+# Independent local services. Start only what the current task needs:
+#   docker compose -f compose.yml up -d redis chromadb
+# Host ports are intentionally different from the reference project.
+name: agent-ecommerce
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: agent-ecommerce-redis
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - "${REDIS_PASSWORD:-agentecommerce123}"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - redis-cli -a ${REDIS_PASSWORD:-agentecommerce123} ping | grep -q PONG
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  chromadb:
+    image: chromadb/chroma:0.5.23
+    container_name: agent-ecommerce-chromadb
+    ports:
+      - "${CHROMA_PORT:-8002}:8000"
+    environment:
+      - IS_PERSISTENT=TRUE
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - ANONYMIZED_TELEMETRY=FALSE
+    volumes:
+      - chromadb-data:/chroma/chroma
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -sf http://localhost:8000/api/v1/heartbeat || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  redis-data:
+    name: agent-ecommerce-redis-data
+  chromadb-data:
+    name: agent-ecommerce-chromadb-data
