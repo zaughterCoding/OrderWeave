@@ -261,24 +261,33 @@ class IntentRecognizer:
 可选意图: {", ".join(c.value for c in IntentCategory)}"""
         prompt = self._clean_text(prompt)
 
-        try:
-            resp = await self.client.messages.create(
-                model=self.model,
-                max_tokens=256,
-                temperature=0.1,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            raw = extract_text_content(resp.content)
-            s, e = raw.find("{"), raw.rfind("}") + 1
-            data = json.loads(raw[s:e])
+        last_error: Optional[Exception] = None
+        # 推理偶尔耗尽预算仍未输出 JSON；有界重试一次，避免静默降级。
+        for attempt in range(2):
             try:
-                data["intent"] = IntentCategory(data["intent"])
-            except ValueError:
-                data["intent"] = IntentCategory.OTHER
-            return data
-        except Exception as ex:
-            logger.warning(f"LLM 识别失败: {ex}")
-            return {"intent": IntentCategory.OTHER, "confidence": 0.0, "reasoning": "LLM 失败", "failed": True}
+                resp = await self.client.messages.create(
+                    model=self.model,
+                    # 意图判断会先输出推理，需要给完整 JSON 留出足够空间。
+                    max_tokens=2048,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                raw = extract_text_content(resp.content)
+                s, e = raw.find("{"), raw.rfind("}") + 1
+                if s < 0 or e <= s:
+                    raise ValueError("模型未返回 JSON 文本")
+                data = json.loads(raw[s:e])
+                try:
+                    data["intent"] = IntentCategory(data["intent"])
+                except ValueError:
+                    data["intent"] = IntentCategory.OTHER
+                return data
+            except Exception as ex:
+                last_error = ex
+                if attempt == 0:
+                    logger.warning(f"LLM 识别失败，重试一次: {ex}")
+        logger.warning(f"LLM 识别失败: {last_error}")
+        return {"intent": IntentCategory.OTHER, "confidence": 0.0, "reasoning": "LLM 失败", "failed": True}
 
     async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
         """信号 2：与模板话术做 Embedding 相似度匹配。"""

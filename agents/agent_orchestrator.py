@@ -484,7 +484,8 @@ class GeneralAgent(BaseAgent):
         handoff_conditions=("涉及权限、资金、隐私或复杂投诉", "用户明确要求人工"),
         tool_scope=("search_knowledge_base", "inspect_request_context", "suggest_required_fields"),
         temperature=0.3,
-        max_tokens=900,
+        # 真实模型会把推理写入输出，900 会在答复中途截断。
+        max_tokens=1600,
     )
     system_prompt = (
         "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
@@ -514,7 +515,8 @@ class TechnicalAgent(BaseAgent):
         handoff_conditions=("生产大面积不可用", "数据丢失或权限异常", "需要后台日志、数据库或人工操作"),
         tool_scope=("search_knowledge_base", "lookup_error_code", "build_diagnostic_plan"),
         temperature=0.1,
-        max_tokens=1200,
+        # 排查步骤较长，1200 会在答复中途截断。
+        max_tokens=2000,
     )
     system_prompt = (
         "你是技术支持专家。专注于：故障排查、错误诊断、系统配置。"
@@ -547,7 +549,8 @@ class BillingAgent(BaseAgent):
         handoff_conditions=("实际退款或补偿", "重复扣款或支付成功但订单未生效", "发票作废/重开", "企业合同或大额订单"),
         tool_scope=("search_knowledge_base", "check_billing_fields", "compare_amounts"),
         temperature=0.0,
-        max_tokens=1100,
+        # 核验字段与退款边界说明较长，1100 会在答复中途截断。
+        max_tokens=2000,
     )
     system_prompt = (
         "你是账单服务专家。专注于：账单查询、退款申请、发票问题、订阅管理。"
@@ -662,7 +665,8 @@ class ResponseComposer:
         try:
             response = await self._client.messages.create(
                 model=self._model,
-                max_tokens=_env_int("ECHOMIND_COMPOSER_MAX_TOKENS", 1000),
+                # 两个完整 Agent 答复较长时，模型会先输出推理，3000 仍可能只产生 reasoning。
+                max_tokens=_env_int("ECHOMIND_COMPOSER_MAX_TOKENS", 8192),
                 temperature=_env_float("ECHOMIND_COMPOSER_TEMPERATURE", 0.1),
                 messages=[{"role": "user", "content": prompt}],
             )

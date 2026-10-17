@@ -114,7 +114,8 @@ Agent 响应: {response}
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=256,
+                # 结构化 JSON 输出需要给推理留出空间，1024 可覆盖较长答复。
+                max_tokens=1024,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )

@@ -217,7 +217,8 @@ class MemoryManager:
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=512,
+                # 画像提取偶尔会耗尽预算仍未输出 JSON，2048 留出更多空间。
+                max_tokens=2048,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -305,7 +306,8 @@ class MemoryManager:
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=256,
+                # 中文摘要按字符计长，768 可避免长对话摘要被截断。
+                max_tokens=768,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
@@ -564,7 +566,8 @@ class MemoryManager:
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=256,
+                # 摘要合并可能包含较多上下文，1024 可稳定输出完整摘要。
+                max_tokens=1024,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )

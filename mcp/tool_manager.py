@@ -285,19 +285,38 @@ class MCPToolManager:
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=256,
+                # 结构化 JSON 输出需要给推理留出空间，1024 可覆盖较长查询。
+                max_tokens=1024,
                 temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = extract_text_content(resp.content)
-            start, end = raw.find("["), raw.rfind("]") + 1
-            queries = json.loads(raw[start:end])
-            if not isinstance(queries, list):
+            # 模型偶尔把多个子查询分成多个并列数组返回，按数组逐个解析。
+            queries = self._parse_json_arrays(raw)
+            if not queries:
+                logger.warning("查询改写未解析到 JSON 数组，使用原始查询")
                 return [query]
-            return list(dict.fromkeys([query] + [str(item) for item in queries]))
+            return list(dict.fromkeys([query] + queries))
         except Exception as ex:
             logger.warning(f"查询改写失败，使用原始查询: {ex}")
             return [query]
+
+    @staticmethod
+    def _parse_json_arrays(raw: str) -> List[str]:
+        """解析文本中的一个或多个 JSON 数组，跳过无法解析的括号片段。"""
+        decoder = json.JSONDecoder()
+        values: List[str] = []
+        index = raw.find("[")
+        while index >= 0:
+            try:
+                value, end = decoder.raw_decode(raw, index)
+            except json.JSONDecodeError:
+                index = raw.find("[", index + 1)
+                continue
+            if isinstance(value, list):
+                values.extend(str(item) for item in value)
+            index = raw.find("[", end)
+        return values
 
     async def search_with_rewrite(
         self,
@@ -410,7 +429,8 @@ class MCPToolManager:
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                max_tokens=256,
+                # 模型偶尔会把大量预算用于内部推理，8192 才能稳定输出完整索引。
+                max_tokens=8192,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
