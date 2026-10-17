@@ -5,11 +5,13 @@ ChromaDB services. It never calls a paid model endpoint.
 """
 import asyncio
 import builtins
+import json
 import os
 import uuid
 from types import SimpleNamespace
 
 import chromadb
+import pytest
 import redis
 from fastapi.testclient import TestClient
 
@@ -370,3 +372,163 @@ def test_cli_quit_exits_and_closes_memory(monkeypatch):
     asyncio.run(api_main._cli())
 
     assert closed["value"] is True
+
+
+class _CliFakeMessages(FakeMessages):
+    """Ask the knowledge tool for the unique marker, then answer normally."""
+
+    def __init__(self, marker: str):
+        super().__init__()
+        self.marker = marker
+
+    async def create(self, **kwargs):
+        last_message = _last_message_text(kwargs)
+        if kwargs.get("tools") and "检索知识库" in last_message:
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                content=[
+                    SimpleNamespace(
+                        type="tool_use",
+                        id="toolu_cli_kb",
+                        name="search_knowledge_base",
+                        input={
+                            "query": f"{self.marker} 退款政策",
+                            "top_k": 10,
+                        },
+                    )
+                ]
+            )
+        return await super().create(**kwargs)
+
+
+class _CliFakeMemory:
+    closed: list[bool] = []
+    fail_on_add: bool = False
+
+    def __init__(self, **kwargs):
+        pass
+
+    async def get_context(self, user_id, conv_id, query=None):
+        return SimpleNamespace(recent_messages=[], to_prompt_text=lambda: "")
+
+    async def add_message(self, *args, **kwargs):
+        if type(self).fail_on_add:
+            raise RuntimeError("memory write failed")
+
+    async def close(self):
+        type(self).closed.append(True)
+
+
+def _prepare_cli_knowledge_test(monkeypatch, marker, collection_name):
+    monkeypatch.setattr(KnowledgeBase, "COLLECTION_NAME", collection_name)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("LLM_MODEL", "fake-model")
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setenv("CHROMA_HOST", CHROMA_HOST)
+    monkeypatch.setenv("CHROMA_PORT", str(CHROMA_PORT))
+
+    fake = _CliFakeMessages(marker)
+    client = SimpleNamespace(messages=fake)
+    for target in (
+        "agents.agent_orchestrator.AsyncAnthropic",
+        "core.intent_recognizer.AsyncAnthropic",
+        "mcp.tool_manager.AsyncAnthropic",
+    ):
+        monkeypatch.setattr(target, lambda **kwargs: client)
+    monkeypatch.setattr(
+        "memory.conversation_memory.MemoryManager", _CliFakeMemory
+    )
+
+    knowledge = KnowledgeBase(
+        chroma_host=CHROMA_HOST,
+        chroma_port=CHROMA_PORT,
+        chroma_path="unused",
+    )
+    assert knowledge._use_server is True, (
+        "independent ChromaDB service is required at "
+        f"{CHROMA_HOST}:{CHROMA_PORT}"
+    )
+    knowledge.add_documents(
+        [
+            {
+                "title": f"唯一政策 {marker}",
+                "content": (
+                    f"火星退款条款 {marker}：订单号 MARS-CLI 在七天内"
+                    "可以申请退款。"
+                ),
+            }
+        ]
+    )
+    return fake
+
+
+def _drop_collection(collection_name):
+    try:
+        chroma = chromadb.HttpClient(
+            host=CHROMA_HOST,
+            port=CHROMA_PORT,
+            settings=chromadb.Settings(anonymized_telemetry=False),
+        )
+        chroma.delete_collection(collection_name)
+    except Exception:
+        pass
+
+
+def test_cli_injects_knowledge_tools_and_returns_real_chroma_hit(monkeypatch):
+    collection_name = f"cli_test_{uuid.uuid4().hex}"
+    marker = f"CLI-MARKER-{uuid.uuid4().hex}"
+    fake = _prepare_cli_knowledge_test(monkeypatch, marker, collection_name)
+    _CliFakeMemory.closed = []
+    _CliFakeMemory.fail_on_add = False
+    inputs = iter(
+        [f"请检索知识库：{marker} 对应的政策", "quit"]
+    )
+    monkeypatch.setattr(builtins, "input", lambda prompt="": next(inputs))
+
+    try:
+        asyncio.run(api_main._cli())
+    finally:
+        _drop_collection(collection_name)
+
+    tool_payloads = []
+    for call in fake.calls:
+        for message in call.get("messages") or []:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_payloads.append(json.loads(block["content"]))
+
+    assert tool_payloads
+    payload = tool_payloads[-1]
+    assert payload["success"] is True
+    assert payload["degraded"] is False
+    assert any(
+        marker in item.get("content", "")
+        for item in payload["results"]
+    )
+    assert _CliFakeMemory.closed == [True]
+
+
+def test_cli_closes_memory_when_a_turn_fails(monkeypatch):
+    collection_name = f"cli_test_{uuid.uuid4().hex}"
+    marker = f"CLI-MARKER-{uuid.uuid4().hex}"
+    _prepare_cli_knowledge_test(monkeypatch, marker, collection_name)
+    _CliFakeMemory.closed = []
+    _CliFakeMemory.fail_on_add = True
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        lambda prompt="": f"请检索知识库：{marker} 对应的政策",
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="memory write failed"):
+            asyncio.run(api_main._cli())
+    finally:
+        _drop_collection(collection_name)
+        _CliFakeMemory.fail_on_add = False
+
+    assert _CliFakeMemory.closed == [True]
+

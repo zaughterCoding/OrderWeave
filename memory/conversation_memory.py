@@ -286,7 +286,11 @@ class MemoryManager:
 
     async def _compress_locked(self, user_id: str, conv_id: str) -> None:
         """Compress working memory while the caller holds the conversation lock."""
-        messages = await self._get_working_memory(user_id, conv_id)
+        # Compression removes the whole list, so it must inspect every pending
+        # message, including a backlog left by earlier summary failures.
+        messages = await self._read_working_messages(
+            user_id, conv_id, limit=None
+        )
         if len(messages) < self.COMPRESS_AT:
             return
 
@@ -346,8 +350,20 @@ class MemoryManager:
         )
 
     async def _get_working_memory(self, user_id: str, conv_id: str) -> List[Message]:
+        """Return the latest messages used as the normal context window."""
+        return await self._read_working_messages(
+            user_id, conv_id, limit=self.WORKING_MAX
+        )
+
+    async def _read_working_messages(
+        self,
+        user_id: str,
+        conv_id: str,
+        limit: Optional[int],
+    ) -> List[Message]:
         key = self._wm_key(user_id, conv_id)
-        raws = await self._redis.lrange(key, 0, self.WORKING_MAX - 1)
+        end = -1 if limit is None else limit - 1
+        raws = await self._redis.lrange(key, 0, end)
         messages = []
         for raw in reversed(raws):
             data = json.loads(raw)

@@ -1,12 +1,25 @@
 """Tests for performance monitoring and response evaluation."""
 import asyncio
 import json
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
+from prometheus_client import CollectorRegistry, generate_latest
 
-from agents.agent_orchestrator import AgentType, OrchestratorResult
-from core.intent_recognizer import IntentCategory
+import monitor.performance_monitor as performance_monitor
+from agents.agent_orchestrator import (
+    AgentOrchestrator,
+    AgentType,
+    BillingAgent,
+    EscalationAgent,
+    GeneralAgent,
+    OrchestratorResult,
+    Request,
+    ResponseComposer,
+    TechnicalAgent,
+)
+from core.intent_recognizer import IntentCategory, UrgencyLevel
 from evaluation.evaluator import EndToEndEvaluator, LLMJudge
 from mcp.tool_manager import MCPToolManager, Tool, ToolStats
 from monitor.performance_monitor import PerformanceMonitor
@@ -310,3 +323,129 @@ def test_tool_manager_exposes_latency_sample_count():
         assert stats["avg_latency_ms"] >= 0.0
 
     asyncio.run(scenario())
+
+
+def test_monitor_updates_resolves_and_retriggers_active_alerts():
+    stats = {
+        "general_0": {"total": 10, "success_rate": 0.5, "avg_ms": 100.0},
+        "billing_0": {"total": 10, "success_rate": 0.5, "avg_ms": 100.0},
+    }
+    orchestrator = FakeOrchestrator(stats)
+    monitor = PerformanceMonitor(orchestrator, FakeToolManager({}), interval_s=3600)
+
+    def active_metrics():
+        return [alert["metric"] for alert in monitor.summary()["active_alerts"]]
+
+    asyncio.run(monitor._collect())
+    assert active_metrics().count("agent_success_rate:general_0") == 1
+    assert "agent_success_rate:billing_0" in active_metrics()
+
+    asyncio.run(monitor._collect())
+    assert active_metrics().count("agent_success_rate:general_0") == 1
+
+    stats["general_0"]["success_rate"] = 1.0
+    asyncio.run(monitor._collect())
+    assert "agent_success_rate:general_0" not in active_metrics()
+    assert "agent_success_rate:billing_0" in active_metrics()
+    assert orchestrator.penalties["general_0"] == pytest.approx(0.0)
+
+    stats["general_0"]["success_rate"] = 0.5
+    asyncio.run(monitor._collect())
+    assert active_metrics().count("agent_success_rate:general_0") == 1
+
+
+def test_prometheus_exports_agent_executions_and_average_latency(monkeypatch):
+    registry = CollectorRegistry()
+    monkeypatch.setattr(
+        performance_monitor,
+        "start_http_server",
+        lambda port, **kwargs: None,
+    )
+    stats = {
+        "general_0": {"total": 4, "success_rate": 0.9, "avg_ms": 500.0}
+    }
+    monitor = PerformanceMonitor(
+        FakeOrchestrator(stats),
+        FakeToolManager({}),
+        interval_s=3600,
+        prometheus_port=9101,
+        prometheus_registry=registry,
+    )
+
+    asyncio.run(monitor._collect())
+    text = generate_latest(registry).decode("utf-8")
+    assert "# TYPE agent_executions_total counter" in text
+    assert 'agent_executions_total{agent="general_0"} 4.0' in text
+    assert "# TYPE agent_avg_latency_ms gauge" in text
+    assert 'agent_avg_latency_ms{agent="general_0"} 500.0' in text
+
+    asyncio.run(monitor._collect())
+    text = generate_latest(registry).decode("utf-8")
+    assert 'agent_executions_total{agent="general_0"} 4.0' in text
+    assert 'agent_avg_latency_ms{agent="general_0"} 500.0' in text
+    assert "agent_avg_latency_ms_count" not in text
+
+    stats["general_0"]["avg_ms"] = 700.0
+    asyncio.run(monitor._collect())
+    text = generate_latest(registry).decode("utf-8")
+    assert 'agent_executions_total{agent="general_0"} 4.0' in text
+    assert 'agent_avg_latency_ms{agent="general_0"} 700.0' in text
+
+
+class _ReplyClient:
+    class Messages:
+        async def create(inner, **kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="已处理。")]
+            )
+
+    def __init__(self):
+        self.messages = self.Messages()
+
+
+def test_agent_execution_count_follows_real_multi_agent_run(monkeypatch):
+    registry = CollectorRegistry()
+    monkeypatch.setattr(
+        performance_monitor,
+        "start_http_server",
+        lambda port, **kwargs: None,
+    )
+    client = _ReplyClient()
+    orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
+    orchestrator._pool = {
+        AgentType.GENERAL: [GeneralAgent(client, "test-model")],
+        AgentType.TECHNICAL: [TechnicalAgent(client, "test-model")],
+        AgentType.BILLING: [BillingAgent(client, "test-model")],
+        AgentType.ESCALATION: [EscalationAgent(client, "test-model")],
+    }
+    orchestrator._recent_tool_traces = deque(maxlen=20)
+    orchestrator._skill_manager = None
+    orchestrator._shared_tools = {}
+    orchestrator._composer = ResponseComposer(client, "test-model")
+    request = Request(
+        message="登录时报 401，同时这笔订单被重复扣款",
+        user_id="u1",
+        conv_id="c1",
+        intent=IntentCategory.TECHNICAL_LOGIN,
+        intent_group="technical",
+        urgency=UrgencyLevel.HIGH,
+        entities={"error_code": ["401"]},
+    )
+
+    asyncio.run(orchestrator.run(request))
+
+    assert sum(
+        stats["total"] for stats in orchestrator.get_stats().values()
+    ) == 2
+
+    monitor = PerformanceMonitor(
+        orchestrator,
+        FakeToolManager({}),
+        interval_s=3600,
+        prometheus_port=9101,
+        prometheus_registry=registry,
+    )
+    asyncio.run(monitor._collect())
+    text = generate_latest(registry).decode("utf-8")
+    assert 'agent_executions_total{agent="technical_0"} 1.0' in text
+    assert 'agent_executions_total{agent="billing_0"} 1.0' in text

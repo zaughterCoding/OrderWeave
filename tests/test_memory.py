@@ -83,8 +83,10 @@ class FakeMessages:
         self.error = error
         self.started = started
         self.release = release
+        self.calls = []
 
     async def create(self, **kwargs):
+        self.calls.append(kwargs)
         if self.started is not None:
             self.started.set()
         if self.release is not None:
@@ -245,3 +247,53 @@ def test_episodic_storage_failure_preserves_working_memory():
 
     assert len(messages) == 15
     assert "summary:user-1:conv-1" not in manager._redis.values
+
+
+def test_recovery_compresses_the_whole_backlog_after_summary_failure():
+    manager = make_manager(client=FakeAnthropic(error=RuntimeError("llm down")))
+    key = manager._wm_key("user-1", "conv-1")
+
+    async def scenario():
+        for index in range(21):
+            await manager.add_message(
+                "user-1", "conv-1", MsgRole.USER, f"m{index}"
+            )
+
+        raw_backlog = list(manager._redis.lists[key])
+        window = await manager._get_working_memory("user-1", "conv-1")
+
+        manager._client.messages.error = None
+        manager._client.messages.response = "恢复摘要"
+        await manager.add_message("user-1", "conv-1", MsgRole.USER, "m21")
+
+        summary_prompts = [
+            call["messages"][0]["content"]
+            for call in manager._client.messages.calls
+            if "总结以下对话" in call["messages"][0]["content"]
+        ]
+        return (
+            raw_backlog,
+            window,
+            await manager._get_working_memory("user-1", "conv-1"),
+            summary_prompts,
+            manager._redis.values.get("summary:user-1:conv-1"),
+            list(manager._episodic.added),
+        )
+
+    raw_backlog, window, messages, prompts, summary, episodic = asyncio.run(
+        scenario()
+    )
+
+    assert len(raw_backlog) == 21
+    assert [message.content for message in window] == [
+        f"m{index}" for index in range(1, 21)
+    ]
+    assert [message.content for message in messages] == [
+        "m17", "m18", "m19", "m20", "m21"
+    ]
+    assert len(prompts) > 1
+    recovery_prompt = prompts[-1]
+    expected_input = "\n".join(f"user: m{index}" for index in range(17))
+    assert expected_input in recovery_prompt
+    assert summary == "恢复摘要"
+    assert len(episodic) == 1

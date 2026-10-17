@@ -81,7 +81,14 @@ uv run --locked --offline python -m api.main --cli
 ## 监控与评测
 
 - `PerformanceMonitor` 定时读取 `AgentOrchestrator.get_stats()` 与 `MCPToolManager.get_stats()`，按阈值产生告警，并把成功率与平均延迟折算为路由惩罚回传给编排器。
+- 告警按 `指标:标签` 维护活动状态：故障持续时更新同一条活动告警，恢复时标记为已解决，再次触发时创建新告警；webhook 只在新建告警时发送。
 - 告警可选通过 webhook 发送，指标可选通过 Prometheus 暴露；自动化测试不会向外部发送 webhook。
+- 设置 `MONITOR_PROMETHEUS_PORT` 后，监控进程在该端口启动 Prometheus HTTP 暴露器，`/metrics` 同时输出这些业务指标：
+  - `agent_success_rate{agent}`（Gauge）：Agent 当前成功率。
+  - `agent_avg_latency_ms{agent}`（Gauge，毫秒）：Agent 当前平均延迟；采集轮询不会产生延迟样本。
+  - `tool_success_rate{tool}`（Gauge）：工具当前成功率。
+  - `agent_executions_total{agent}`（Counter）：监控观测到的 Agent 执行次数累计值；多 Agent 请求会为每个参与的 Agent 各计一次，不代表 HTTP 请求数。
+- 未设置 `MONITOR_PROMETHEUS_PORT` 时只注册 Python 进程默认指标，不产出上述业务指标。
 - `EndToEndEvaluator` 计算意图识别 Accuracy／Macro-F1，并使用 LLM-as-Judge 评估相关性、准确性、完整性与有用性。
 - Judge 解析失败的结果记录 `GRADER_ERROR`、`passed=False` 和空 `scores`；报告保留结果总数并统计 `grader_errors`，平均值只使用有效评分。
 - `baseline_path` 只读；每次评测写入新的 `report_<timestamp>.json`，不会覆盖基线或已有报告。

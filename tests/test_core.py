@@ -95,6 +95,99 @@ class _FakeClient:
         self.messages = _FakeMessages(text)
 
 
+class _PromptFakeMessages:
+    """Return a different intent depending on a marker in the prompt."""
+
+    def __init__(self):
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        prompt = kwargs["messages"][0]["content"]
+        intent = "technical_login" if "TAIL-B" in prompt else "refund"
+        return SimpleNamespace(
+            content=[
+                SimpleNamespace(
+                    type="text",
+                    text=(
+                        f'{{"intent": "{intent}", "confidence": 0.9, '
+                        '"reasoning": "fake intent"}'
+                    ),
+                )
+            ]
+        )
+
+
+class _PromptFakeClient:
+    def __init__(self):
+        self.messages = _PromptFakeMessages()
+
+
+def make_cache_recognizer(client):
+    recognizer = IntentRecognizer.__new__(IntentRecognizer)
+    recognizer.client = client
+    recognizer.model = "fake-model"
+    recognizer.threshold = 0.5
+    recognizer._embedding_enabled = False
+    recognizer._cache = {}
+    recognizer.cache_hits = 0
+    recognizer.cache_misses = 0
+    return recognizer
+
+
+def test_intent_cache_does_not_share_entities_between_long_messages():
+    client = _PromptFakeClient()
+    recognizer = make_cache_recognizer(client)
+    prefix = "同一段较长的客服工单描述" * 30
+
+    first = asyncio.run(
+        recognizer.recognize(f"{prefix} order_id: AAAA1111")
+    )
+    second = asyncio.run(
+        recognizer.recognize(f"{prefix} order_id: BBBB2222")
+    )
+
+    assert first is not second
+    assert first.entities["order_id"] == ["AAAA1111"]
+    assert second.entities["order_id"] == ["BBBB2222"]
+    assert len(client.messages.calls) == 2
+
+
+def test_intent_cache_uses_the_full_recent_history_window():
+    client = _PromptFakeClient()
+    recognizer = make_cache_recognizer(client)
+    prefix = "最近对话的公共前缀" * 30
+
+    first = asyncio.run(
+        recognizer.recognize(
+            "请查看这个问题",
+            history=[{"role": "user", "content": prefix + "TAIL-A"}],
+        )
+    )
+    second = asyncio.run(
+        recognizer.recognize(
+            "请查看这个问题",
+            history=[{"role": "user", "content": prefix + "TAIL-B"}],
+        )
+    )
+
+    assert first.intent is IntentCategory.REFUND
+    assert second.intent is IntentCategory.TECHNICAL_LOGIN
+    assert len(client.messages.calls) == 2
+
+
+def test_identical_message_and_history_still_hit_the_cache():
+    client = _PromptFakeClient()
+    recognizer = make_cache_recognizer(client)
+    history = [{"role": "user", "content": "我要申请退款"}]
+
+    first = asyncio.run(recognizer.recognize("请查看退款进度", history=history))
+    second = asyncio.run(recognizer.recognize("请查看退款进度", history=history))
+
+    assert second is first
+    assert len(client.messages.calls) == 1
+
+
 def test_recognize_with_fake_client():
     recognizer = IntentRecognizer.__new__(IntentRecognizer)
     recognizer.client = _FakeClient(

@@ -459,12 +459,14 @@ class IntentRecognizer:
         return UrgencyLevel.LOW
 
     def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
-        payload = {"message": self._clean_text(message)[:200]}
+        # The cache stores entities and urgency, so the key must cover every
+        # input character that can affect recognition within the history window.
+        payload = {"message": self._clean_text(message)}
         if history:
             payload["history"] = [
                 {
-                    "role": self._clean_text(item.get("role", ""))[:20],
-                    "content": self._clean_text(item.get("content", ""))[:160],
+                    "role": self._clean_text(item.get("role", "")),
+                    "content": self._clean_text(item.get("content", "")),
                 }
                 for item in history[-3:]
             ]

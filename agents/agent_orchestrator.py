@@ -112,6 +112,7 @@ class AgentResponse:
     escalate:    bool  = False   # whether escalation is required
     tools_used:  List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+    knowledge_hits: int = 0
 
 
 @dataclass
@@ -120,15 +121,23 @@ class AgentCallResult:
     content: str
     tools_used: List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+    knowledge_hits: int = 0
 
 
 class AgentCallError(RuntimeError):
     """Keep tool calls made before a failure so the request trace stays accurate."""
 
-    def __init__(self, message: str, tools_used: List[str], tool_traces: List[Dict[str, Any]]):
+    def __init__(
+        self,
+        message: str,
+        tools_used: List[str],
+        tool_traces: List[Dict[str, Any]],
+        knowledge_hits: int = 0,
+    ):
         super().__init__(message)
         self.tools_used = list(tools_used)
         self.tool_traces = list(tool_traces)
+        self.knowledge_hits = knowledge_hits
 
 
 @dataclass
@@ -159,6 +168,7 @@ class OrchestratorResult:
     supporting_agents: List[AgentType] = field(default_factory=list)
     tools_used: List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
+    knowledge_hits: int = 0
     routing_reason: str = ""
     routing_confidence: float = 0.0
 
@@ -227,6 +237,7 @@ class BaseAgent:
                 escalate=escalate,
                 tools_used=call_result.tools_used,
                 tool_traces=call_result.tool_traces,
+                knowledge_hits=call_result.knowledge_hits,
             )
         except Exception as ex:
             ms = (time.monotonic() - t0) * 1000
@@ -234,6 +245,9 @@ class BaseAgent:
             logger.error(f"{self.agent_type.value} 处理失败: {ex}")
             tools_used = ex.tools_used if isinstance(ex, AgentCallError) else []
             tool_traces = ex.tool_traces if isinstance(ex, AgentCallError) else []
+            knowledge_hits = (
+                ex.knowledge_hits if isinstance(ex, AgentCallError) else 0
+            )
             return AgentResponse(
                 agent_type=self.agent_type,
                 content="抱歉，处理您的请求时出现问题，请稍后重试。",
@@ -241,6 +255,7 @@ class BaseAgent:
                 latency_ms=ms,
                 tools_used=list(tools_used),
                 tool_traces=list(tool_traces),
+                knowledge_hits=knowledge_hits,
             )
 
     async def _call_llm(self, req: Request) -> AgentCallResult:
@@ -264,6 +279,7 @@ class BaseAgent:
         tools = self.get_tools()
         tools_used: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
+        knowledge_hits = 0
         try:
             for _ in range(3):
                 request_kwargs: Dict[str, Any] = {
@@ -289,6 +305,7 @@ class BaseAgent:
                         content=extract_text_content(resp.content),
                         tools_used=list(tools_used),
                         tool_traces=list(tool_traces),
+                        knowledge_hits=knowledge_hits,
                     )
 
                 messages.append({"role": "assistant", "content": resp.content})
@@ -323,6 +340,7 @@ class BaseAgent:
                     tool_latency_ms = (time.monotonic() - tool_t0) * 1000
                     if not error_text and isinstance(result, dict):
                         error_text = str(result.get("error", "") or "")
+                    knowledge_hits += self._knowledge_hit_count(name, result)
                     tool_traces.append(
                         {
                             "agent_type": self.agent_type.value,
@@ -348,11 +366,31 @@ class BaseAgent:
                 f"{self.agent_type.value} 工具调用超过最大轮数",
                 tools_used,
                 tool_traces,
+                knowledge_hits,
             )
         except AgentCallError:
             raise
         except Exception as ex:
-            raise AgentCallError(str(ex), tools_used, tool_traces) from ex
+            raise AgentCallError(
+                str(ex), tools_used, tool_traces, knowledge_hits
+            ) from ex
+
+    @staticmethod
+    def _knowledge_hit_count(name: str, result: Any) -> int:
+        """Count usable knowledge fragments, ignoring failed or empty calls."""
+        if name != "search_knowledge_base" or not isinstance(result, dict):
+            return 0
+        if result.get("success") is not True:
+            return 0
+        fragments = result.get("results")
+        if not isinstance(fragments, list):
+            return 0
+        return sum(
+            1
+            for item in fragments
+            if isinstance(item, dict)
+            and str(item.get("content") or "").strip()
+        )
 
     @staticmethod
     def _block_type(block: Any) -> Optional[str]:
@@ -783,6 +821,12 @@ class AgentOrchestrator:
             req.intent_group = intent_result.intent_group
             req.urgency = intent_result.urgency
             req.intent_confidence = intent_result.confidence
+            # Callers that pass explicit entities already know their values;
+            # recognized fields only fill the gaps.
+            recognized_entities = dict(intent_result.entities or {})
+            if req.entities:
+                recognized_entities.update(req.entities)
+            req.entities = recognized_entities
 
         if self._needs_clarification(req):
             result = OrchestratorResult(
@@ -831,6 +875,7 @@ class AgentOrchestrator:
             supporting_agents=[],
             tools_used=list(response.tools_used),
             tool_traces=list(response.tool_traces),
+            knowledge_hits=response.knowledge_hits if response.success else 0,
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
         )
@@ -857,6 +902,12 @@ class AgentOrchestrator:
             for response in valid_responses
             for trace in response.tool_traces
         ]
+        # A valid hit from any contributing agent makes the request knowledge-backed.
+        knowledge_hits = sum(
+            response.knowledge_hits
+            for response in valid_responses
+            if response.success
+        )
         result = OrchestratorResult(
             request_id=req.request_id,
             response=combined,
@@ -872,6 +923,7 @@ class AgentOrchestrator:
             supporting_agents=decision.supporting_agents,
             tools_used=tools_used,
             tool_traces=tool_traces,
+            knowledge_hits=knowledge_hits,
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
         )

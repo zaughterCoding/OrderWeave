@@ -243,3 +243,132 @@ def test_shared_rag_tool_exposes_partial_degradation():
     assert result["success"] is True
     assert result["degraded"] is True
     assert result["results"][0]["title"] == "退款政策"
+
+
+def test_same_fragment_id_with_different_scores_is_merged_once(monkeypatch):
+    manager, messages = make_manager(
+        monkeypatch, ['["第二查询"]', "[0, 1]"]
+    )
+
+    async def handler(params, context):
+        if params["query"] == "第二查询":
+            return [
+                {
+                    "id": "doc-1",
+                    "title": "退款政策",
+                    "content": "7 天内可退款",
+                    "score": 0.8,
+                }
+            ]
+        return [
+            {
+                "id": "doc-1",
+                "title": "退款政策",
+                "content": "7 天内可退款",
+                "score": 0.9,
+            },
+            {
+                "id": "doc-2",
+                "title": "发票说明",
+                "content": "发票可在账户中心下载",
+                "score": 0.7,
+            },
+        ]
+
+    manager.register(knowledge_tool(handler))
+
+    result = asyncio.run(
+        manager.search_with_rewrite("knowledge_search", "退款", top_k=1)
+    )
+
+    assert result.success is True
+    assert [item["id"] for item in result.data] == ["doc-1"]
+    assert result.data[0]["score"] == 0.9
+    rerank_prompt = messages.calls[1]["messages"][0]["content"]
+    assert rerank_prompt.count('"id": "doc-1"') == 1
+
+
+def test_same_title_with_different_fragment_ids_is_kept(monkeypatch):
+    manager, _ = make_manager(monkeypatch, ['["第二查询"]'])
+
+    async def handler(params, context):
+        score = 0.9 if params["query"] == "退款" else 0.8
+        return [
+            {
+                "id": "doc-a",
+                "title": "退款政策",
+                "content": "7 天内可退款",
+                "score": score,
+            },
+            {
+                "id": "doc-b",
+                "title": "退款政策",
+                "content": "7 天内可退款",
+                "score": score,
+            },
+        ]
+
+    manager.register(knowledge_tool(handler))
+
+    result = asyncio.run(
+        manager.search_with_rewrite("knowledge_search", "退款", top_k=5)
+    )
+
+    ids = [item["id"] for item in result.data]
+    assert len(ids) == 2
+    assert set(ids) == {"doc-a", "doc-b"}
+
+
+def test_items_without_id_merge_by_stable_fragment_fields(monkeypatch):
+    manager, _ = make_manager(monkeypatch, ['["第二查询"]'])
+
+    async def handler(params, context):
+        score = 0.9 if params["query"] == "退款" else 0.8
+        return [
+            {
+                "title": "退款政策",
+                "content": "7 天内可退款",
+                "chunk": 0,
+                "score": score,
+            }
+        ]
+
+    manager.register(knowledge_tool(handler))
+
+    result = asyncio.run(
+        manager.search_with_rewrite("knowledge_search", "退款", top_k=5)
+    )
+
+    assert len(result.data) == 1
+    assert result.data[0]["score"] == 0.9
+
+
+def test_dedupe_keeps_top_k_slots_for_distinct_fragments(monkeypatch):
+    manager, messages = make_manager(
+        monkeypatch, ['["第二查询"]', "[0, 1, 2]"]
+    )
+
+    async def handler(params, context):
+        second = params["query"] == "第二查询"
+        if second:
+            return [
+                {"id": "doc-a", "title": "A", "content": "A", "score": 0.8},
+                {"id": "doc-c", "title": "C", "content": "C", "score": 0.7},
+                {"id": "doc-d", "title": "D", "content": "D", "score": 0.6},
+            ]
+        return [
+            {"id": "doc-a", "title": "A", "content": "A", "score": 0.9},
+            {"id": "doc-b", "title": "B", "content": "B", "score": 0.9},
+        ]
+
+    manager.register(knowledge_tool(handler))
+
+    result = asyncio.run(
+        manager.search_with_rewrite("knowledge_search", "退款", top_k=3)
+    )
+
+    ids = [item["id"] for item in result.data]
+    assert len(ids) == 3
+    assert len(set(ids)) == 3
+    rerank_prompt = messages.calls[1]["messages"][0]["content"]
+    assert rerank_prompt.count('"id": "doc-a"') == 1

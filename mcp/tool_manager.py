@@ -317,7 +317,8 @@ class MCPToolManager:
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        seen, merged = set(), []
+        seen: Dict[Tuple[str, ...], int] = {}
+        merged: List[Any] = []
         degraded = False
         for result in results:
             if isinstance(result, Exception):
@@ -331,10 +332,15 @@ class MCPToolManager:
             # Fallback payloads are informative text, not retrieval hits.
             if result.success and not result.degraded and isinstance(result.data, list):
                 for item in result.data:
-                    key = hashlib.md5(str(item).encode()).hexdigest()
-                    if key not in seen:
-                        seen.add(key)
+                    # Scores differ per sub-query, so identity must exclude
+                    # dynamic fields; keep the highest score for one fragment.
+                    key = self._fragment_key(item)
+                    index = seen.get(key)
+                    if index is None:
+                        seen[key] = len(merged)
                         merged.append(item)
+                    elif self._fragment_score(item) > self._fragment_score(merged[index]):
+                        merged[index] = item
 
         if not merged:
             error = "知识库检索降级，未获得有效结果" if degraded else "所有子查询均无结果"
@@ -354,6 +360,30 @@ class MCPToolManager:
             reranked=was_reranked,
             degraded=degraded,
         )
+
+    @staticmethod
+    def _fragment_key(item: Any) -> Tuple[str, ...]:
+        """Identify a fragment by stable fields only."""
+        if isinstance(item, dict):
+            fragment_id = item.get("id")
+            if fragment_id not in (None, ""):
+                return ("id", str(fragment_id))
+            return (
+                "content",
+                str(item.get("title", "")),
+                str(item.get("content", "")),
+                str(item.get("chunk", item.get("chunk_index", ""))),
+            )
+        return ("raw", str(item))
+
+    @staticmethod
+    def _fragment_score(item: Any) -> float:
+        if not isinstance(item, dict):
+            return 0.0
+        try:
+            return float(item.get("score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
 
     async def _rerank(
         self,

@@ -39,6 +39,116 @@ class PromptFakeAnthropic:
         self.messages = PromptFakeMessages(marker)
 
 
+class ToggleSummaryMessages:
+    """Fail summary calls until the test recovers the backend."""
+
+    def __init__(self):
+        self.fail_summary = True
+        self.prompts = []
+
+    async def create(self, **kwargs):
+        prompt = kwargs["messages"][0]["content"]
+        self.prompts.append(prompt)
+        if self.fail_summary and "总结以下对话" in prompt:
+            raise RuntimeError("summary backend down")
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text="合成摘要")]
+        )
+
+
+class ToggleSummaryAnthropic:
+    def __init__(self):
+        self.messages = ToggleSummaryMessages()
+
+
+def test_real_storage_compresses_the_whole_backlog_after_summary_failure(
+    monkeypatch,
+):
+    marker = f"backlog-marker-{uuid.uuid4().hex}"
+    user_id = f"memory-backlog-{uuid.uuid4().hex}"
+    conv_id = f"conv-backlog-{uuid.uuid4().hex}"
+
+    fake_model = ToggleSummaryAnthropic()
+    monkeypatch.setattr(
+        "memory.conversation_memory.AsyncAnthropic",
+        lambda **kwargs: fake_model,
+    )
+
+    manager = MemoryManager(
+        redis_url=REDIS_URL,
+        chroma_host=CHROMA_HOST,
+        chroma_port=CHROMA_PORT,
+        api_key="test-key",
+        model="fake-model",
+    )
+    messages = [f"m{index} {marker}" for index in range(22)]
+    wm_key = manager._wm_key(user_id, conv_id)
+    summary_key = manager._summary_key(user_id, conv_id)
+
+    async def scenario():
+        assert manager._use_server is True, (
+            "independent Chroma server is required at "
+            f"{CHROMA_HOST}:{CHROMA_PORT}; run compose.yml first"
+        )
+
+        for index in range(21):
+            await manager.add_message(
+                user_id, conv_id, MsgRole.USER, messages[index]
+            )
+
+        pending = await manager._redis.lrange(wm_key, 0, -1)
+        assert len(pending) == 21
+        context = await manager.get_context(user_id, conv_id, query="退款")
+        assert [message.content for message in context.recent_messages] == (
+            messages[1:21]
+        )
+
+        fake_model.messages.fail_summary = False
+        await manager.add_message(
+            user_id, conv_id, MsgRole.USER, messages[21]
+        )
+
+        recovery_prompt = fake_model.messages.prompts[-1]
+        expected_input = "\n".join(
+            f"user: {messages[index]}" for index in range(17)
+        )
+        assert expected_input in recovery_prompt
+
+        latest = await manager.get_context(user_id, conv_id, query="退款")
+        assert [
+            message.content for message in latest.recent_messages
+        ] == messages[17:22]
+        assert latest.summary == "合成摘要"
+        assert await manager._redis.get(summary_key) == "合成摘要"
+
+        records = await asyncio.to_thread(
+            manager._episodic.get, where={"user_id": user_id}
+        )
+        assert len(records["ids"]) == 1
+        full_text = records["metadatas"][0]["full_text"]
+        assert messages[0] in full_text
+        assert records["metadatas"][0]["conv_id"] == conv_id
+
+    async def cleanup():
+        await asyncio.to_thread(
+            manager._episodic.delete, where={"user_id": user_id}
+        )
+        await asyncio.to_thread(
+            manager._profile.delete,
+            ids=[manager._profile_doc_id(user_id)],
+        )
+        await manager._redis.delete(wm_key, summary_key)
+        await manager.close()
+
+    async def run():
+        try:
+            await scenario()
+        finally:
+            await cleanup()
+
+    asyncio.run(run())
+
+
 def test_real_redis_and_chroma_memory_round_trip(monkeypatch):
     marker = f"memory-marker-{uuid.uuid4().hex}"
     user_a = f"memory-test-a-{uuid.uuid4().hex}"

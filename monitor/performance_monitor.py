@@ -14,7 +14,7 @@ from enum import Enum
 from typing import Any, Deque, Dict, List, Optional
 
 import httpx
-from prometheus_client import Counter, Gauge, Histogram, start_http_server
+from prometheus_client import Counter, Gauge, start_http_server
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +99,15 @@ class PerformanceMonitor:
         interval_s: float = 10.0,
         webhook_url: Optional[str] = None,
         prometheus_port: Optional[int] = None,
+        prometheus_registry: Optional[Any] = None,
     ):
         self._orchestrator = orchestrator
         self._tool_manager = tool_manager
         self._interval = interval_s
         self._webhook = webhook_url
         self._detector = AnomalyDetector()
+        self._prometheus_registry = prometheus_registry
+        self._execution_totals: Dict[str, int] = {}
 
         self._alerts: List[Alert] = []
         self._suggestions: List[Suggestion] = []
@@ -116,19 +119,42 @@ class PerformanceMonitor:
             self._setup_prometheus(prometheus_port)
 
     def _setup_prometheus(self, port: int) -> None:
+        registry = self._prometheus_registry
+        metric_kwargs: Dict[str, Any] = (
+            {"registry": registry} if registry is not None else {}
+        )
         self._prom = {
             "agent_success_rate": Gauge(
-                "agent_success_rate", "Agent success rate", ["agent"]
+                "agent_success_rate",
+                "Agent success rate",
+                ["agent"],
+                **metric_kwargs,
             ),
-            "agent_latency_ms": Histogram(
-                "agent_latency_ms", "Agent latency in milliseconds", ["agent"]
+            # Only a current average is available per agent, so a Gauge avoids
+            # pretending that polling produces request latency samples.
+            "agent_avg_latency_ms": Gauge(
+                "agent_avg_latency_ms",
+                "Average agent latency in milliseconds",
+                ["agent"],
+                **metric_kwargs,
             ),
             "tool_success_rate": Gauge(
-                "tool_success_rate", "Tool success rate", ["tool"]
+                "tool_success_rate",
+                "Tool success rate",
+                ["tool"],
+                **metric_kwargs,
             ),
-            "requests_total": Counter("requests_total", "Total requests"),
+            "agent_executions_total": Counter(
+                "agent_executions_total",
+                "Cumulative agent executions observed by the monitor",
+                ["agent"],
+                **metric_kwargs,
+            ),
         }
-        start_http_server(port)
+        if registry is not None:
+            start_http_server(port, registry=registry)
+        else:
+            start_http_server(port)
         logger.info(f"Prometheus 已启动: :{port}")
 
     async def start(self) -> None:
@@ -164,6 +190,19 @@ class PerformanceMonitor:
         routing_penalties: Dict[str, float] = {}
 
         for agent_key, stats in agent_stats.items():
+            total = stats.get("total", 0) or 0
+            try:
+                total = int(total)
+            except (TypeError, ValueError):
+                total = 0
+            if "agent_executions_total" in self._prom:
+                delta = max(0, total - self._execution_totals.get(agent_key, 0))
+                if delta:
+                    self._prom["agent_executions_total"].labels(
+                        agent=agent_key
+                    ).inc(delta)
+                self._execution_totals[agent_key] = total
+
             success_rate = stats.get("success_rate")
             avg_ms = stats.get("avg_ms")
             if avg_ms is None:
@@ -192,7 +231,7 @@ class PerformanceMonitor:
                 self._prom["agent_success_rate"].labels(agent=agent_key).set(
                     success_rate
                 )
-                self._prom["agent_latency_ms"].labels(agent=agent_key).observe(
+                self._prom["agent_avg_latency_ms"].labels(agent=agent_key).set(
                     avg_ms
                 )
 
@@ -260,11 +299,30 @@ class PerformanceMonitor:
         triggered = (
             operator == "less_than" and value < threshold
         ) or (operator == "greater_than" and value > threshold)
+        alert_key = f"{metric}:{label}"
         if triggered:
+            message = f"{label} 的 {metric} = {value:.3f}，阈值 {threshold}"
+            existing = next(
+                (
+                    alert
+                    for alert in self._alerts
+                    if not alert.resolved and alert.metric == alert_key
+                ),
+                None,
+            )
+            if existing is not None:
+                existing.severity = severity
+                existing.message = message
+                existing.value = value
+                existing.threshold = threshold
+                existing.ts = datetime.now().isoformat()
+                logger.warning(f"[{severity.value.upper()}] {message}")
+                return
+
             alert = Alert(
                 severity=severity,
-                metric=f"{metric}:{label}",
-                message=f"{label} 的 {metric} = {value:.3f}，阈值 {threshold}",
+                metric=alert_key,
+                message=message,
                 value=value,
                 threshold=threshold,
             )
@@ -272,6 +330,11 @@ class PerformanceMonitor:
             logger.warning(f"[{severity.value.upper()}] {alert.message}")
             if self._webhook:
                 asyncio.create_task(self._send_webhook(alert))
+            return
+
+        for alert in self._alerts:
+            if not alert.resolved and alert.metric == alert_key:
+                alert.resolved = True
 
     def _generate_routing_suggestions(
         self, agent_stats: Dict[str, Any]

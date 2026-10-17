@@ -79,6 +79,67 @@ def _env_float(name: str, default: float) -> float:
     return float(raw) if raw else default
 
 
+def _build_knowledge_tooling(
+    cfg: Dict[str, Any],
+    chroma_host: str,
+    chroma_port: int,
+    chroma_path: str,
+):
+    """Build the knowledge search tool chain used by both the API and the CLI."""
+    from mcp.knowledge_base import KnowledgeBase
+    from mcp.tool_manager import MCPToolManager, Tool
+
+    tool_manager = MCPToolManager(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+    )
+    knowledge_base = KnowledgeBase(
+        chroma_host=chroma_host,
+        chroma_port=chroma_port,
+        chroma_path=chroma_path,
+    )
+
+    def knowledge_fallback(
+        params: Dict[str, Any],
+        context: Optional[Dict[str, Any]],
+        error: str,
+    ) -> List[Dict[str, Any]]:
+        query = params.get("query", "")
+        return [
+            {
+                "title": "知识库降级结果",
+                "content": (
+                    f"知识库暂时不可用，未能完成对“{query}”的语义检索。"
+                    "请稍后重试，或转人工客服确认。"
+                ),
+                "score": 0.0,
+                "fallback": True,
+                "error": error,
+            }
+        ]
+
+    tool_manager.register(
+        Tool(
+            name="knowledge_search",
+            description="搜索知识库（基于 ChromaDB 向量检索）",
+            handler=knowledge_base.search_handler,
+            schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "top_k": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+            cache_ttl=300.0,
+            supports_rerank=True,
+            fallback=knowledge_fallback,
+        )
+    )
+    return tool_manager, knowledge_base
+
+
 def _spawn_background(coro) -> None:
     task = asyncio.create_task(coro)
     _background_tasks.add(task)
@@ -107,8 +168,6 @@ async def lifespan(app: FastAPI):
         from agents.agent_orchestrator import AgentOrchestrator
         from core.skill_loader import SkillManager
         from evaluation.evaluator import EndToEndEvaluator
-        from mcp.knowledge_base import KnowledgeBase
-        from mcp.tool_manager import MCPToolManager, Tool
         from memory.conversation_memory import MemoryManager
         from monitor.performance_monitor import PerformanceMonitor
         from core.intent_recognizer import IntentRecognizer
@@ -152,56 +211,11 @@ async def lifespan(app: FastAPI):
             model=cfg["model"],
         )
 
-        _tool_manager = MCPToolManager(
-            api_key=cfg["api_key"],
-            base_url=cfg.get("base_url"),
-            model=cfg["model"],
-        )
-        _knowledge_base = KnowledgeBase(
-            chroma_host=chroma_host,
-            chroma_port=chroma_port,
-            chroma_path=chroma_path,
+        _tool_manager, _knowledge_base = _build_knowledge_tooling(
+            cfg, chroma_host, chroma_port, chroma_path
         )
         logger.info(
             f"知识库已加载: {await _knowledge_base.doc_count_async()} 个文档片段"
-        )
-
-        def knowledge_fallback(
-            params: Dict[str, Any],
-            context: Optional[Dict[str, Any]],
-            error: str,
-        ) -> List[Dict[str, Any]]:
-            query = params.get("query", "")
-            return [
-                {
-                    "title": "知识库降级结果",
-                    "content": (
-                        f"知识库暂时不可用，未能完成对“{query}”的语义检索。"
-                        "请稍后重试，或转人工客服确认。"
-                    ),
-                    "score": 0.0,
-                    "fallback": True,
-                    "error": error,
-                }
-            ]
-
-        _tool_manager.register(
-            Tool(
-                name="knowledge_search",
-                description="搜索知识库（基于 ChromaDB 向量检索）",
-                handler=_knowledge_base.search_handler,
-                schema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "top_k": {"type": "integer"},
-                    },
-                    "required": ["query"],
-                },
-                cache_ttl=300.0,
-                supports_rerank=True,
-                fallback=knowledge_fallback,
-            )
         )
 
         _orchestrator = AgentOrchestrator(
@@ -439,7 +453,7 @@ async def chat(req: ChatRequest):
         routing_confidence=result.routing_confidence,
         escalated=result.escalated,
         latency_ms=round(result.latency_ms, 1),
-        knowledge_used="search_knowledge_base" in result.tools_used,
+        knowledge_used=result.knowledge_hits > 0,
         entities=intent_result.entities,
         intent_confidence=round(intent_result.confidence, 4),
         intent_source_scores=intent_result.source_scores,
@@ -629,12 +643,6 @@ async def _cli() -> None:
     )
     skill_manager.load()
 
-    orchestrator = AgentOrchestrator(
-        api_key=cfg["api_key"],
-        base_url=cfg.get("base_url"),
-        model=cfg["model"],
-        skill_manager=skill_manager,
-    )
     redis_url = os.getenv("REDIS_URL", "").strip() or (
         "redis://:agentecommerce123@127.0.0.1:6380/0"
     )
@@ -642,6 +650,19 @@ async def _cli() -> None:
     chroma_port = _env_int("CHROMA_PORT", 8002)
     chroma_path = os.getenv("CHROMA_PERSIST_DIRECTORY", "").strip() or str(
         _project_path("data", "chroma")
+    )
+    # The CLI needs the same knowledge chain as the API so tool calls do not
+    # silently drop into "tool not found" during manual verification.
+    tool_manager, _knowledge_base = _build_knowledge_tooling(
+        cfg, chroma_host, chroma_port, chroma_path
+    )
+
+    orchestrator = AgentOrchestrator(
+        api_key=cfg["api_key"],
+        base_url=cfg.get("base_url"),
+        model=cfg["model"],
+        skill_manager=skill_manager,
+        rag_tool_manager=tool_manager,
     )
     memory = MemoryManager(
         redis_url=redis_url,
