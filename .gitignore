@@ -27,5 +27,5 @@ htmlcov/
 
 # Logs and local data
 logs/
-data/
+/data/
 *.log
