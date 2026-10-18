@@ -24,6 +24,16 @@ from core.llm_utils import extract_text_content
 
 logger = logging.getLogger(__name__)
 
+
+def _sanitize_text(value: Any) -> str:
+    """丢弃无法编码为 UTF-8 的字符（例如孤立代理项）。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    return value.encode("utf-8", errors="ignore").decode("utf-8")
+
+
 # ── 意图结果数据结构 ─────────────────────────────────────────────────────────
 class IntentCategory(Enum):
     QUERY      = "query"       # 信息查询
@@ -63,11 +73,15 @@ class IntentResult:
     reasoning:  str # LLM 返回的简短说明
     latency_ms: float # 识别耗时（毫秒）
     source_scores: Dict[str, float] = field(default_factory=dict) # 各信号置信度：llm、embedding、pattern、refined_by_pattern
+    # 以下字段只用于评测诊断，不改变正常路由语义。
+    raw_intent: Optional[str] = None # 模型原始标签
+    recognition_status: str = "ok" # ok、low_confidence、unknown_label、parse_error、request_error
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
 # LLM 示例与 Embedding 匹配共用的少样本模板。
 _TEMPLATES: Dict[IntentCategory, List[str]] = {
-    IntentCategory.QUERY:      ["我的订单状态是什么？", "如何重置密码？", "快递什么时候到？"],
+    IntentCategory.QUERY:      ["我的订单状态是什么？", "如何重置密码？", "快递什么时候到？", "退货政策是什么？"],
     IntentCategory.COMPLAINT:  ["等了好几个小时！", "服务太差了！", "一直没人处理！"],
     IntentCategory.REQUEST:    ["帮我取消订单", "我需要修改地址", "请协助退款"],
     IntentCategory.GREETING:   ["你好", "嗨，有人吗", "早上好"],
@@ -85,7 +99,52 @@ _TEMPLATES: Dict[IntentCategory, List[str]] = {
     IntentCategory.TECHNICAL_LOGIN: ["登录一直报401", "验证码收不到", "无法登录账号"],
     IntentCategory.TECHNICAL_CRASH: ["应用一直崩溃", "页面报500错误", "系统闪退"],
     IntentCategory.HUMAN_HANDOFF: ["转人工客服", "我要找人工", "请升级处理"],
+    IntentCategory.OTHER: ["帮我写一首诗。"],
 }
+
+# 零售场景的少样本示例；全部取自上面的模板，避免复制评测数据。
+_PROMPT_EXAMPLES = (
+    (IntentCategory.GREETING, _TEMPLATES[IntentCategory.GREETING][0]),
+    (IntentCategory.ORDER_STATUS, _TEMPLATES[IntentCategory.ORDER_STATUS][0]),
+    (IntentCategory.QUERY, _TEMPLATES[IntentCategory.QUERY][-1]),
+    (IntentCategory.REFUND, _TEMPLATES[IntentCategory.REFUND][0]),
+    (IntentCategory.HUMAN_HANDOFF, _TEMPLATES[IntentCategory.HUMAN_HANDOFF][0]),
+    (IntentCategory.OTHER, _TEMPLATES[IntentCategory.OTHER][0]),
+)
+
+
+def build_intent_prompt(
+    message: str,
+    history: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """构造与实际意图请求完全一致的 Prompt，供预算预检复用。"""
+    message = _sanitize_text(message)
+    examples = "\n".join(
+        f'  消息: "{_sanitize_text(t)}" → 意图: {cat.value}'
+        for cat, t in _PROMPT_EXAMPLES
+    )
+    ctx = ""
+    if history:
+        ctx = "\n最近对话:\n" + "\n".join(
+            f"  {_sanitize_text(m.get('role', 'user'))}: {_sanitize_text(m.get('content', ''))}"
+            for m in history[-3:]
+        )
+
+    prompt = f"""你是客服意图分析专家。根据示例和最近对话判断用户当前消息的主要意图，返回 JSON。
+如果用户问题能匹配本场景的细粒度业务意图，请优先返回 order_status、refund、query、human_handoff、greeting、other，而不是 complaint、request、billing 等宽泛大类。
+退货办理相关优先返回 refund，不要返回 billing 或 request；查询本人订单事实优先返回 order_status，不要返回 logistics；政策与准备咨询返回 query；明确要求真人接手返回 human_handoff。
+只判断当前消息的主要目标；历史只用于消歧，用户明确否定或改口时以当前消息为准。
+
+示例:
+{examples}
+{ctx}
+用户消息: "{message}"
+
+返回格式（仅 JSON，不要其他文字）:
+{{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
+
+可选意图: {", ".join(c.value for c in IntentCategory)}"""
+    return _sanitize_text(prompt)
 
 _SPECIFIC_INTENTS = {
     IntentCategory.ORDER_STATUS,
@@ -125,6 +184,61 @@ _URGENCY_KEYWORDS = {
     UrgencyLevel.HIGH:     ["今天", "马上", "尽快", "hurry", "now"],
     UrgencyLevel.MEDIUM:   ["这周", "soon", "快点"],
 }
+
+# 六目标槽位的商品称谓词典；只保存通用名词，不包含完整句子。
+_PRODUCT_TERMS = (
+    "笔记本电脑",
+    "智能手表",
+    "T恤",
+    "徒步靴",
+    "耳机",
+    "平板",
+    "电子书",
+    "相机",
+    "净化器",
+    "吸尘器",
+    "电水壶",
+    "手机",
+    "显示器",
+    "键盘",
+    "鼠标",
+    "音箱",
+    "电视",
+    "空调",
+    "冰箱",
+    "洗衣机",
+    "微波炉",
+    "电饭煲",
+    "吹风机",
+    "衬衫",
+    "裤子",
+    "连衣裙",
+    "外套",
+    "运动鞋",
+    "背包",
+    "双肩包",
+    "水杯",
+    "充电器",
+    "数据线",
+)
+_PRODUCT_RE = re.compile(
+    "|".join(
+        r"手机(?!号)" if term == "手机" else re.escape(term)
+        for term in sorted(_PRODUCT_TERMS, key=len, reverse=True)
+    )
+)
+# 数量单位；排除“第一件”这类序数，也不把“两笔订单”“七天”和
+# “另一张银行卡”“另一个颜色”这类非商品数量当槽位。
+_QUANTITY_RE = re.compile(
+    r"(?<![第\d零一二两三四五六七八九十百])"
+    r"(?:\d+|[零一二两三四五六七八九十百]+)\s*"
+    r"(?:件|台|双|个(?!颜色|月|问题|订单|账号|号|人|小时|天|年|星期|礼拜)"
+    r"|只|套|部(?!电影|剧|电话)|条|张(?!银行卡|卡)|盒|瓶|包)"
+)
+_PAYMENT_METHOD_ID_RE = re.compile(
+    r"\b(?:gift_card|paypal|credit_card|payment_method)_[A-Za-z0-9]+\b",
+    re.I,
+)
 
 
 def _cosine(a: List[float], b: List[float]) -> float:
@@ -198,6 +312,36 @@ class IntentRecognizer:
         entities = self._extract_entities(message)
         urgency  = self._urgency(message, intent)
 
+        # 区分未知标签、解析失败、请求失败与正常低置信度兜底，避免评测
+        # 把错误输出误当成正确的 other。
+        llm_failed = bool(llm.get("failed"))
+        unknown_label = bool(llm.get("unknown_label"))
+        if llm_failed:
+            recognition_status = str(llm.get("failure_kind") or "request_error")
+        elif unknown_label:
+            recognition_status = "unknown_label"
+        elif intent is IntentCategory.OTHER and confidence < self.threshold:
+            recognition_status = "low_confidence"
+        else:
+            recognition_status = "ok"
+        fallback_source = "none"
+        if llm_failed and intent is not IntentCategory.OTHER:
+            if emb.get("intent") is intent and float(emb.get("confidence", 0.0) or 0.0) > 0:
+                fallback_source = "embedding"
+            elif pat.get("intent") is intent and float(pat.get("confidence", 0.0) or 0.0) > 0:
+                fallback_source = "pattern"
+        diagnostics = {
+            "raw_intent": llm.get("raw_intent"),
+            "llm_status": (
+                "failed" if llm_failed else "unknown_label" if unknown_label else "ok"
+            ),
+            "failure_kind": llm.get("failure_kind"),
+            "attempts": llm.get("attempts", []),
+            "fallback_source": fallback_source,
+            "final_intent": intent.value,
+            "final_confidence": confidence,
+        }
+
         result = IntentResult(
             intent=intent,
             confidence=confidence,
@@ -207,6 +351,9 @@ class IntentRecognizer:
             reasoning=llm.get("reasoning", ""),
             latency_ms=(time.monotonic() - t0) * 1000,
             source_scores=source_scores,
+            raw_intent=llm.get("raw_intent"),
+            recognition_status=recognition_status,
+            diagnostics=diagnostics,
         )
 
         # 缓存需要上限：达到 1000 条时丢弃最旧的一半。
@@ -236,32 +383,11 @@ class IntentRecognizer:
     ) -> Dict[str, Any]:
         """信号 1：结合少样本示例和上下文的 LLM 语义理解。"""
         message = self._clean_text(message)
-        examples = "\n".join(
-            f'  消息: "{t}" → 意图: {cat.value}'
-            for cat, tpls in _TEMPLATES.items()
-            for t in tpls[:1]  # 每个类别只取一个示例，保持 prompt 简短
-        )
-        ctx = ""
-        if history:
-            ctx = "\n最近对话:\n" + "\n".join(
-                f"  {self._clean_text(m.get('role', 'user'))}: {self._clean_text(m.get('content', ''))}"
-                for m in history[-3:]
-            )
-
-        prompt = f"""你是客服意图分析专家。根据示例判断用户意图，返回 JSON。
-如果用户问题能匹配细粒度业务意图，请优先返回细粒度意图，而不是宽泛大类。
-例如退款优先返回 refund，发票优先返回 invoice，登录故障优先返回 technical_login。
-
-        {ctx}
-        用户消息: "{message}"
-
-返回格式（仅 JSON，不要其他文字）:
-{{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
-
-可选意图: {", ".join(c.value for c in IntentCategory)}"""
-        prompt = self._clean_text(prompt)
+        prompt = build_intent_prompt(message, history)
 
         last_error: Optional[Exception] = None
+        last_kind = "request_error"
+        attempts: List[Dict[str, Any]] = []
         # 推理偶尔耗尽预算仍未输出 JSON；有界重试一次，避免静默降级。
         for attempt in range(2):
             try:
@@ -277,17 +403,47 @@ class IntentRecognizer:
                 if s < 0 or e <= s:
                     raise ValueError("模型未返回 JSON 文本")
                 data = json.loads(raw[s:e])
+                if not isinstance(data, dict):
+                    raise ValueError("模型返回的 JSON 不是对象")
+                raw_intent = data.get("intent")
+                if not isinstance(raw_intent, str) or not raw_intent.strip():
+                    raise ValueError("模型未返回 intent 字段")
+                attempts.append({"attempt": attempt + 1, "status": "ok"})
+                data["raw_intent"] = raw_intent
+                data["attempts"] = attempts
+                data["unknown_label"] = False
                 try:
-                    data["intent"] = IntentCategory(data["intent"])
+                    data["intent"] = IntentCategory(raw_intent.strip().lower())
                 except ValueError:
+                    # 未知标签保留为显式错误，不能伪装成正确的 other。
                     data["intent"] = IntentCategory.OTHER
+                    data["unknown_label"] = True
                 return data
             except Exception as ex:
                 last_error = ex
+                last_kind = (
+                    "parse_error"
+                    if isinstance(ex, (ValueError, json.JSONDecodeError))
+                    else "request_error"
+                )
+                attempts.append(
+                    {
+                        "attempt": attempt + 1,
+                        "status": last_kind,
+                        "error": str(ex)[:200],
+                    }
+                )
                 if attempt == 0:
                     logger.warning(f"LLM 识别失败，重试一次: {ex}")
         logger.warning(f"LLM 识别失败: {last_error}")
-        return {"intent": IntentCategory.OTHER, "confidence": 0.0, "reasoning": "LLM 失败", "failed": True}
+        return {
+            "intent": IntentCategory.OTHER,
+            "confidence": 0.0,
+            "reasoning": "LLM 失败",
+            "failed": True,
+            "failure_kind": last_kind,
+            "attempts": attempts,
+        }
 
     async def _embedding_recognize(self, message: str) -> Dict[str, Any]:
         """信号 2：与模板话术做 Embedding 相似度匹配。"""
@@ -389,15 +545,45 @@ class IntentRecognizer:
     # ── 实体抽取 ──────────────────────────────────────────────────────────────
 
     def _extract_entities(self, message: str) -> Dict[str, List[str]]:
-        """用规则抽取高价值实体，避免额外的 LLM 调用。"""
+        """用规则抽取六目标槽位，并保留原有的日期、金额和错误码字段。"""
         message = self._clean_text(message)
         return {
-            "order_id": self._unique(re.findall(r"(?:订单号?|order(?:_id)?|#)\s*[:：#]?\s*([A-Za-z0-9_-]{4,32})", message, re.I)),
-            "product": [],
-            "date": self._unique(re.findall(r"(今天|明天|昨天|本周|这周|下周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?)", message)),
-            "amount": self._unique(re.findall(r"((?:¥|￥)\s*\d+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?\s*(?:元|块|rmb|cny|usd|美元))", message, re.I)),
+            "order_id": self._unique(
+                re.findall(
+                    r"(?:订单号?|order(?:_id)?|#)\s*[:：#]?\s*([A-Za-z0-9_-]{4,32})",
+                    message,
+                    re.I,
+                )
+            ),
+            "item_id": self._unique(
+                re.findall(
+                    r"(?:商品编号|商品ID|商品id|item_id|款式号)\s*[:：#]?\s*([A-Za-z0-9_-]{4,32})",
+                    message,
+                    re.I,
+                )
+            ),
+            "product": self._unique(_PRODUCT_RE.findall(message)),
+            "payment_method_id": self._unique(_PAYMENT_METHOD_ID_RE.findall(message)),
+            "quantity": self._unique(_QUANTITY_RE.findall(message)),
+            "amount": self._unique(
+                re.findall(
+                    r"((?:¥|￥)\s*\d+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?\s*(?:元|块|rmb|cny|usd|美元))",
+                    message,
+                    re.I,
+                )
+            ),
+            "date": self._unique(
+                re.findall(
+                    r"(今天|明天|昨天|本周|这周|下周|\d{4}[-/.年]\d{1,2}[-/.月]\d{1,2}日?)",
+                    message,
+                )
+            ),
             "error_code": self._unique(
-                re.findall(r"(?:error(?:_code)?|错误码|状态码|http)\s*[:：#]?\s*([45]\d{2})\b", message, re.I)
+                re.findall(
+                    r"(?:error(?:_code)?|错误码|状态码|http)\s*[:：#]?\s*([45]\d{2})\b",
+                    message,
+                    re.I,
+                )
                 + re.findall(r"\b([45]\d{2})\b", message)
             ),
         }
@@ -505,12 +691,7 @@ class IntentRecognizer:
 
     @staticmethod
     def _clean_text(value: Any) -> str:
-        """丢弃无法编码为 UTF-8 的字符（例如孤立代理项）。"""
-        if value is None:
-            return ""
-        if not isinstance(value, str):
-            value = str(value)
-        return value.encode("utf-8", errors="ignore").decode("utf-8")
+        return _sanitize_text(value)
 
     @property
     def cache_stats(self) -> Dict[str, Any]:

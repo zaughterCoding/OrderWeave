@@ -1,5 +1,8 @@
 import asyncio
+import json
 from types import SimpleNamespace
+
+import pytest
 
 from agents.agent_orchestrator import Request
 from agents.tools import build_shared_rag_tools
@@ -83,6 +86,98 @@ def test_search_returns_document_id():
     assert result[0]["id"] == "doc-1"
     assert result[0]["title"] == "退款政策"
     assert result[0]["score"] == 0.9
+
+
+class _EvidenceCollection:
+    """只实现证据装载和检索所需的最小集合接口。"""
+
+    def __init__(self):
+        self.documents = {}
+        self.metadatas = {}
+        self.upsert_calls = 0
+
+    def get(self, ids, include=None):
+        present = [evidence_id for evidence_id in ids if evidence_id in self.documents]
+        return {
+            "ids": present,
+            "documents": [self.documents[evidence_id] for evidence_id in present],
+            "metadatas": [self.metadatas[evidence_id] for evidence_id in present],
+        }
+
+    def upsert(self, ids, documents, metadatas):
+        self.upsert_calls += 1
+        for evidence_id, document, metadata in zip(ids, documents, metadatas):
+            self.documents[evidence_id] = document
+            self.metadatas[evidence_id] = metadata
+
+    def query(self, query_texts, n_results):
+        ids = list(self.documents)[:n_results]
+        return {
+            "ids": [ids],
+            "documents": [[self.documents[evidence_id] for evidence_id in ids]],
+            "metadatas": [[self.metadatas[evidence_id] for evidence_id in ids]],
+            "distances": [[0.1] * len(ids)],
+        }
+
+
+def _evidence_passage(content="只有已送达订单才能申请退货。"):
+    return {
+        "evidence_id": "K01.P01",
+        "doc_id": "K01",
+        "title": "退货条件",
+        "content": content,
+        "language": "zh",
+        "source_kind": "project_authored",
+        "source_refs": [{"url": "https://example.com/policy", "section": "退货"}],
+        "policy_release": "v1.0.1",
+        "policy_commit": "fc0055dc",
+        "scope": "project_zh",
+        "category": "all",
+    }
+
+
+def test_evidence_upsert_is_idempotent_and_preserves_scalar_metadata():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb._collection = _EvidenceCollection()
+
+    assert kb.upsert_evidence([_evidence_passage()]) == 1
+    assert kb.upsert_evidence([_evidence_passage()]) == 0
+
+    metadata = kb._collection.metadatas["K01.P01"]
+    assert metadata["evidence_id"] == "K01.P01"
+    assert metadata["policy_release"] == "v1.0.1"
+    assert json.loads(metadata["source_refs_json"])[0]["section"] == "退货"
+    assert kb._collection.upsert_calls == 1
+
+
+def test_evidence_conflict_is_rejected_before_writing():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb._collection = _EvidenceCollection()
+    kb.upsert_evidence([_evidence_passage()])
+
+    with pytest.raises(ValueError, match="正文"):
+        kb.upsert_evidence([_evidence_passage("另一段正文")])
+
+    changed = _evidence_passage()
+    changed["policy_release"] = "v1.0.2"
+    with pytest.raises(ValueError, match="元数据"):
+        kb.upsert_evidence([changed])
+
+    assert kb._collection.upsert_calls == 1
+
+
+def test_search_exposes_stable_evidence_identity_and_source():
+    kb = KnowledgeBase.__new__(KnowledgeBase)
+    kb._collection = _EvidenceCollection()
+    kb.upsert_evidence([_evidence_passage()])
+
+    result = kb.search("退货条件")
+
+    assert result[0]["id"] == "K01.P01"
+    assert result[0]["evidence_id"] == "K01.P01"
+    assert result[0]["doc_id"] == "K01"
+    assert result[0]["policy_release"] == "v1.0.1"
+    assert result[0]["source_refs"][0]["section"] == "退货"
 
 
 def test_tool_result_is_not_degraded_by_default():

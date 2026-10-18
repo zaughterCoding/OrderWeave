@@ -24,6 +24,8 @@ class IntentTestCase:
     message: str
     expected_intent: str
     context: Optional[Dict[str, Any]] = None
+    # 最近的用户／助手消息，按原顺序传给生产识别器。
+    history: Optional[List[Dict[str, str]]] = None
 
 
 @dataclass
@@ -172,7 +174,10 @@ class IntentEvaluator:
         case_details: List[Dict[str, Any]] = []
 
         for case in cases:
-            result = await self._recognizer.recognize(case.message)
+            result = await self._recognizer.recognize(
+                case.message,
+                history=case.history,
+            )
             predicted = result.intent.value
             predictions.append(predicted)
             ground_truth.append(case.expected_intent)
@@ -181,6 +186,9 @@ class IntentEvaluator:
                     "message": case.message,
                     "expected": case.expected_intent,
                     "predicted": predicted,
+                    "raw_intent": getattr(result, "raw_intent", None),
+                    "recognition_status": getattr(result, "recognition_status", "ok"),
+                    "history_messages": len(case.history or []),
                     "confidence": result.confidence,
                     "reasoning": result.reasoning,
                 }

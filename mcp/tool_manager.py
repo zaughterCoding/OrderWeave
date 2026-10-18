@@ -21,6 +21,51 @@ from core.llm_utils import extract_text_content
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_text(value: Any) -> str:
+    """移除会破坏 LLM 请求编码的代理项字符。"""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    return value.encode("utf-8", errors="ignore").decode("utf-8")
+
+
+def _rerank_preview(item: Any) -> str:
+    """压缩重排提示中的单条结果，保证正文不被新增元数据挤掉。"""
+    if not isinstance(item, dict):
+        return str(item)[:200]
+    payload = {
+        "id": item.get("id") or item.get("evidence_id"),
+        "title": str(item.get("title", ""))[:80],
+        "content": str(item.get("content", ""))[:160],
+    }
+    return json.dumps(payload, ensure_ascii=False)[:300]
+
+
+def build_rewrite_prompt(query: str, n: int) -> str:
+    """构造与实际改写请求完全一致的 Prompt，供预算预检复用。"""
+    prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
+要求：每个子查询角度不同，覆盖原始问题的不同方面。
+原始查询: "{query}"
+返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
+    return _sanitize_text(prompt)
+
+
+def build_rerank_prompt(query: str, items: List[Any]) -> str:
+    """构造与实际重排请求完全一致的 Prompt，供预算预检复用。"""
+    items_text = "\n".join(
+        f"{i}. {_rerank_preview(item)}" for i, item in enumerate(items)
+    )
+    prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
+用户查询: "{query}"
+检索结果:
+{items_text}
+
+返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]
+只返回 JSON 数组，不要其他文字。"""
+    return _sanitize_text(prompt)
+
+
 class CircuitState(Enum):
     CLOSED = "closed"
     OPEN = "open"
@@ -38,6 +83,8 @@ class ToolResult:
     reranked: bool = False
     # 数据来自降级路径时为 True，不能算作真实命中。
     degraded: bool = False
+    # 供评测追溯的改写、召回和重排信息；正常调用可为空。
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -275,13 +322,15 @@ class MCPToolManager:
             return await result
         return result
 
-    async def rewrite_query(self, query: str, n: int = 3) -> List[str]:
+    async def rewrite_query(
+        self,
+        query: str,
+        n: int = 3,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         """把查询扩展为 n 个子查询，同时保留原查询。"""
-        prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
-要求：每个子查询角度不同，覆盖原始问题的不同方面。
-原始查询: "{query}"
-返回 JSON 数组，例如: ["子查询1", "子查询2", "子查询3"]"""
-        prompt = self._clean_text(prompt)
+        diag = diagnostics if diagnostics is not None else {}
+        prompt = build_rewrite_prompt(query, n)
         try:
             resp = await self._client.messages.create(
                 model=self._model,
@@ -295,10 +344,33 @@ class MCPToolManager:
             queries = self._parse_json_arrays(raw)
             if not queries:
                 logger.warning("查询改写未解析到 JSON 数组，使用原始查询")
+                diag.update(
+                    {
+                        "rewrite_status": "no_json",
+                        "rewrite_generated_count": 0,
+                        "sub_queries": [query],
+                    }
+                )
                 return [query]
-            return list(dict.fromkeys([query] + queries))
+            result = list(dict.fromkeys([query] + queries))
+            diag.update(
+                {
+                    "rewrite_status": "ok",
+                    "rewrite_generated_count": max(0, len(result) - 1),
+                    "sub_queries": result,
+                }
+            )
+            return result
         except Exception as ex:
             logger.warning(f"查询改写失败，使用原始查询: {ex}")
+            diag.update(
+                {
+                    "rewrite_status": "failed",
+                    "rewrite_error": str(ex)[:300],
+                    "rewrite_generated_count": 0,
+                    "sub_queries": [query],
+                }
+            )
             return [query]
 
     @staticmethod
@@ -324,32 +396,63 @@ class MCPToolManager:
         query: str,
         top_k: int = 5,
         context: Optional[Dict[str, Any]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         """执行改写、并行召回、合并去重和重排。"""
-        sub_queries = await self.rewrite_query(query, n=3)
+        diag = diagnostics if diagnostics is not None else {}
+        total_start = time.monotonic()
+        diag["requested_top_k"] = top_k
+
+        rewrite_start = time.monotonic()
+        sub_queries = await self.rewrite_query(query, n=3, diagnostics=diag)
+        diag["rewrite_ms"] = (time.monotonic() - rewrite_start) * 1000
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
         recall_k = max(top_k, 5)
+        diag["recall_k"] = recall_k
+        recall_start = time.monotonic()
         tasks = [
             self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
             for q in sub_queries
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
+        diag["recall_ms"] = (time.monotonic() - recall_start) * 1000
 
         seen: Dict[Tuple[str, ...], int] = {}
         merged: List[Any] = []
         degraded = False
-        for result in results:
+        subquery_results: List[Dict[str, Any]] = []
+        for sub_query, result in zip(sub_queries, results):
             if isinstance(result, Exception):
                 degraded = True
                 logger.warning(f"子查询执行异常: {result}")
+                subquery_results.append(
+                    {
+                        "query": sub_query,
+                        "success": False,
+                        "degraded": True,
+                        "count": 0,
+                        "error": str(result)[:300],
+                    }
+                )
                 continue
             if not isinstance(result, ToolResult):
                 degraded = True
+                subquery_results.append(
+                    {
+                        "query": sub_query,
+                        "success": False,
+                        "degraded": True,
+                        "count": 0,
+                        "error": "unexpected_result",
+                    }
+                )
                 continue
             degraded = degraded or result.degraded
+            count = 0
             # 降级载荷只是提示文本，不是检索命中。
             if result.success and not result.degraded and isinstance(result.data, list):
+                count = len(result.data)
                 for item in result.data:
                     # score 是动态字段，不能进入身份键；同一片段只保留最高分。
                     key = self._fragment_key(item)
@@ -359,24 +462,63 @@ class MCPToolManager:
                         merged.append(item)
                     elif self._fragment_score(item) > self._fragment_score(merged[index]):
                         merged[index] = item
+            subquery_results.append(
+                {
+                    "query": sub_query,
+                    "success": bool(result.success),
+                    "degraded": bool(result.degraded),
+                    "cached": bool(result.cached),
+                    "count": count,
+                    "error": result.error,
+                }
+            )
+
+        diag["subquery_results"] = subquery_results
+        diag["candidate_count"] = len(merged)
+        diag["pre_rerank_ids"] = [
+            item.get("evidence_id") or item.get("id")
+            if isinstance(item, dict)
+            else str(item)
+            for item in merged
+        ]
+        diag["degraded_subqueries"] = sum(
+            1 for item in subquery_results if item["degraded"]
+        )
 
         if not merged:
             error = "知识库检索降级，未获得有效结果" if degraded else "所有子查询均无结果"
+            diag["final_count"] = 0
+            diag["rerank_status"] = "skipped_no_candidates"
+            diag["total_ms"] = (time.monotonic() - total_start) * 1000
             return ToolResult(
                 success=False,
                 data=[],
                 tool_name=tool_name,
                 error=error,
                 degraded=degraded,
+                diagnostics=diag,
             )
 
-        reranked, was_reranked = await self._rerank(query, merged, top_k)
+        rerank_start = time.monotonic()
+        reranked, was_reranked = await self._rerank(
+            query, merged, top_k, diagnostics=diag
+        )
+        diag["rerank_ms"] = (time.monotonic() - rerank_start) * 1000
+        diag["final_count"] = len(reranked)
+        diag["final_ids"] = [
+            item.get("evidence_id") or item.get("id")
+            if isinstance(item, dict)
+            else str(item)
+            for item in reranked
+        ]
+        diag["total_ms"] = (time.monotonic() - total_start) * 1000
         return ToolResult(
             success=True,
             data=reranked,
             tool_name=tool_name,
             reranked=was_reranked,
             degraded=degraded,
+            diagnostics=diag,
         )
 
     @staticmethod
@@ -403,28 +545,25 @@ class MCPToolManager:
         except (TypeError, ValueError):
             return 0.0
 
+    @staticmethod
+    def _rerank_preview(item: Any) -> str:
+        return _rerank_preview(item)
+
     async def _rerank(
         self,
         query: str,
         items: List[Any],
         top_k: int,
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Any], bool]:
         """用 LLM 对结果重排；第二个返回值表示是否实际执行了重排。"""
+        diag = diagnostics if diagnostics is not None else {}
+        diag["rerank_candidate_count"] = len(items)
         if len(items) <= top_k:
+            diag["rerank_status"] = "skipped_candidates<=top_k"
             return items, False
 
-        items_text = "\n".join(
-            f"{i}. {json.dumps(item, ensure_ascii=False)[:200]}"
-            for i, item in enumerate(items)
-        )
-        prompt = f"""根据用户查询，对以下检索结果按相关性打分（0-10），返回 JSON 数组。
-用户查询: "{query}"
-检索结果:
-{items_text}
-
-返回格式（按相关性降序排列的索引列表）: [最相关的索引, ..., 最不相关的索引]
-只返回 JSON 数组，不要其他文字。"""
-        prompt = self._clean_text(prompt)
+        prompt = build_rerank_prompt(query, items)
 
         try:
             resp = await self._client.messages.create(
@@ -438,13 +577,18 @@ class MCPToolManager:
             start, end = raw.find("["), raw.rfind("]") + 1
             order: List[int] = json.loads(raw[start:end])
             if not isinstance(order, list):
+                diag["rerank_status"] = "invalid_output"
                 return items[:top_k], False
             reranked = [items[i] for i in order if isinstance(i, int) and 0 <= i < len(items)]
             if not reranked:
+                diag["rerank_status"] = "empty_output"
                 return items[:top_k], False
+            diag["rerank_status"] = "applied"
             return reranked[:top_k], True
         except Exception as ex:
             logger.warning(f"重排失败，返回原始顺序: {ex}")
+            diag["rerank_status"] = "failed"
+            diag["rerank_error"] = str(ex)[:300]
             return items[:top_k], False
 
     def _cache_key(self, name: str, params: Dict, rerank_top_k: int = 0) -> str:
@@ -514,12 +658,7 @@ class MCPToolManager:
 
     @staticmethod
     def _clean_text(value: Any) -> str:
-        """移除会破坏 LLM 请求编码的代理项字符。"""
-        if value is None:
-            return ""
-        if not isinstance(value, str):
-            value = str(value)
-        return value.encode("utf-8", errors="ignore").decode("utf-8")
+        return _sanitize_text(value)
 
     def get_stats(self) -> Dict[str, Any]:
         return {

@@ -4,6 +4,7 @@
 """
 import asyncio
 import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -32,6 +33,22 @@ class _ProjectEmbeddingFunction(ONNXMiniLM_L6_V2):
     )
 
 
+_EMBEDDING_REQUIRED_FILES = (
+    "config.json",
+    "model.onnx",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.txt",
+)
+
+
+def _embedding_cache_ready() -> bool:
+    """只检查本地缓存，不允许 Chroma 在缺失时隐式下载模型。"""
+    folder = Path(_ProjectEmbeddingFunction.DOWNLOAD_PATH) / "onnx"
+    return all((folder / name).is_file() for name in _EMBEDDING_REQUIRED_FILES)
+
+
 class KnowledgeBase:
     """由 ChromaDB 服务或本地持久化支撑的 RAG 知识库。"""
 
@@ -43,6 +60,8 @@ class KnowledgeBase:
         chroma_port: int = 8000,
         chroma_path: str = "./data/chroma",
         collection_name: Optional[str] = None,
+        load_demo_documents: bool = True,
+        embedding_function: Optional[Any] = None,
     ):
         # 优先使用独立的 ChromaDB 服务。Embedding 模型在服务端运行，
         # 客户端无需下载模型。
@@ -63,14 +82,23 @@ class KnowledgeBase:
                 settings=chromadb.Settings(anonymized_telemetry=False),
             )
 
+        if embedding_function is None:
+            if not _embedding_cache_ready():
+                folder = Path(_ProjectEmbeddingFunction.DOWNLOAD_PATH) / "onnx"
+                raise RuntimeError(
+                    "Embedding 模型缓存不完整，已按任务约束停止且不会自动下载: "
+                    f"{folder}"
+                )
+            embedding_function = _ProjectEmbeddingFunction()
+
         self._collection_name = collection_name or self.COLLECTION_NAME
         self._collection = self._client.get_or_create_collection(
             name=self._collection_name,
             metadata={"description": "AgentEcommerce RAG 知识库"},
-            embedding_function=_ProjectEmbeddingFunction(),
+            embedding_function=embedding_function,
         )
 
-        if self._collection.count() == 0:
+        if load_demo_documents and self._collection.count() == 0:
             self._load_default_docs()
 
     def add_documents(self, documents: List[Dict[str, str]]) -> int:
@@ -101,8 +129,105 @@ class KnowledgeBase:
         """在线程池中执行同步的 ChromaDB 写入。"""
         return await asyncio.to_thread(self.add_documents, documents)
 
+    @staticmethod
+    def _evidence_metadata(passage: Dict[str, Any]) -> Dict[str, Any]:
+        """把证据元数据压成 Chroma 允许的标量。"""
+        refs = passage.get("source_refs") or []
+        return {
+            "title": str(passage.get("title", "")),
+            "doc_id": str(passage.get("doc_id", "")),
+            "evidence_id": str(passage.get("evidence_id", "")),
+            "language": str(passage.get("language", "")),
+            "source_kind": str(passage.get("source_kind", "")),
+            "source_refs_json": json.dumps(refs, ensure_ascii=False, sort_keys=True),
+            "policy_release": str(passage.get("policy_release", "")),
+            "policy_commit": str(passage.get("policy_commit", "")),
+            "scope": str(passage.get("scope", "")),
+            "category": str(passage.get("category", "")),
+            "chunk_index": 0,
+            "total_chunks": 1,
+        }
+
+    def upsert_evidence(self, passages: List[Dict[str, Any]]) -> int:
+        """按 evidence_id 原样写入知识段，不切块；返回新增数量。
+
+        重复导入相同内容保持幂等；同一 ID 的内容或来源不一致时在写入前
+        报错，避免把冲突吞成成功。
+        """
+        ids: List[str] = []
+        documents: List[str] = []
+        metadatas: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for passage in passages:
+            evidence_id = str(passage.get("evidence_id", "")).strip()
+            content = passage.get("content")
+            doc_id = str(passage.get("doc_id", "")).strip()
+            title = str(passage.get("title", "")).strip()
+            if not evidence_id or not doc_id or not title or not isinstance(content, str) or not content:
+                raise ValueError(
+                    f"证据缺少 evidence_id、doc_id、title 或 content: {evidence_id or passage!r}"
+                )
+            if evidence_id in seen:
+                raise ValueError(f"本批次 evidence_id 重复: {evidence_id}")
+            seen.add(evidence_id)
+            ids.append(evidence_id)
+            documents.append(content)
+            metadatas.append(self._evidence_metadata(passage))
+
+        if not ids:
+            return 0
+
+        existing = self._collection.get(
+            ids=ids,
+            include=["documents", "metadatas"],
+        )
+        existing_docs = {
+            str(evidence_id): document
+            for evidence_id, document in zip(
+                existing.get("ids") or [],
+                existing.get("documents") or [],
+            )
+        }
+        existing_metas = {
+            str(evidence_id): metadata or {}
+            for evidence_id, metadata in zip(
+                existing.get("ids") or [],
+                existing.get("metadatas") or [],
+            )
+        }
+
+        new_ids, new_docs, new_metas = [], [], []
+        for evidence_id, document, metadata in zip(ids, documents, metadatas):
+            if evidence_id not in existing_docs:
+                new_ids.append(evidence_id)
+                new_docs.append(document)
+                new_metas.append(metadata)
+                continue
+            if existing_docs[evidence_id] != document:
+                raise ValueError(f"证据 {evidence_id} 正文与已存内容冲突")
+            existing_meta = existing_metas.get(evidence_id, {})
+            mismatched = [
+                key
+                for key, value in metadata.items()
+                if existing_meta.get(key) != value
+            ]
+            if mismatched:
+                raise ValueError(
+                    f"证据 {evidence_id} 元数据与已存内容冲突: {', '.join(mismatched)}"
+                )
+
+        if new_ids:
+            self._collection.upsert(
+                ids=new_ids,
+                documents=new_docs,
+                metadatas=new_metas,
+            )
+            logger.info(f"零售证据写入 {len(new_ids)} 段")
+        return len(new_ids)
+
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """返回与查询最相关的片段。"""
+        """返回与查询最相关的片段，并保留稳定证据身份与来源。"""
         results = self._collection.query(
             query_texts=[query],
             n_results=top_k,
@@ -115,13 +240,28 @@ class KnowledgeBase:
         distances = results.get("distances", [[]])[0]
         if documents:
             for doc_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
+                meta = meta or {}
+                refs = []
+                if meta.get("source_refs_json"):
+                    try:
+                        refs = json.loads(meta["source_refs_json"])
+                    except (TypeError, json.JSONDecodeError):
+                        refs = []
                 items.append(
                     {
                         "id": doc_id,
+                        "evidence_id": meta.get("evidence_id") or doc_id,
+                        "doc_id": meta.get("doc_id", ""),
                         "title": meta.get("title", ""),
                         "content": doc,
                         "score": round(1.0 - dist, 4),
                         "chunk": meta.get("chunk_index", 0),
+                        "source_kind": meta.get("source_kind", ""),
+                        "source_refs": refs,
+                        "policy_release": meta.get("policy_release", ""),
+                        "policy_commit": meta.get("policy_commit", ""),
+                        "scope": meta.get("scope", ""),
+                        "category": meta.get("category", ""),
                     }
                 )
 
@@ -134,6 +274,15 @@ class KnowledgeBase:
     @property
     def doc_count(self) -> int:
         return self._collection.count()
+
+    @property
+    def backend(self) -> str:
+        """记录实际使用的后端，HTTP 失败回退时必须显式区分。"""
+        return "server" if self._use_server else "local"
+
+    @property
+    def collection_name(self) -> str:
+        return self._collection_name
 
     async def doc_count_async(self) -> int:
         """在不阻塞事件循环的情况下返回已存片段数。"""

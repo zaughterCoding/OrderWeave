@@ -5,6 +5,7 @@ import pytest
 
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
+from evaluation.evaluator import IntentEvaluator, IntentTestCase
 
 
 def make_recognizer(threshold=0.5):
@@ -220,3 +221,87 @@ def test_recognize_with_fake_client():
         "misses": 1,
         "hit_rate": 0.5,
     }
+
+
+def test_llm_prompt_contains_the_selected_examples_and_history():
+    client = _PromptFakeClient()
+    recognizer = make_cache_recognizer(client)
+
+    asyncio.run(
+        recognizer.recognize(
+            "先别申请，查一下它目前的状态。",
+            history=[{"role": "user", "content": "我想退掉 #W9000501"}],
+        )
+    )
+
+    prompt = client.messages.calls[0]["messages"][0]["content"]
+    assert "示例:" in prompt
+    assert '消息: "我要申请退款" → 意图: refund' in prompt
+    assert '消息: "我的订单现在是什么状态？" → 意图: order_status' in prompt
+    assert '消息: "退货政策是什么？" → 意图: query' in prompt
+    assert '消息: "转人工客服" → 意图: human_handoff' in prompt
+    assert "最近对话:" in prompt
+    assert "#W9000501" in prompt
+
+
+class _RecordingRecognizer:
+    def __init__(self):
+        self.calls = []
+
+    async def recognize(self, message, history=None):
+        self.calls.append((message, history))
+        return SimpleNamespace(
+            intent=IntentCategory.REFUND,
+            confidence=0.9,
+            reasoning="",
+            raw_intent="refund",
+            recognition_status="ok",
+        )
+
+
+def test_intent_evaluator_passes_sample_history_to_the_production_entry():
+    recognizer = _RecordingRecognizer()
+    history = [{"role": "user", "content": "我想退掉 #W9000501"}]
+    case = IntentTestCase(
+        message="先别申请，查一下它目前的状态。",
+        expected_intent="order_status",
+        history=history,
+    )
+
+    result = asyncio.run(IntentEvaluator(recognizer).evaluate([case]))
+
+    assert recognizer.calls == [(case.message, history)]
+    assert result["cases"][0]["history_messages"] == 1
+    assert result["cases"][0]["raw_intent"] == "refund"
+
+
+def test_entity_extraction_covers_six_target_slot_types():
+    entities = make_recognizer()._extract_entities(
+        "订单 #W9000101 里的耳机和T恤各买了两件，"
+        "商品编号 9100000001，用 gift_card_9000001 支付，共 120元，退一件。"
+    )
+
+    assert entities["order_id"] == ["W9000101"]
+    assert entities["item_id"] == ["9100000001"]
+    assert entities["product"] == ["耳机", "T恤"]
+    assert entities["payment_method_id"] == ["gift_card_9000001"]
+    assert entities["quantity"] == ["两件", "一件"]
+    assert entities["amount"] == ["120元"]
+
+
+def test_entity_extraction_rejects_non_id_numbers_and_ordinals():
+    entities = make_recognizer()._extract_entities(
+        "两笔订单都是七天前买的，订单号忘了，用PayPal支付，第一个订单先不管。"
+    )
+
+    assert entities["order_id"] == []
+    assert entities["item_id"] == []
+    assert entities["payment_method_id"] == []
+    assert entities["quantity"] == []
+    assert entities["product"] == []
+
+
+def test_history_slots_are_not_reextracted_from_the_current_message():
+    entities = make_recognizer()._extract_entities("先别申请，查一下它目前的状态。")
+
+    assert entities["order_id"] == []

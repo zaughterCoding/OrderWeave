@@ -94,6 +94,29 @@ uv run --locked --offline python -m api.main --cli
 - `baseline_path` 只读；每次评测写入新的 `report_<timestamp>.json`，不会覆盖基线或已有报告。
 - 工具平均延迟只对实际记录延迟的调用求平均，样本数通过 `latency_samples` 暴露。
 
+## 零售组件基线
+
+`evaluation/data/retail/` 保存冻结的 `retail-zh-v1` 资料：120 条意图／槽位样本、48 个检索问题、29 段知识与固定划分。校验器只读；不要修改 gold、qrels 或按 test 反复调参。
+
+```powershell
+# 纯离线：资料校验与计分合同自检，不导入模型或存储客户端，不发请求
+uv run --locked --offline python -m evaluation.run_retail_baseline --mode offline-check
+
+# 真实 ChromaDB 向量检索（V）：使用独立集合，结束后只删除本次集合
+uv run --locked --offline python -m evaluation.run_retail_baseline --mode vector --split dev
+
+# 付费链路（仅在有明确新预算时）：意图与改写／召回／重排（P）
+uv run --locked --offline python -m evaluation.run_retail_baseline --mode live --split dev `
+  --budget-cny <授权上限> --input-price-cny-per-mtok <当前输入单价> `
+  --output-price-cny-per-mtok <当前输出单价>
+```
+
+- `--split` 可选 `dev`、`test`、`all`，默认 `all`。
+- `vector` 要求 ChromaDB 已在 `CHROMA_HOST:CHROMA_PORT`（默认 `127.0.0.1:8002`）运行，且本地 Embedding 缓存完整；缺失时直接停止，不自动下载模型。29 段知识按 `evidence_id` 幂等导入隔离集合，旧集合不受影响。
+- `live` 在创建模型客户端前检查预算与显式单价；缺失即拒绝。有密钥不代表可以调用。远程 Embedding 被显式屏蔽，意图向量回退到本地字符 n-gram。
+- 运行产物写入 `data/evaluation/retail/<run_id>/`（已忽略）：`run.json`、`metrics.json`、`intent_predictions.jsonl`、`retrieval_predictions.jsonl`、`usage.jsonl`。
+- 状态含义：`OFFLINE_READY_REAL_BASELINE_PENDING_BUDGET`（离线就绪、真实基线待预算）、`PARTIAL_RUN`、`SMOKE_COMPLETE`（指定子集烟测完成，不代表完整基线）、`BASELINE_COMPLETE`。Fake 或离线检查只证明接线、计分与边界，不代表真实模型成绩。
+
 ## 测试
 
 ```powershell
@@ -152,6 +175,10 @@ uv run --locked --offline pytest tests -q
 - `memory/conversation_memory.py`：Redis 工作记忆、会话摘要、ChromaDB 情景记忆与用户画像；压缩与追加按会话加锁。
 - `monitor/performance_monitor.py`：Agent／工具统计采样、Z-score 异常检测、阈值告警、路由惩罚反馈、优化建议、Prometheus 与 webhook。
 - `evaluation/evaluator.py`：意图 Accuracy／Macro-F1、LLM-as-Judge 对话评分、回归检测、只读基线与独立报告文件。
+- `evaluation/retail_metrics.py`：固定六类意图、类型化槽位与证据级检索指标；错误、未知标签、无答案问题按显式合同处理。
+- `evaluation/retail_budget.py`：付费请求前的预算上界、原子预留与按 usage／上界结算。
+- `evaluation/run_retail_baseline.py`：离线检查、真实向量检索 V 与受控 live 链路的可复现入口。
+- `evaluation/validate_retail_data.py`：冻结零售资料的只读一致性校验。
 - `compose.yml`：独立的本地 Redis 与 ChromaDB 服务。
 - `tests/`：单元测试与真实 Redis／ChromaDB 集成测试。
 
