@@ -1742,7 +1742,7 @@ async def run_acceptance() -> Dict[str, Any]:
                 case="V10-routes-monitor-metrics",
                 input={"routes": sorted(routes)},
                 assertions={
-                    "skills_reload_count_3": reloaded["body"].get("count") == 3,
+                    "skills_reload_count_4": reloaded["body"].get("count") == 4,
                     "monitor_has_stats": "agent_stats" in monitor["body"]
                     and "tool_stats" in monitor["body"],
                     "metrics_http_200": metrics["status"] == 200,
@@ -1765,7 +1765,7 @@ async def run_acceptance() -> Dict[str, Any]:
                     ),
                 },
                 required=[
-                    "skills_reload_count_3",
+                    "skills_reload_count_4",
                     "monitor_has_stats",
                     "metrics_http_200",
                     "agent_executions_positive",

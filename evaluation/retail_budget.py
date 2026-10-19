@@ -16,6 +16,17 @@ INPUT_COUNT_BASIS = "utf8_json_request_bytes_plus_format_overhead"
 REQUEST_FORMAT_OVERHEAD_TOKENS = 512
 
 
+def _json_default(value: Any) -> Any:
+    """让 SDK 内容块也能计入请求体上界。"""
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "to_dict"):
+        return value.to_dict()
+    if isinstance(value, (bytes, bytearray)):
+        return value.decode("utf-8", errors="ignore")
+    raise TypeError(f"无法序列化请求字段: {type(value).__name__}")
+
+
 def request_input_upper_tokens(request_kwargs: Dict[str, Any]) -> int:
     """返回一次请求输入 token 的保守上界。
 
@@ -29,6 +40,7 @@ def request_input_upper_tokens(request_kwargs: Dict[str, Any]) -> int:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        default=_json_default,
     )
     return len(payload.encode("utf-8")) + REQUEST_FORMAT_OVERHEAD_TOKENS
 

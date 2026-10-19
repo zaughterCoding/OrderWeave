@@ -1,0 +1,49 @@
+{
+  "dataset": "tau2-bench retail v1.0.1 public seed",
+  "repository": "https://github.com/sierra-research/tau2-bench",
+  "release": "v1.0.1",
+  "commit": "fc0055dc4e0a316c3f83133267fbd6faaa770992",
+  "retrieved_date": "2026-10-17",
+  "snapshot_date": "2026-10-18",
+  "license": "MIT",
+  "license_note": "上游 LICENSE 原样保留于本目录，版权归 Sierra Research 及相关贡献者。",
+  "purpose": "本项目零售沙箱的固定公开种子；不包含官方隐藏任务、gold 或评分脚本。",
+  "counts": {
+    "users": 500,
+    "orders": 1000,
+    "products": 50,
+    "knowledge_segments": 29
+  },
+  "files": [
+    {
+      "path": "db.json",
+      "url": "https://raw.githubusercontent.com/sierra-research/tau2-bench/fc0055dc4e0a316c3f83133267fbd6faaa770992/data/tau2/domains/retail/db.json",
+      "sha256": "413a65160adbdb5fde0ffc0015c49b6d70250b10c18128de169b597af7766765",
+      "bytes": 2811616
+    },
+    {
+      "path": "policy.md",
+      "url": "https://raw.githubusercontent.com/sierra-research/tau2-bench/fc0055dc4e0a316c3f83133267fbd6faaa770992/data/tau2/domains/retail/policy.md",
+      "sha256": "2c9652afbce57d6e087768d37cda64d31c53d50b3e3225cfdb791bac66466467",
+      "bytes": 6699
+    },
+    {
+      "path": "LICENSE",
+      "url": "https://raw.githubusercontent.com/sierra-research/tau2-bench/fc0055dc4e0a316c3f83133267fbd6faaa770992/LICENSE",
+      "sha256": "e67c5aa0074dfcaefd3c3a1aedb94cb539234aecd15d5a972574e3200e6252fe",
+      "bytes": 1072
+    },
+    {
+      "path": "knowledge.jsonl",
+      "url": null,
+      "sha256": "e7360f9d22531ed836da12fe34d90c971a9300a3ed943031d75f8f6dc3b734c0",
+      "bytes": 20291,
+      "source": "本项目 T10 冻结的 29 段中文证据；每段保留 evidence_id、来源和 policy_release/policy_commit。"
+    }
+  ],
+  "runtime_notes": [
+    "SQLite 首次初始化只接受新库或空库；已有非空业务库不会自动重置。",
+    "知识集合只导入本目录 knowledge.jsonl 的 29 段，禁用源码演示政策。",
+    "本目录不含官方任务计划、gold、用户模拟器或判定器。"
+  ]
+}

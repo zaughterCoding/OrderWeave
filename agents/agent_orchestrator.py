@@ -44,6 +44,7 @@ class AgentType(Enum):
     TECHNICAL = "technical"  # 技术支持
     BILLING   = "billing"    # 账单与退款
     ESCALATION = "escalation" # 人工升级与交接
+    RETAIL    = "retail"     # 零售沙箱单 Agent
 
 
 @dataclass(frozen=True)
@@ -153,6 +154,10 @@ class Request:
     urgency:     Optional[UrgencyLevel]   = None
     intent_confidence: float = 1.0
     request_id:  str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    # 零售模式使用；旧模式保持默认值，不参与原有路由。
+    turn: int = 0
+    retail_user_id: Optional[str] = None
+    retail_pending: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -198,6 +203,10 @@ class BaseAgent:
     agent_type: AgentType
     system_prompt: str
     profile: AgentProfile
+    # 旧 Agent 保持原有 3 轮、每轮执行全部 tool_use；零售 Agent 在子类收窄。
+    max_tool_rounds: int = 3
+    max_tool_uses_per_response: Optional[int] = None
+    capture_tool_results: bool = False
 
     def __init__(
         self,
@@ -280,8 +289,10 @@ class BaseAgent:
         tools_used: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
         knowledge_hits = 0
+        # 仅在本次请求内保存 prepare 等业务状态，不跨请求共享。
+        guard_state: Dict[str, Any] = {}
         try:
-            for _ in range(3):
+            for _ in range(max(1, int(self.max_tool_rounds or 3))):
                 request_kwargs: Dict[str, Any] = {
                     "model": self._model,
                     "max_tokens": self.profile.max_tokens,
@@ -310,7 +321,7 @@ class BaseAgent:
 
                 messages.append({"role": "assistant", "content": resp.content})
                 tool_results = []
-                for block in tool_uses:
+                for index, block in enumerate(tool_uses):
                     name = self._block_value(block, "name")
                     tool_use_id = self._block_value(block, "id")
                     args = self._block_value(block, "input") or {}
@@ -319,42 +330,73 @@ class BaseAgent:
                     call_success = True
                     result_success: Optional[bool] = None
                     error_text = ""
-                    if spec is None:
+                    skipped = False
+                    guard_reason = ""
+                    if (
+                        self.max_tool_uses_per_response is not None
+                        and index >= self.max_tool_uses_per_response
+                    ):
                         call_success = False
-                        result: Any = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
+                        result_success = False
+                        skipped = True
+                        result: Any = {
+                            "success": False,
+                            "error": "每次模型响应最多执行一个工具调用；本次调用未执行。",
+                        }
+                        error_text = result["error"]
+                    elif spec is None:
+                        call_success = False
+                        result = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
                         error_text = result["error"]
                     else:
-                        try:
-                            self._validate_tool_input(spec, args)
-                            result = spec.handler(req, args)
-                            if inspect.isawaitable(result):
-                                result = await result
-                            tools_used.append(name)
-                            if isinstance(result, dict) and "success" in result:
-                                result_success = bool(result.get("success"))
-                        except Exception as ex:
+                        guard_reason = self._guard_tool_call(
+                            req, name, args, guard_state
+                        ) or ""
+                        if guard_reason:
                             call_success = False
-                            logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
-                            error_text = str(ex)
-                            result = {"success": False, "error": error_text}
+                            result_success = False
+                            result = {"success": False, "error": guard_reason}
+                            error_text = guard_reason
+                        else:
+                            try:
+                                self._validate_tool_input(spec, args)
+                                result = spec.handler(req, args)
+                                if inspect.isawaitable(result):
+                                    result = await result
+                                tools_used.append(name)
+                                if isinstance(result, dict) and "success" in result:
+                                    result_success = bool(result.get("success"))
+                                self._on_tool_result(
+                                    req, name, args, result, guard_state
+                                )
+                            except Exception as ex:
+                                call_success = False
+                                logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
+                                error_text = str(ex)
+                                result = {"success": False, "error": error_text}
                     tool_latency_ms = (time.monotonic() - tool_t0) * 1000
                     if not error_text and isinstance(result, dict):
                         error_text = str(result.get("error", "") or "")
                     knowledge_hits += self._knowledge_hit_count(name, result)
-                    tool_traces.append(
-                        {
-                            "agent_type": self.agent_type.value,
-                            "tool_name": name,
-                            "tool_use_id": tool_use_id,
-                            "input": dict(args),
-                            "success": call_success,
-                            "result_success": result_success,
-                            "latency_ms": round(tool_latency_ms, 1),
-                            "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
-                            "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
-                            "error": error_text,
-                        }
-                    )
+                    trace: Dict[str, Any] = {
+                        "agent_type": self.agent_type.value,
+                        "tool_name": name,
+                        "tool_use_id": tool_use_id,
+                        "input": dict(args),
+                        "success": call_success,
+                        "result_success": result_success,
+                        "latency_ms": round(tool_latency_ms, 1),
+                        "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
+                        "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
+                        "error": error_text,
+                    }
+                    if skipped:
+                        trace["skipped"] = True
+                    if guard_reason:
+                        trace["blocked_by_guard"] = True
+                    if self.capture_tool_results:
+                        trace["result"] = result
+                    tool_traces.append(trace)
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
@@ -433,6 +475,46 @@ class BaseAgent:
                     raise ValueError(f"参数 {key} 小于最小值 {minimum}")
                 if maximum is not None and value > maximum:
                     raise ValueError(f"参数 {key} 大于最大值 {maximum}")
+            if expected == "array":
+                if not isinstance(value, list):
+                    raise ValueError(f"参数 {key} 类型错误，期望 array")
+                min_items = prop.get("minItems")
+                max_items = prop.get("maxItems")
+                if min_items is not None and len(value) < int(min_items):
+                    raise ValueError(f"参数 {key} 少于最少项数 {min_items}")
+                if max_items is not None and len(value) > int(max_items):
+                    raise ValueError(f"参数 {key} 超过最多项数 {max_items}")
+                item_type = (prop.get("items") or {}).get("type")
+                if item_type in type_map:
+                    for index, item in enumerate(value):
+                        if (
+                            isinstance(item, bool)
+                            and item_type in ("integer", "number")
+                        ) or not isinstance(item, type_map[item_type]):
+                            raise ValueError(
+                                f"参数 {key}[{index}] 类型错误，期望 {item_type}"
+                            )
+
+    def _guard_tool_call(
+        self,
+        req: Request,
+        name: str,
+        args: Dict[str, Any],
+        state: Dict[str, Any],
+    ) -> Optional[str]:
+        """业务 Agent 可据此阻止本轮不该执行的工具；默认不限制。"""
+        return None
+
+    def _on_tool_result(
+        self,
+        req: Request,
+        name: str,
+        args: Dict[str, Any],
+        result: Any,
+        state: Dict[str, Any],
+    ) -> None:
+        """工具实际执行后的钩子；默认不保存状态。"""
+        return None
 
     def _build_system_prompt(self, req: Request) -> str:
         """把角色契约与动态 Skills 合并进 system prompt。"""

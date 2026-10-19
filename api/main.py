@@ -45,7 +45,18 @@ _monitor: Any = None
 _evaluator: Any = None
 _skill_manager: Any = None
 _knowledge_base: Any = None
+_retail_runtime: Any = None
 _background_tasks: set[asyncio.Task] = set()
+
+
+def _retail_mode() -> bool:
+    """零售模式采用显式开关；关闭时旧客服路径保持不变。"""
+    return os.getenv("RETAIL_MODE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _project_path(*parts: str) -> pathlib.Path:
@@ -161,9 +172,38 @@ def _background_done(task: asyncio.Task) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _orchestrator, _memory, _tool_manager, _monitor
-    global _evaluator, _skill_manager, _knowledge_base
+    global _evaluator, _skill_manager, _knowledge_base, _retail_runtime
 
     print(BANNER, flush=True)
+    if _retail_mode():
+        from agents.retail_runtime import build_retail_runtime
+
+        try:
+            _retail_runtime = build_retail_runtime()
+            _skill_manager = _retail_runtime.skill_manager
+            _tool_manager = _retail_runtime.tool_manager
+            _knowledge_base = _retail_runtime.knowledge_base
+            logger.info(
+                "零售模式已就绪: model=%s db=%s collection=%s budget=%.2f CNY",
+                _retail_runtime.config.model,
+                _retail_runtime.config.db_path,
+                _retail_runtime.config.knowledge_collection,
+                _retail_runtime.config.budget_cny,
+            )
+            yield
+        finally:
+            if _retail_runtime is not None:
+                await _retail_runtime.close()
+            pending = list(_background_tasks)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            _retail_runtime = None
+            _tool_manager = None
+            _skill_manager = None
+            _knowledge_base = None
+            logger.info("AgentEcommerce 零售模式已关闭")
+        return
+
     try:
         from agents.agent_orchestrator import AgentOrchestrator
         from core.skill_loader import SkillManager
@@ -371,6 +411,14 @@ def _require_orchestrator() -> None:
 
 @app.get("/health")
 async def health():
+    if _retail_runtime is not None:
+        return {
+            "status": "ok",
+            "mode": "retail",
+            "agents": _retail_runtime.service.summary()["agent"],
+            "store": _retail_runtime.store.stats(),
+            "budget": _retail_runtime.ledger.summary(),
+        }
     _require_orchestrator()
     return {"status": "ok", "agents": _orchestrator.get_stats()}
 
@@ -394,6 +442,33 @@ async def reload_skills():
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
+    if _retail_runtime is not None:
+        conv_id = req.conv_id or str(uuid.uuid4())
+        try:
+            result = await _retail_runtime.service.handle_turn(
+                req.message, req.user_id, conv_id
+            )
+        except ValueError as ex:
+            raise HTTPException(400, str(ex))
+        return ChatResponse(
+            conv_id=conv_id,
+            request_id=result.request_id,
+            response=result.response,
+            intent="retail_support",
+            intent_group="retail",
+            agent_type=result.agent_type.value,
+            agent_types=[result.agent_type.value],
+            primary_agent=result.agent_type.value,
+            supporting_agents=[],
+            tools_used=result.tools_used,
+            escalated=result.escalated,
+            latency_ms=result.latency_ms,
+            knowledge_used=result.knowledge_hits > 0,
+            entities={},
+            intent_confidence=1.0,
+            intent_source_scores={},
+        )
+
     if _orchestrator is None or _memory is None:
         raise HTTPException(503, "服务未就绪")
 
@@ -462,6 +537,12 @@ async def chat(req: ChatRequest):
 
 @app.get("/monitor")
 async def monitor_summary():
+    if _retail_runtime is not None:
+        summary = _retail_runtime.service.summary()
+        summary["recent_traces"] = _retail_runtime.service.get_recent_tool_traces(
+            limit=20
+        )
+        return summary
     if _monitor is None:
         raise HTTPException(503, "服务未就绪")
     return _monitor.summary()
@@ -469,6 +550,13 @@ async def monitor_summary():
 
 @app.get("/trace/tool/{request_id}", response_model=ToolTraceResponse)
 async def get_tool_trace(request_id: str):
+    if _retail_runtime is not None:
+        trace = _retail_runtime.service.get_tool_trace(request_id)
+        return ToolTraceResponse(
+            request_id=request_id,
+            found=trace is not None,
+            trace=trace or {},
+        )
     _require_orchestrator()
     trace = _orchestrator.get_tool_trace(request_id)
     return ToolTraceResponse(
@@ -480,6 +568,10 @@ async def get_tool_trace(request_id: str):
 
 @app.get("/trace/tools", response_model=RecentToolTracesResponse)
 async def list_recent_tool_traces(limit: int = 20):
+    if _retail_runtime is not None:
+        return RecentToolTracesResponse(
+            items=_retail_runtime.service.get_recent_tool_traces(limit=limit)
+        )
     _require_orchestrator()
     return RecentToolTracesResponse(
         items=_orchestrator.get_recent_tool_traces(limit=limit)
@@ -493,6 +585,8 @@ async def prometheus_metrics():
 
 @app.post("/search")
 async def search(query: str, top_k: int = 5):
+    if _retail_runtime is not None:
+        top_k = max(1, min(int(top_k), 10))
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
     result = await _tool_manager.search_with_rewrite(
@@ -507,6 +601,10 @@ async def search(query: str, top_k: int = 5):
 
 @app.post("/knowledge/add", tags=["知识库"])
 async def add_knowledge(body: BatchDocInput):
+    if _retail_runtime is not None:
+        raise HTTPException(
+            409, "零售模式使用冻结知识集合，禁止在线导入或修改"
+        )
     if _knowledge_base is None:
         raise HTTPException(503, "知识库未初始化")
     count = await _knowledge_base.add_documents_async(
@@ -525,6 +623,10 @@ async def add_knowledge(body: BatchDocInput):
 
 @app.post("/knowledge/upload", tags=["知识库"])
 async def upload_knowledge(file: UploadFile = File(...)):
+    if _retail_runtime is not None:
+        raise HTTPException(
+            409, "零售模式使用冻结知识集合，禁止在线导入或修改"
+        )
     if _knowledge_base is None:
         raise HTTPException(503, "知识库未初始化")
 
@@ -567,11 +669,23 @@ async def upload_knowledge(file: UploadFile = File(...)):
 async def knowledge_stats():
     if _knowledge_base is None:
         raise HTTPException(503, "知识库未初始化")
-    return {"total_chunks": await _knowledge_base.doc_count_async()}
+    total = await _knowledge_base.doc_count_async()
+    if _retail_runtime is not None:
+        return {
+            "total_chunks": total,
+            "collection": _retail_runtime.config.knowledge_collection,
+            "frozen": True,
+            "mode": "retail",
+        }
+    return {"total_chunks": total}
 
 
 @app.post("/eval/run")
 async def run_eval(body: Optional[EvalRunInput] = None):
+    if _retail_runtime is not None:
+        raise HTTPException(
+            409, "零售模式不运行旧评测、模型用户模拟器或付费 Judge"
+        )
     if _evaluator is None:
         raise HTTPException(503, "服务未就绪")
 
@@ -625,9 +739,46 @@ async def run_eval(body: Optional[EvalRunInput] = None):
     }
 
 
+async def _retail_cli() -> None:
+    """零售模式 CLI；与 API 共用 RetailService 和同一账本。"""
+    from agents.retail_runtime import build_retail_runtime
+
+    runtime = build_retail_runtime()
+    user_id = os.getenv("RETAIL_CLIENT_USER", "").strip() or "cli_user"
+    conv_id = os.getenv("RETAIL_CONV_ID", "").strip() or str(uuid.uuid4())
+    print(
+        f"零售模式：会话 {conv_id}，客户端用户 {user_id}；"
+        f"数据库 {runtime.config.db_path}"
+    )
+    try:
+        while True:
+            try:
+                message = input("你: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n再见")
+                break
+            if not message or message.lower() in ("quit", "exit", "退出"):
+                print("再见")
+                break
+            try:
+                result = await runtime.service.handle_turn(
+                    message, user_id, conv_id
+                )
+            except ValueError as ex:
+                print(f"\n系统: {ex}\n")
+                continue
+            print(f"\nAgentEcommerce [retail]: {result.response}\n")
+    finally:
+        await runtime.close()
+
+
 async def _cli() -> None:
     print(BANNER)
     print("AgentEcommerce CLI — 输入 quit 退出\n")
+
+    if _retail_mode():
+        await _retail_cli()
+        return
 
     from agents.agent_orchestrator import AgentOrchestrator, Request
     from core.skill_loader import SkillManager

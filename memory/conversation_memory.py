@@ -109,6 +109,11 @@ class MemoryManager:
         api_key: str = "",
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        client: Optional[AsyncAnthropic] = None,
+        key_prefix: str = "",
+        collection_suffix: str = "",
+        cross_conv_history: bool = True,
+        profile_enabled: bool = True,
     ):
         if not model:
             raise ValueError("model is required")
@@ -116,8 +121,13 @@ class MemoryManager:
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        # 零售模式注入受预算保护的客户端；旧调用保持原构造行为。
+        self._client = client or AsyncAnthropic(**kwargs)
         self._model = model
+        self._key_prefix = str(key_prefix or "")
+        self._collection_suffix = str(collection_suffix or "")
+        self._cross_conv_history = bool(cross_conv_history)
+        self._profile_enabled = bool(profile_enabled)
 
         self._redis = redis.from_url(redis_url, decode_responses=True)
         self._locks: Dict[Tuple[str, str], asyncio.Lock] = {}
@@ -141,11 +151,11 @@ class MemoryManager:
 
         embedding_function = _MemoryEmbeddingFunction()
         self._episodic = chroma.get_or_create_collection(
-            "episodic",
+            f"episodic{self._collection_suffix}",
             embedding_function=embedding_function,
         )
         self._profile = chroma.get_or_create_collection(
-            "user_profile",
+            f"user_profile{self._collection_suffix}",
             embedding_function=embedding_function,
         )
 
@@ -190,6 +200,8 @@ class MemoryManager:
 
     async def update_profile(self, user_id: str, conv_id: str) -> None:
         """从最近消息中提取画像数据并存入 ChromaDB。"""
+        if not getattr(self, "_profile_enabled", True):
+            return
         user_id = self._safe_text(user_id)
         conv_id = self._safe_text(conv_id)
         messages = await self._get_working_memory(user_id, conv_id)
@@ -267,7 +279,11 @@ class MemoryManager:
             conv_id,
             query or (recent[-1].content if recent else ""),
         )
-        profile = await self._get_profile(user_id)
+        profile = (
+            await self._get_profile(user_id)
+            if getattr(self, "_profile_enabled", True)
+            else {}
+        )
         summary = await self._redis.get(self._summary_key(user_id, conv_id)) or ""
 
         return MemoryContext(
@@ -400,7 +416,7 @@ class MemoryManager:
                 },
             )
             docs = self._extract_docs(results)
-            if len(docs) < self.HISTORY_TOP_K:
+            if getattr(self, "_cross_conv_history", True) and len(docs) < self.HISTORY_TOP_K:
                 fallback = await self._query_episodic(
                     query_text,
                     n_results=self.HISTORY_TOP_K,
@@ -475,17 +491,17 @@ class MemoryManager:
             self._locks[key] = lock
         return lock
 
-    @staticmethod
-    def _wm_key(user_id: str, conv_id: str) -> str:
-        return f"wm:{user_id}:{conv_id}"
+    def _wm_key(self, user_id: str, conv_id: str) -> str:
+        return f"{getattr(self, '_key_prefix', '')}wm:{user_id}:{conv_id}"
 
-    @staticmethod
-    def _summary_key(user_id: str, conv_id: str) -> str:
-        return f"summary:{user_id}:{conv_id}"
+    def _summary_key(self, user_id: str, conv_id: str) -> str:
+        return f"{getattr(self, '_key_prefix', '')}summary:{user_id}:{conv_id}"
 
-    @classmethod
-    def _profile_doc_id(cls, user_id: str) -> str:
-        return f"{cls.PROFILE_DOC_PREFIX}{user_id}"
+    def _profile_doc_id(self, user_id: str) -> str:
+        return (
+            f"{self.PROFILE_DOC_PREFIX}"
+            f"{getattr(self, '_key_prefix', '')}{user_id}"
+        )
 
     @staticmethod
     def _safe_text(value: Any) -> str:

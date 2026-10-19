@@ -5,7 +5,7 @@ from core.skill_loader import SkillManager
 SKILLS_DIR = Path(__file__).resolve().parent.parent / "skills"
 
 
-def test_three_skills_load_and_match_their_agents():
+def test_skills_load_and_match_their_agents():
     manager = SkillManager(root_dir=str(SKILLS_DIR))
 
     skills = manager.load()
@@ -14,13 +14,20 @@ def test_three_skills_load_and_match_their_agents():
         "通用客服接待规范",
         "技术支持处理规范",
         "账单退款处理规范",
+        "零售售后处理规范",
     }
     assert manager.errors == []
-    assert manager.summary()["count"] == 3
+    assert manager.summary()["count"] == 4
 
     assert "通用客服接待规范" in manager.prompt_for("你好，我想咨询一下", "general")
     assert "技术支持处理规范" in manager.prompt_for("接口报 500 错误", "technical")
     assert "账单退款处理规范" in manager.prompt_for("我要申请退款", "billing")
+
+    # 零售 Skill 每轮注入，且不混入旧账单审核规则。
+    retail_prompt = manager.prompt_for("你好", "retail")
+    assert "零售售后处理规范" in retail_prompt
+    assert "账单退款处理规范" not in retail_prompt
+    assert "零售售后处理规范" not in manager.prompt_for("你好", "general")
 
     # 限定给其他 Agent 的 Skills 不得泄漏进当前 Agent 的 prompt。
     assert "技术支持处理规范" not in manager.prompt_for("接口报 500 错误", "general")

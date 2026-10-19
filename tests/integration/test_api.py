@@ -202,11 +202,11 @@ def test_http_api_routes_with_fake_model_and_real_storage(monkeypatch, tmp_path)
 
             skills = client.get("/skills")
             assert skills.status_code == 200
-            assert skills.json()["count"] == 3
+            assert skills.json()["count"] == 4
 
             reloaded = client.post("/skills/reload")
             assert reloaded.status_code == 200
-            assert reloaded.json()["count"] == 3
+            assert reloaded.json()["count"] == 4
 
             added = client.post(
                 "/knowledge/add",

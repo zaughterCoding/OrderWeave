@@ -1,0 +1,31 @@
+{
+  "model": "deepseek-flash",
+  "model_version_note": "官方中文价目页标注为 DeepSeek-V4.1-Flash-1017；Anthropic 兼容端点使用模型名 deepseek-flash。",
+  "endpoint": "https://api.deepseek.com/anthropic",
+  "currency": "CNY",
+  "unit": "per_million_tokens",
+  "checked_at_utc": "2026-10-18T23:30:00Z",
+  "checked_at_beijing": "2026-10-19T07:30:00+08:00",
+  "source_zh": "https://api-docs.deepseek.com/zh-cn/quick_start/pricing",
+  "source_en": "https://api-docs.deepseek.com/quick_start/pricing",
+  "peak": {
+    "input_cache_hit": 0.04,
+    "input_cache_miss": 2.0,
+    "output": 8.0
+  },
+  "off_peak": {
+    "input_cache_hit": 0.02,
+    "input_cache_miss": 1.0,
+    "output": 4.0
+  },
+  "peak_hours": "北京时间周一至周五（不含中国法定节假日）09:00-12:00、14:00-18:00；其余时段含周末和法定节假日为空闲时段。",
+  "ledger_basis": "保守使用高峰时段 cache-miss 输入价 2 元/百万 token 和输出价 8 元/百万 token；账本对所有输入 token（含 cache read/write）均按该输入价计费，避免低估。",
+  "official_discount_note": "官方说明空闲时段价格为高峰时段的一半；本记录同时保留空闲价，但付费账本不使用较低价。",
+  "effective_date_note": "价目页未给出这些 token 价格的生效日期；本次按 2026-10-18 页面内容冻结。",
+  "preflight_policy": {
+    "planned_input_token_proxy": "请求体 UTF-8 JSON 字节数除以 3，向上取整；中文约 3 字节/字符，正常分词不超过 1 token/字符，作为计划估算。",
+    "planned_output_tokens": "Agent 请求按 512 token；检索改写按 128；检索重排按 64。",
+    "hard_upper": "账本仍按完整请求体字节数 + 512 和实际 max_tokens 预留，按 usage 结算；计划估算不替代账本硬上界。",
+    "gate": "计划总费用不超过剩余预算的 90%，且单次请求硬上界不超过剩余预算的 50%；否则不发起付费调用。"
+  }
+}

@@ -7,7 +7,13 @@ import pytest
 from agents.agent_orchestrator import Request
 from agents.tools import build_shared_rag_tools
 from mcp.knowledge_base import KnowledgeBase
-from mcp.tool_manager import CircuitBreaker, MCPToolManager, Tool, ToolResult
+from mcp.tool_manager import (
+    MIN_RECALL_K,
+    CircuitBreaker,
+    MCPToolManager,
+    Tool,
+    ToolResult,
+)
 
 
 def make_manager(monkeypatch, responses):
@@ -218,8 +224,11 @@ def test_search_with_rewrite_merges_deduplicates_and_reranks(monkeypatch):
     assert len(queries) == 4
     assert len(messages.calls) == 2
 
+    # search_with_rewrite 内部按 recall_k 召回，直接调用需使用同一参数才能命中缓存。
     cached = asyncio.run(
-        manager.call("knowledge_search", {"query": "退款流程", "top_k": 5})
+        manager.call(
+            "knowledge_search", {"query": "退款流程", "top_k": MIN_RECALL_K}
+        )
     )
 
     assert cached.success is True

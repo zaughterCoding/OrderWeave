@@ -59,6 +59,7 @@ RERANK_MAX_TOKENS = 8192
 STATUS_PENDING_BUDGET = "OFFLINE_READY_REAL_BASELINE_PENDING_BUDGET"
 STATUS_PARTIAL = "PARTIAL_RUN"
 STATUS_SMOKE_COMPLETE = "SMOKE_COMPLETE"
+STATUS_COMPONENT_COMPLETE = "COMPONENT_COMPLETE"
 STATUS_COMPLETE = "BASELINE_COMPLETE"
 STATUS_REFUSED_BUDGET = "REFUSED_NO_BUDGET"
 STATUS_REFUSED_PREFLIGHT = "REFUSED_BUDGET_PREFLIGHT"
@@ -152,6 +153,104 @@ def _hash_dataset(root: Path) -> Dict[str, Any]:
         "manifest_sha256": _sha256_file(manifest_path),
         "artifacts": artifacts,
     }
+
+
+def _retrieval_source_item(item: Any) -> Dict[str, Any]:
+    """保留检索结果的稳定身份与来源字段，不记录正文。"""
+    if not isinstance(item, dict):
+        return {"evidence_id": str(item)}
+    return {
+        "evidence_id": str(item.get("evidence_id") or item.get("id") or ""),
+        "id": item.get("id"),
+        "doc_id": item.get("doc_id", ""),
+        "title": item.get("title", ""),
+        "score": item.get("score"),
+        "source_kind": item.get("source_kind", ""),
+        "source_refs": item.get("source_refs") or [],
+        "policy_release": item.get("policy_release", ""),
+        "policy_commit": item.get("policy_commit", ""),
+        "scope": item.get("scope", ""),
+        "category": item.get("category", ""),
+    }
+
+
+def _read_budget_ledger(path: Path, limit_cny: float) -> Dict[str, Any]:
+    """读取跨阶段累计账本；不存在时按本次授权上限初始化。"""
+    if not path.exists():
+        return {"version": 1, "limit_cny": float(limit_cny), "entries": []}
+    try:
+        ledger = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as ex:
+        raise BaselineRefused(
+            STATUS_REFUSED_BUDGET,
+            f"预算账本不可读，无法建立可信累计额: {path}",
+            {"error": f"{type(ex).__name__}: {str(ex)[:200]}"},
+        ) from ex
+    recorded = float(ledger.get("limit_cny", -1))
+    if recorded != float(limit_cny):
+        raise BaselineRefused(
+            STATUS_REFUSED_BUDGET,
+            f"预算账本上限 {recorded} 与本次授权 {limit_cny} 不一致",
+            {"ledger": str(path)},
+        )
+    return ledger
+
+
+def _ledger_entry_charge(entry: Dict[str, Any]) -> float:
+    """未结算的已启动记录按计划上界占用，已完成记录按实际花费加在途占用。"""
+    if entry.get("status") == "started":
+        return float(entry.get("planned_upper_bound_cny") or 0.0)
+    return float(entry.get("spent_cny") or 0.0) + float(
+        entry.get("unsettled_cny") or 0.0
+    )
+
+
+def _ledger_committed(ledger: Dict[str, Any]) -> float:
+    return sum(
+        _ledger_entry_charge(entry) for entry in ledger.get("entries") or []
+    )
+
+
+def _write_budget_ledger(path: Path, ledger: Dict[str, Any]) -> None:
+    """原子写入账本，避免中断留下半个文件。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(ledger, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _ledger_start(
+    ledger: Dict[str, Any],
+    run_id: str,
+    stage_label: str,
+    planned_upper_bound_cny: float,
+    available_before_cny: float,
+) -> None:
+    ledger.setdefault("entries", []).append(
+        {
+            "run_id": run_id,
+            "stage_label": stage_label,
+            "status": "started",
+            "started_at": _utc_now(),
+            "planned_upper_bound_cny": float(planned_upper_bound_cny),
+            "available_before_cny": float(available_before_cny),
+        }
+    )
+
+
+def _ledger_finish(
+    ledger: Dict[str, Any],
+    run_id: str,
+    fields: Dict[str, Any],
+) -> None:
+    for entry in ledger.get("entries") or []:
+        if entry.get("run_id") == run_id:
+            entry.update(fields)
+            entry["finished_at"] = _utc_now()
+            return
 
 
 def _load_dataset(root: Path) -> Dict[str, Any]:
@@ -658,15 +757,7 @@ def _run_vector_queries(
                 "query": row["query"],
                 "ranking": ranking,
                 "scores": [
-                    {
-                        "evidence_id": str(
-                            item.get("evidence_id") or item.get("id")
-                        ),
-                        "score": item.get("score"),
-                        "title": item.get("title"),
-                        "policy_release": item.get("policy_release"),
-                    }
-                    for item in items
+                    _retrieval_source_item(item) for item in items
                 ],
                 "is_error": False,
                 "error_kind": None,
@@ -1268,8 +1359,13 @@ def _preflight_upper_bound(
     model: str,
 ) -> Dict[str, Any]:
     from core.intent_recognizer import build_intent_prompt
-    from mcp.tool_manager import build_rewrite_prompt, build_rerank_prompt
+    from mcp.tool_manager import (
+        build_rerank_prompt,
+        build_rewrite_prompt,
+        retrieval_config,
+    )
 
+    settings = retrieval_config(TOP_K)
     intent_upper = 0.0
     for row in intents:
         prompt = build_intent_prompt(
@@ -1282,8 +1378,8 @@ def _preflight_upper_bound(
             request_input_upper_tokens(request), INTENT_MAX_TOKENS
         )
 
-    # 正常配置下最多 1 个原查询 + REWRITE_N 个子查询，各召回 RECALL_K 条。
-    candidate_upper = (REWRITE_N + 1) * RECALL_K
+    # 正常配置下最多 1 个原查询 + rewrite_n 个子查询，各召回 recall_k 条。
+    candidate_upper = (settings["rewrite_n"] + 1) * settings["recall_k"]
     worst_items = [
         {
             "id": f"preflight-{index}",
@@ -1295,7 +1391,7 @@ def _preflight_upper_bound(
     retrieval_upper = 0.0
     for row in queries:
         rewrite_prompt = build_rewrite_prompt(
-            str(row.get("query", "")), REWRITE_N
+            str(row.get("query", "")), settings["rewrite_n"]
         )
         rewrite_request = _preflight_request_kwargs(
             model, rewrite_prompt, REWRITE_MAX_TOKENS, 0.3
@@ -1319,6 +1415,7 @@ def _preflight_upper_bound(
         "input_count_basis": INPUT_COUNT_BASIS,
         "format_overhead_tokens_per_request": REQUEST_FORMAT_OVERHEAD_TOKENS,
         "intent_attempts_per_case": 2,
+        "retrieval_config": settings,
         "rerank_candidate_upper_bound": candidate_upper,
         "intent_upper_bound_cny": intent_upper,
         "retrieval_upper_bound_cny": retrieval_upper,
@@ -1541,12 +1638,22 @@ async def _run_live_pipeline(
                         ranking.append(str(item))
             ranking = [value for value in ranking if value]
             is_error = not success or budget_stop
+            final_items = (
+                [
+                    _retrieval_source_item(item)
+                    for item in result.data
+                    if isinstance(item, dict)
+                ]
+                if success and isinstance(getattr(result, "data", None), list)
+                else []
+            )
             artifact = {
                 "query_id": row["query_id"],
                 "split": row["split"],
                 "mode": "P",
                 "query": row["query"],
                 "ranking": ranking,
+                "final_items": final_items,
                 "final_ids": diagnostics.get("final_ids"),
                 "pre_rerank_ids": diagnostics.get("pre_rerank_ids"),
                 "reranked": bool(getattr(result, "reranked", False)),
@@ -1574,6 +1681,7 @@ async def _run_live_pipeline(
                 "mode": "P",
                 "query": row["query"],
                 "ranking": [],
+                "final_items": [],
                 "final_ids": diagnostics.get("final_ids"),
                 "pre_rerank_ids": diagnostics.get("pre_rerank_ids"),
                 "reranked": False,
@@ -1617,17 +1725,19 @@ async def _run_live_stages(
     guard_client: _GuardedClient,
     lifecycle: _ClientLifecycle,
 ) -> Dict[str, Any]:
-    """在同一事件循环内串行执行意图与 P，并在所有退出路径释放客户端。"""
+    """在同一事件循环内串行执行选中的组件，并在所有退出路径释放客户端。"""
     outcome: Dict[str, Any] = {
         "intent": ([], [], []),
         "pipeline": ([], []),
-        "pipeline_skipped": False,
+        "intent_skipped": recognizer is None,
+        "pipeline_skipped": manager is None,
     }
     try:
-        outcome["intent"] = await _run_live_intent(
-            recognizer, intents, request_log, guard_client
-        )
-        if guard_client.stop_reason:
+        if recognizer is not None:
+            outcome["intent"] = await _run_live_intent(
+                recognizer, intents, request_log, guard_client
+            )
+        if manager is None or guard_client.stop_reason:
             outcome["pipeline_skipped"] = True
         else:
             outcome["pipeline"] = await _run_live_pipeline(
@@ -1636,6 +1746,61 @@ async def _run_live_stages(
         return outcome
     finally:
         await lifecycle.close_all()
+
+
+def _load_vector_reference(
+    source_dir: Path,
+    queries: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """读取原方案已产生的真实 V 排序，作为未改检索层的共用参考。
+
+    参考运行必须覆盖本轮全部查询；这里只复用排序与来源字段，不使用其
+    gold 或分数，评分仍按当前冻结数据重算。
+    """
+    predictions = source_dir / "retrieval_predictions.jsonl"
+    if not predictions.is_file():
+        raise BaselineRefused(
+            STATUS_REFUSED_SELECTION,
+            f"V 参考缺少 retrieval_predictions.jsonl: {source_dir}",
+        )
+    rows = _read_jsonl(predictions)
+    by_id = {
+        str(row.get("query_id")): row
+        for row in rows
+        if row.get("mode") == "V"
+    }
+    expected = [row["query_id"] for row in queries]
+    missing = [query_id for query_id in expected if query_id not in by_id]
+    if missing:
+        raise BaselineRefused(
+            STATUS_REFUSED_SELECTION,
+            "V 参考未覆盖本轮全部检索问题",
+            {"missing_ids": missing, "source_dir": str(source_dir)},
+        )
+    artifacts: List[Dict[str, Any]] = []
+    scores: List[Dict[str, Any]] = []
+    for row in queries:
+        source = by_id[row["query_id"]]
+        artifact = dict(source)
+        artifact["query"] = row["query"]
+        artifact["split"] = row["split"]
+        artifact["mode"] = "V"
+        artifacts.append(artifact)
+        scores.append(
+            _retrieval_score_record(
+                row,
+                artifact.get("ranking") or [],
+                is_error=bool(artifact.get("is_error")),
+                note="复用原方案 V 参考排序",
+            )
+        )
+    meta = {
+        "source_dir": str(source_dir),
+        "predictions_sha256": _sha256_file(predictions),
+        "queries": len(artifacts),
+        "shared_not_rerun": True,
+    }
+    return artifacts, scores, meta
 
 
 def run_live(
@@ -1673,26 +1838,71 @@ def run_live(
         )
 
     splits = _selected_splits(args.split)
+    component = getattr(args, "component", "both")
+    run_intent = component in ("both", "intent")
+    run_retrieval = component in ("both", "retrieval")
     intents = _selected(dataset["intents"], args.split)
     queries = _selected(dataset["queries"], args.split)
     intent_filter = getattr(args, "intent_ids", None)
     query_filter = getattr(args, "query_ids", None)
     intents = _select_by_ids(intents, "case_id", intent_filter, "意图")
     queries = _select_by_ids(queries, "query_id", query_filter, "检索")
+    if intent_filter is not None and not run_intent:
+        raise BaselineRefused(
+            STATUS_REFUSED_SELECTION,
+            "component 未包含意图识别，不能指定意图子集",
+        )
+    if query_filter is not None and not run_retrieval:
+        raise BaselineRefused(
+            STATUS_REFUSED_SELECTION,
+            "component 未包含检索，不能指定检索子集",
+        )
     filtered = intent_filter is not None or query_filter is not None
+    intents = intents if run_intent else []
+    queries = queries if run_retrieval else []
+
+    # 跨阶段账本：未结算的已启动记录按计划上界占用，避免重跑清零。
+    ledger_path = (
+        Path(getattr(args, "budget_ledger", None)).expanduser().resolve()
+        if getattr(args, "budget_ledger", None)
+        else (run_dir / "budget_ledger.json").resolve()
+    )
+    ledger = _read_budget_ledger(ledger_path, args.budget_cny)
+    committed_before = _ledger_committed(ledger)
+    available_cny = float(args.budget_cny) - committed_before
+    if available_cny <= 0:
+        raise BaselineRefused(
+            STATUS_REFUSED_BUDGET,
+            "累计账本已无剩余额度，未创建模型客户端",
+            {
+                "ledger": str(ledger_path),
+                "limit_cny": float(args.budget_cny),
+                "committed_cny": committed_before,
+            },
+        )
     guard = BudgetGuard(
-        budget_cny=args.budget_cny,
+        budget_cny=available_cny,
         input_price_cny_per_mtok=args.input_price_cny_per_mtok,
         output_price_cny_per_mtok=args.output_price_cny_per_mtok,
     )
     api_key, base_url, model = _live_credentials(args)
     from mcp import knowledge_base as kb_module
     from mcp import tool_manager as tool_manager_module
-    from mcp.tool_manager import Tool
+    from mcp.tool_manager import Tool, retrieval_config
     from core import intent_recognizer as intent_module
 
-    # 预检使用实际模型名和完整请求体计数，但仍在创建客户端之前。
+    # 预检与运行共用生产配置，避免只改评测常量或内部召回范围。
+    retrieval_settings = retrieval_config(TOP_K)
     preflight = _preflight_upper_bound(guard, intents, queries, model)
+    preflight.update(
+        {
+            "component": component,
+            "authorized_limit_cny": float(args.budget_cny),
+            "committed_before_cny": committed_before,
+            "available_budget_cny": available_cny,
+            "ledger": str(ledger_path),
+        }
+    )
     if not preflight["fits_budget"]:
         raise BaselineRefused(
             STATUS_REFUSED_PREFLIGHT,
@@ -1700,14 +1910,18 @@ def run_live(
             {"preflight": preflight},
         )
 
-    if not kb_module._embedding_cache_ready():
+    if run_retrieval and not kb_module._embedding_cache_ready():
         raise BaselineRefused(
             STATUS_BLOCKED_EMBEDDING,
             "Embedding 本地缓存不完整，按约束不下载模型",
             {"preflight": preflight},
         )
 
-    host, port, fallback_path = _chroma_config(args, run_dir)
+    host, port, fallback_path = (
+        _chroma_config(args, run_dir)
+        if run_retrieval
+        else (None, None, None)
+    )
     collection_name = _collection_name(run_id)
     result = _base_result(args.mode, args.split)
     result["details"].update(
@@ -1720,10 +1934,29 @@ def run_live(
             "selection": {
                 "filtered": filtered,
                 "split": args.split,
+                "component": component,
                 "intent_ids": [row["case_id"] for row in intents],
                 "query_ids": [row["query_id"] for row in queries],
                 "expected_intent": len(intents),
                 "expected_queries": len(queries),
+            },
+            "experiment": {
+                "ab_label": getattr(args, "ab_label", None),
+                "config_label": getattr(args, "config_label", None),
+                "stage_label": getattr(args, "stage_label", None),
+                "component": component,
+                "budget_ledger": str(ledger_path),
+                "vector_from": (
+                    str(Path(args.vector_from).expanduser().resolve())
+                    if getattr(args, "vector_from", None)
+                    else None
+                ),
+            },
+            "budget_ledger": {
+                "path": str(ledger_path),
+                "limit_cny": float(args.budget_cny),
+                "committed_before_cny": committed_before,
+                "available_cny": available_cny,
             },
         }
     )
@@ -1735,7 +1968,12 @@ def run_live(
         {
             "model": model,
             "base_url_configured": bool(base_url),
+            "component": component,
+            "ab_label": getattr(args, "ab_label", None),
+            "config_label": getattr(args, "config_label", None),
+            "stage_label": getattr(args, "stage_label", None),
             "intent": {
+                "enabled": run_intent,
                 "confidence_threshold": CONFIDENCE_THRESHOLD,
                 "max_tokens_per_attempt": INTENT_MAX_TOKENS,
                 "llm_retry_attempts": 2,
@@ -1746,26 +1984,34 @@ def run_live(
                 ),
             },
             "retrieval": {
-                "top_k": TOP_K,
-                "recall_k": RECALL_K,
-                "rewrite_n": REWRITE_N,
+                "enabled": run_retrieval,
+                "top_k": retrieval_settings["top_k"],
+                "recall_k": retrieval_settings["recall_k"],
+                "rewrite_n": retrieval_settings["rewrite_n"],
                 "rewrite_max_tokens": REWRITE_MAX_TOKENS,
                 "rerank_max_tokens": RERANK_MAX_TOKENS,
                 "cache_ttl_s": CACHE_TTL_S,
-                "original_query_included": True,
+                "original_query_included": retrieval_settings[
+                    "original_query_included"
+                ],
             },
-            "chroma": {
-                "host": host,
-                "port": port,
-                "collection": collection_name,
-                "load_demo_documents": False,
-                "fallback_path": fallback_path,
-            },
+            "chroma": (
+                {
+                    "host": host,
+                    "port": port,
+                    "collection": collection_name,
+                    "load_demo_documents": False,
+                    "fallback_path": fallback_path,
+                }
+                if run_retrieval
+                else {"status": "NOT_RUN_COMPONENT"}
+            ),
             "embedding": {
                 "backend": "onnx_all-MiniLM-L6-v2",
                 "cache_path": str(
                     kb_module._ProjectEmbeddingFunction.DOWNLOAD_PATH / "onnx"
                 ),
+                "used": run_retrieval,
             },
             "cache": "cold_fresh_recognizer_and_tool_manager",
             "concurrency": "serial",
@@ -1780,121 +2026,173 @@ def run_live(
     lifecycle = _ClientLifecycle()
     guard_client: Optional[_GuardedClient] = None
     kb = None
+    backend = "NOT_REQUIRED"
+    imported = 0
+    second_import = 0
+    verification: Dict[str, Any] = {"status": "NOT_RUN_COMPONENT"}
     original_intent_factory = intent_module.AsyncAnthropic
     original_tool_factory = tool_manager_module.AsyncAnthropic
     owns_collection = False
     collection_deleted = False
+    # 在发出任何付费请求前，把本轮可能占用的上界写入累计账本。
+    _ledger_start(
+        ledger,
+        run_id,
+        getattr(args, "stage_label", None) or component,
+        preflight["total_upper_bound_cny"],
+        available_cny,
+    )
+    _write_budget_ledger(ledger_path, ledger)
+    ledger_status = "started"
     try:
-        kb = kb_module.KnowledgeBase(
-            chroma_host=host,
-            chroma_port=port,
-            chroma_path=fallback_path,
-            collection_name=collection_name,
-            load_demo_documents=False,
-        )
-        backend = kb.backend
-        initial_count = kb.doc_count
-        if initial_count:
-            raise BaselineRefused(
-                STATUS_BLOCKED_STORAGE,
-                f"独立集合 {collection_name} 非空，拒绝复用未知内容",
-                {"count": initial_count},
+        if run_retrieval:
+            kb = kb_module.KnowledgeBase(
+                chroma_host=host,
+                chroma_port=port,
+                chroma_path=fallback_path,
+                collection_name=collection_name,
+                load_demo_documents=False,
             )
-        owns_collection = True
-        import_started = time.monotonic()
-        imported = kb.upsert_evidence(dataset["knowledge"])
-        import_ms = (time.monotonic() - import_started) * 1000
-        verification = _verify_evidence(kb, dataset["knowledge"])
-        second_import = kb.upsert_evidence(dataset["knowledge"])
-        if not verification["passed"]:
-            raise BaselineRefused(
-                STATUS_BLOCKED_STORAGE,
-                "知识证据导入校验失败",
-                {"verification": verification},
+            backend = kb.backend
+            initial_count = kb.doc_count
+            if initial_count:
+                raise BaselineRefused(
+                    STATUS_BLOCKED_STORAGE,
+                    f"独立集合 {collection_name} 非空，拒绝复用未知内容",
+                    {"count": initial_count},
+                )
+            owns_collection = True
+            import_started = time.monotonic()
+            imported = kb.upsert_evidence(dataset["knowledge"])
+            import_ms = (time.monotonic() - import_started) * 1000
+            verification = _verify_evidence(kb, dataset["knowledge"])
+            second_import = kb.upsert_evidence(dataset["knowledge"])
+            if not verification["passed"]:
+                raise BaselineRefused(
+                    STATUS_BLOCKED_STORAGE,
+                    "知识证据导入校验失败",
+                    {"verification": verification},
+                )
+            result["details"].update(
+                {
+                    "backend": backend,
+                    "collection": collection_name,
+                    "import_ms": import_ms,
+                    "import_includes_embedding_load": True,
+                    "imported_new": imported,
+                    "second_import_new": second_import,
+                    "evidence_verification": verification,
+                }
             )
-        result["details"].update(
-            {
-                "backend": backend,
-                "collection": collection_name,
-                "import_ms": import_ms,
-                "import_includes_embedding_load": True,
-                "imported_new": imported,
-                "second_import_new": second_import,
-                "evidence_verification": verification,
-            }
-        )
+
+        guarded_clients: List[_GuardedClient] = []
 
         def guarded_factory(**kwargs: Any) -> _GuardedClient:
             inner = original_intent_factory(**kwargs)
             lifecycle.track(inner)
-            return _GuardedClient(inner, guard, request_log)
+            wrapped = _GuardedClient(inner, guard, request_log)
+            guarded_clients.append(wrapped)
+            return wrapped
 
         def guarded_tool_factory(**kwargs: Any) -> _GuardedClient:
             inner = original_tool_factory(**kwargs)
             lifecycle.track(inner)
-            return _GuardedClient(inner, guard, request_log)
+            wrapped = _GuardedClient(inner, guard, request_log)
+            guarded_clients.append(wrapped)
+            return wrapped
 
-        # 两个模块各自持有 AsyncAnthropic 引用，需分别替换后再建组件。
-        intent_module.AsyncAnthropic = guarded_factory
-        tool_manager_module.AsyncAnthropic = guarded_tool_factory
-        recognizer = intent_module.IntentRecognizer(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            confidence_threshold=CONFIDENCE_THRESHOLD,
-        )
-        guard_client = recognizer.client
-        tool_manager = tool_manager_module.MCPToolManager(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-        )
-        tool_manager.register(
-            Tool(
-                name="knowledge_search",
-                description="搜索零售知识库（ChromaDB 向量检索）",
-                handler=kb.search_handler,
-                schema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "top_k": {"type": "integer"},
-                    },
-                    "required": ["query"],
-                },
-                cache_ttl=CACHE_TTL_S,
-                timeout_s=30.0,
-                supports_rerank=True,
+        # 两个模块各自持有 AsyncAnthropic 引用，只替换本轮实际运行的组件。
+        recognizer = None
+        tool_manager = None
+        if run_intent:
+            intent_module.AsyncAnthropic = guarded_factory
+            recognizer = intent_module.IntentRecognizer(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+                confidence_threshold=CONFIDENCE_THRESHOLD,
             )
-        )
+        if run_retrieval:
+            tool_manager_module.AsyncAnthropic = guarded_tool_factory
+            tool_manager = tool_manager_module.MCPToolManager(
+                api_key=api_key,
+                base_url=base_url,
+                model=model,
+            )
+            tool_manager.register(
+                Tool(
+                    name="knowledge_search",
+                    description="搜索零售知识库（ChromaDB 向量检索）",
+                    handler=kb.search_handler,
+                    schema={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                            "top_k": {"type": "integer"},
+                        },
+                        "required": ["query"],
+                    },
+                    cache_ttl=CACHE_TTL_S,
+                    timeout_s=30.0,
+                    supports_rerank=True,
+                )
+            )
+        guard_client = guarded_clients[0] if guarded_clients else None
+        if guard_client is None:
+            raise BaselineRefused(
+                STATUS_REFUSED_SELECTION,
+                "未创建任何组件客户端",
+            )
 
-        # V 不产生模型费用，先跑完；随后意图和 P 都受同一预算守卫。
-        v_artifacts, v_scores = _run_vector_queries(kb, queries)
         known_ids = {row["evidence_id"] for row in dataset["knowledge"]}
-        _fill_vector_result(
-            result,
-            dataset,
-            splits,
-            args.split,
-            v_artifacts,
-            v_scores,
-            known_ids,
-            expected_ids=[row["query_id"] for row in queries],
-        )
-        v_complete = result["details"].get("retrieval_V_complete", False)
-        result["stages"]["vector_baseline"] = (
-            "COMPLETE"
-            if v_complete
-            and result["details"].get("vector_protocol_clean")
-            else "PROTOCOL_ISSUES"
-            if v_complete
-            else "FAILED"
-        )
-        result["stages"]["storage_integration"] = (
-            "VERIFIED" if backend == "server" else "LOCAL_FALLBACK"
-        )
+        if run_retrieval:
+            vector_reference = None
+            vector_from = getattr(args, "vector_from", None)
+            if vector_from:
+                # 未改检索层时复用原方案的真实 V 排序，不重算也不写成新运行。
+                v_artifacts, v_scores, vector_reference = _load_vector_reference(
+                    Path(vector_from).expanduser().resolve(),
+                    queries,
+                )
+            else:
+                # V 不产生模型费用，先跑完；随后 P 受同一预算守卫。
+                v_artifacts, v_scores = _run_vector_queries(kb, queries)
+            _fill_vector_result(
+                result,
+                dataset,
+                splits,
+                args.split,
+                v_artifacts,
+                v_scores,
+                known_ids,
+                expected_ids=[row["query_id"] for row in queries],
+            )
+            result["retrieval"]["V"]["source"] = (
+                "reference_run" if vector_reference else "current_run"
+            )
+            if vector_reference:
+                result["retrieval"]["V"]["reference"] = vector_reference
+                result["details"]["vector_reference"] = vector_reference
+            v_complete = result["details"].get("retrieval_V_complete", False)
+            result["stages"]["vector_baseline"] = (
+                "COMPLETE"
+                if v_complete
+                and result["details"].get("vector_protocol_clean")
+                else "PROTOCOL_ISSUES"
+                if v_complete
+                else "FAILED"
+            )
+            result["stages"]["storage_integration"] = (
+                "VERIFIED" if backend == "server" else "LOCAL_FALLBACK"
+            )
+        else:
+            result["retrieval"]["V"] = {"status": "NOT_RUN_COMPONENT"}
+            result["retrieval"]["P"] = {"status": "NOT_RUN_COMPONENT"}
+            result["stages"]["vector_baseline"] = "NOT_RUN_COMPONENT"
+            result["stages"]["storage_integration"] = "NOT_RUN_COMPONENT"
+            result["coverage"]["retrieval_V"] = _coverage_for([], [])
 
-        # 意图与 P 的全部模型调用、预算停止和客户端释放都在同一事件循环。
+        # 选中组件的全部模型调用、预算停止和客户端释放在同一事件循环。
         live_stages = asyncio.run(
             _run_live_stages(
                 recognizer,
@@ -1912,100 +2210,131 @@ def run_live(
             "clients_closed": len(lifecycle.closed_indices),
             "close_errors": list(lifecycle.errors),
         }
-        intent_artifacts, intent_scores, slot_scores = live_stages["intent"]
-        p_artifacts, p_scores = live_stages["pipeline"]
-        if live_stages["pipeline_skipped"]:
-            result["notes"].append(
-                f"意图阶段预算停止: {guard_client.stop_reason}"
-            )
+        intent_artifacts: List[Dict[str, Any]] = []
+        intent_scores: List[Dict[str, Any]] = []
+        slot_scores: List[Dict[str, Any]] = []
+        p_artifacts: List[Dict[str, Any]] = []
+        p_scores: List[Dict[str, Any]] = []
+        if run_intent:
+            intent_artifacts, intent_scores, slot_scores = live_stages["intent"]
+        if run_retrieval:
+            p_artifacts, p_scores = live_stages["pipeline"]
+            if live_stages["pipeline_skipped"]:
+                result["notes"].append(
+                    f"检索阶段预算停止: {guard_client.stop_reason}"
+                )
 
-        intent_metrics = _per_split(intent_scores, splits, score_intents)
-        slot_metrics = _per_split(slot_scores, splits, score_slots)
-        rows_by_id = {row["case_id"]: row for row in dataset["intents"]}
-        expected_intent = [row["case_id"] for row in intents]
-        attempted_intent = [row["case_id"] for row in intent_artifacts]
-        result["intent"] = intent_metrics
-        result["slots"] = slot_metrics
-        result["coverage"]["intent"] = _coverage_for(
-            expected_intent, attempted_intent
-        )
-        result["latency"]["intent"] = _latency_by_split(
-            intent_artifacts, splits
-        )
-        result["errors"]["intent"] = _intent_error_summary(
-            intent_scores, rows_by_id, intent_artifacts
-        )
-        result["errors"]["slots"] = _slot_error_summary(
-            {
-                "cases": [
-                    case
-                    for split_metrics in slot_metrics.values()
-                    for case in split_metrics.get("cases", [])
-                ]
-            },
-            rows_by_id,
-        )
-        result["intent_predictions"] = intent_artifacts
-        result["stages"]["live_intent"] = (
-            "COMPLETE"
-            if _attempted_status(
+        if run_intent:
+            intent_metrics = _per_split(intent_scores, splits, score_intents)
+            slot_metrics = _per_split(slot_scores, splits, score_slots)
+            rows_by_id = {row["case_id"]: row for row in dataset["intents"]}
+            expected_intent = [row["case_id"] for row in intents]
+            attempted_intent = [row["case_id"] for row in intent_artifacts]
+            result["intent"] = intent_metrics
+            result["slots"] = slot_metrics
+            result["coverage"]["intent"] = _coverage_for(
                 expected_intent, attempted_intent
             )
-            == "COMPLETE"
-            else "PARTIAL"
-        )
+            result["latency"]["intent"] = _latency_by_split(
+                intent_artifacts, splits
+            )
+            result["errors"]["intent"] = _intent_error_summary(
+                intent_scores, rows_by_id, intent_artifacts
+            )
+            result["errors"]["slots"] = _slot_error_summary(
+                {
+                    "cases": [
+                        case
+                        for split_metrics in slot_metrics.values()
+                        for case in split_metrics.get("cases", [])
+                    ]
+                },
+                rows_by_id,
+            )
+            result["intent_predictions"] = intent_artifacts
+            result["stages"]["live_intent"] = (
+                "COMPLETE"
+                if _attempted_status(
+                    expected_intent, attempted_intent
+                )
+                == "COMPLETE"
+                else "PARTIAL"
+            )
+        else:
+            result["stages"]["live_intent"] = "NOT_RUN_COMPONENT"
+            result["intent"] = {"status": "NOT_RUN_COMPONENT"}
+            result["slots"] = {"status": "NOT_RUN_COMPONENT"}
+            result["coverage"]["intent"] = _coverage_for([], [])
 
-        p_metrics = _per_split(
-            p_scores,
-            splits,
-            lambda subset: compute_retrieval_metrics(
-                subset, known_ids=known_ids
-            ),
-        )
-        result["retrieval"]["P"] = {
-            "status": "SCORED" if p_artifacts else "NOT_RUN",
-            "mode": "P",
-            "top_k": TOP_K,
-            "rewrite_n": REWRITE_N,
-            "recall_k": RECALL_K,
-            "per_split": p_metrics,
-            "latency": _latency_by_split(p_artifacts, splits),
-            "protocol_clean": all(
-                item.get("protocol_clean") for item in p_metrics.values()
-            ),
-        }
-        result["latency"]["retrieval_P"] = _latency_by_split(
-            p_artifacts, splits
-        )
-        expected_queries = [row["query_id"] for row in queries]
-        attempted_queries = [row["query_id"] for row in p_artifacts]
-        result["coverage"]["retrieval_P"] = _coverage_for(
-            expected_queries, attempted_queries
-        )
-        result["retrieval_predictions"] = list(v_artifacts) + list(p_artifacts)
-        result["errors"]["retrieval_P"] = _retrieval_error_summary(
-            p_artifacts, p_metrics, "P"
-        )
-        result["stages"]["live_pipeline"] = (
-            "COMPLETE"
-            if _attempted_status(
+        if run_retrieval:
+            p_metrics = _per_split(
+                p_scores,
+                splits,
+                lambda subset: compute_retrieval_metrics(
+                    subset, known_ids=known_ids
+                ),
+            )
+            result["retrieval"]["P"] = {
+                "status": "SCORED" if p_artifacts else "NOT_RUN",
+                "mode": "P",
+                "top_k": retrieval_settings["top_k"],
+                "rewrite_n": retrieval_settings["rewrite_n"],
+                "recall_k": retrieval_settings["recall_k"],
+                "per_split": p_metrics,
+                "latency": _latency_by_split(p_artifacts, splits),
+                "protocol_clean": all(
+                    item.get("protocol_clean") for item in p_metrics.values()
+                ),
+            }
+            result["latency"]["retrieval_P"] = _latency_by_split(
+                p_artifacts, splits
+            )
+            expected_queries = [row["query_id"] for row in queries]
+            attempted_queries = [row["query_id"] for row in p_artifacts]
+            result["coverage"]["retrieval_P"] = _coverage_for(
                 expected_queries, attempted_queries
             )
-            == "COMPLETE"
-            else "PARTIAL"
-        )
-        result["coverage"]["knowledge"] = {
-            "expected": len(dataset["knowledge"]),
-            "actual": kb.doc_count,
-            "imported_new": imported,
-            "second_import_new": second_import,
-            "verification": verification,
-            "status": "VERIFIED" if verification["passed"] else "FAILED",
-        }
+            result["retrieval_predictions"] = list(v_artifacts) + list(
+                p_artifacts
+            )
+            result["errors"]["retrieval_P"] = _retrieval_error_summary(
+                p_artifacts, p_metrics, "P"
+            )
+            result["stages"]["live_pipeline"] = (
+                "COMPLETE"
+                if _attempted_status(
+                    expected_queries, attempted_queries
+                )
+                == "COMPLETE"
+                else "PARTIAL"
+            )
+            result["coverage"]["knowledge"] = {
+                "expected": len(dataset["knowledge"]),
+                "actual": kb.doc_count,
+                "imported_new": imported,
+                "second_import_new": second_import,
+                "verification": verification,
+                "status": "VERIFIED" if verification["passed"] else "FAILED",
+            }
+        else:
+            result["stages"]["live_pipeline"] = "NOT_RUN_COMPONENT"
+            result["retrieval"]["P"] = {"status": "NOT_RUN_COMPONENT"}
+            result["coverage"]["retrieval_P"] = _coverage_for([], [])
+            result["coverage"]["knowledge"] = {
+                "expected": len(dataset["knowledge"]),
+                "actual": None,
+                "status": "NOT_RUN_COMPONENT",
+            }
+
         result["cost"] = {
             **guard.summary(),
             "basis": INPUT_COUNT_BASIS,
             "vendor_bill_verified": False,
+            "authorized_limit_cny": float(args.budget_cny),
+            "committed_before_cny": committed_before,
+            "available_budget_cny": available_cny,
+            "ledger_path": str(ledger_path),
+            "component": component,
         }
         usage_rows = list(guard.usage)
         usage_rows.append(
@@ -2016,21 +2345,36 @@ def run_live(
             }
         )
         result["usage"] = usage_rows
-        complete = (
-            result["stages"]["live_intent"] == "COMPLETE"
-            and result["stages"]["live_pipeline"] == "COMPLETE"
-            and result["stages"]["vector_baseline"] == "COMPLETE"
-            and result["stages"]["storage_integration"] == "VERIFIED"
-            and not guard.cost_stop_reason
-        )
+        if run_intent and run_retrieval:
+            complete = (
+                result["stages"]["live_intent"] == "COMPLETE"
+                and result["stages"]["live_pipeline"] == "COMPLETE"
+                and result["stages"]["vector_baseline"] == "COMPLETE"
+                and result["stages"]["storage_integration"] == "VERIFIED"
+                and not guard.cost_stop_reason
+            )
+        elif run_intent:
+            complete = (
+                result["stages"]["live_intent"] == "COMPLETE"
+                and not guard.cost_stop_reason
+            )
+        else:
+            complete = (
+                result["stages"]["live_pipeline"] == "COMPLETE"
+                and result["stages"]["vector_baseline"] == "COMPLETE"
+                and result["stages"]["storage_integration"] == "VERIFIED"
+                and not guard.cost_stop_reason
+            )
         if complete and filtered:
             # 子集通过只说明烟测范围可用，不能签收完整固定集基线。
             result["status"] = STATUS_SMOKE_COMPLETE
+        elif complete and component != "both":
+            result["status"] = STATUS_COMPONENT_COMPLETE
         elif complete:
             result["status"] = STATUS_COMPLETE
         else:
             result["status"] = STATUS_PARTIAL
-            if backend != "server":
+            if run_retrieval and backend != "server":
                 result["blockers"].append("PENDING_STORAGE")
             if guard_client.stop_reason:
                 result["blockers"].append("BUDGET_EXHAUSTED")
@@ -2040,6 +2384,13 @@ def run_live(
                     "实际费用超过预留上界，已永久停止后续请求: "
                     + guard.cost_stop_reason
                 )
+        ledger_status = (
+            "complete"
+            if result["status"] in (STATUS_COMPLETE, STATUS_COMPONENT_COMPLETE)
+            else "partial"
+            if result["status"] == STATUS_SMOKE_COMPLETE
+            else "failed"
+        )
     finally:
         intent_module.AsyncAnthropic = original_intent_factory
         tool_manager_module.AsyncAnthropic = original_tool_factory
@@ -2083,6 +2434,32 @@ def run_live(
                         "本地回退路径未删除，保留在运行目录内: "
                         f"{type(ex).__name__}: {str(ex)[:200]}"
                     )
+        try:
+            # 无论成功或异常都落账；未结算的在途预留保留为占用。
+            summary = guard.summary()
+            _ledger_finish(
+                ledger,
+                run_id,
+                {
+                    "status": (
+                        ledger_status
+                        if ledger_status != "started"
+                        else "failed"
+                    ),
+                    "spent_cny": summary["spent_cny"],
+                    "unsettled_cny": summary["reserved_cny"],
+                    "requests": summary["requests"],
+                    "cost_stop_reason": summary["cost_stop_reason"],
+                    "result_status": result.get("status"),
+                    "available_before_cny": available_cny,
+                },
+            )
+            _write_budget_ledger(ledger_path, ledger)
+        except Exception as ex:
+            result["notes"].append(
+                "累计账本写入失败，费用占用仍按本次内存结果记录: "
+                f"{type(ex).__name__}: {str(ex)[:200]}"
+            )
     return result
 
 
@@ -2099,8 +2476,17 @@ def _refused_result(
     }
     result["blockers"].append(refused.reason)
     if args.mode == "live":
-        result["stages"]["live_intent"] = "REFUSED"
-        result["stages"]["live_pipeline"] = "REFUSED"
+        component = getattr(args, "component", "both")
+        result["stages"]["live_intent"] = (
+            "REFUSED"
+            if component in ("both", "intent")
+            else "NOT_RUN_COMPONENT"
+        )
+        result["stages"]["live_pipeline"] = (
+            "REFUSED"
+            if component in ("both", "retrieval")
+            else "NOT_RUN_COMPONENT"
+        )
     result["usage"] = [
         _empty_usage_row(
             args.mode,
@@ -2217,6 +2603,46 @@ def _parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         choices=("dev", "test", "all"),
         default="all",
         help="评测划分；默认 all（dev＋test）",
+    )
+    parser.add_argument(
+        "--component",
+        choices=("both", "intent", "retrieval"),
+        default="both",
+        help=(
+            "live 模式运行的组件；默认 both 保持原行为，"
+            "intent／retrieval 只运行单一组件"
+        ),
+    )
+    parser.add_argument(
+        "--budget-ledger",
+        default=None,
+        help=(
+            "live 模式跨阶段累计账本路径；默认运行目录内 budget_ledger.json，"
+            "分阶段实验须显式传同一路径"
+        ),
+    )
+    parser.add_argument(
+        "--stage-label",
+        default=None,
+        help="本轮阶段标签，如 A-dev、B-test",
+    )
+    parser.add_argument(
+        "--ab-label",
+        default=None,
+        help="方案标签，如 A 或 B",
+    )
+    parser.add_argument(
+        "--config-label",
+        default=None,
+        help="冻结配置标签，用于核对 A/B 实际参数",
+    )
+    parser.add_argument(
+        "--vector-from",
+        default=None,
+        help=(
+            "复用指定运行目录的真实 V 排序；仅检索组件使用，"
+            "不重跑 V 也不写成独立运行"
+        ),
     )
     parser.add_argument(
         "--intent-ids",
@@ -2343,6 +2769,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "finished_at": finished_at,
         "mode": args.mode,
         "split": args.split,
+        "component": getattr(args, "component", "both"),
         "status": result["status"],
         "exit_code": exit_code,
         "stages": result["stages"],
@@ -2396,6 +2823,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "dataset_version": data_before.get("version"),
         "mode": args.mode,
         "split": args.split,
+        "component": getattr(args, "component", "both"),
         "status": result["status"],
         "stages": result["stages"],
         "blockers": result["blockers"],
@@ -2458,7 +2886,8 @@ def _exit_code(
         )
     return (
         0
-        if result["status"] in (STATUS_COMPLETE, STATUS_SMOKE_COMPLETE)
+        if result["status"]
+        in (STATUS_COMPLETE, STATUS_SMOKE_COMPLETE, STATUS_COMPONENT_COMPLETE)
         else 2
     )
 

@@ -42,6 +42,21 @@ def _rerank_preview(item: Any) -> str:
     return json.dumps(payload, ensure_ascii=False)[:300]
 
 
+# 检索链的生产配置；预检和运行记录都从这里读取，避免只改评测常量。
+REWRITE_N = 3
+MIN_RECALL_K = 5
+
+
+def retrieval_config(top_k: int) -> Dict[str, Any]:
+    """返回生产检索链实际使用的配置，供预检、诊断和运行记录复用。"""
+    return {
+        "top_k": int(top_k),
+        "rewrite_n": REWRITE_N,
+        "recall_k": max(int(top_k), MIN_RECALL_K),
+        "original_query_included": True,
+    }
+
+
 def build_rewrite_prompt(query: str, n: int) -> str:
     """构造与实际改写请求完全一致的 Prompt，供预算预检复用。"""
     prompt = f"""将以下用户查询改写为 {n} 个不同角度的搜索子查询，用于检索知识库。
@@ -165,13 +180,15 @@ class MCPToolManager:
         api_key: str,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
+        client: Optional[Any] = None,
     ):
         if not model:
             raise ValueError("model is required")
         kwargs: Dict[str, Any] = {"api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        self._client = AsyncAnthropic(**kwargs)
+        # 零售模式注入受预算保护的客户端；旧调用保持原构造行为。
+        self._client = client or AsyncAnthropic(**kwargs)
         self._model = model
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}
@@ -401,15 +418,18 @@ class MCPToolManager:
         """执行改写、并行召回、合并去重和重排。"""
         diag = diagnostics if diagnostics is not None else {}
         total_start = time.monotonic()
+        settings = retrieval_config(top_k)
         diag["requested_top_k"] = top_k
+        diag.update(settings)
 
         rewrite_start = time.monotonic()
-        sub_queries = await self.rewrite_query(query, n=3, diagnostics=diag)
+        sub_queries = await self.rewrite_query(
+            query, n=settings["rewrite_n"], diagnostics=diag
+        )
         diag["rewrite_ms"] = (time.monotonic() - rewrite_start) * 1000
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
-        recall_k = max(top_k, 5)
-        diag["recall_k"] = recall_k
+        recall_k = settings["recall_k"]
         recall_start = time.monotonic()
         tasks = [
             self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
@@ -480,6 +500,21 @@ class MCPToolManager:
             if isinstance(item, dict)
             else str(item)
             for item in merged
+        ]
+        # 只保留稳定身份和来源字段，供评测判断必需证据是否进入候选。
+        diag["pre_rerank_items"] = [
+            {
+                "evidence_id": item.get("evidence_id") or item.get("id"),
+                "doc_id": item.get("doc_id", ""),
+                "title": item.get("title", ""),
+                "score": item.get("score"),
+                "source_kind": item.get("source_kind", ""),
+                "source_refs": item.get("source_refs") or [],
+                "policy_release": item.get("policy_release", ""),
+                "policy_commit": item.get("policy_commit", ""),
+            }
+            for item in merged
+            if isinstance(item, dict)
         ]
         diag["degraded_subqueries"] = sum(
             1 for item in subquery_results if item["degraded"]

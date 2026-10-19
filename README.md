@@ -112,10 +112,50 @@ uv run --locked --offline python -m evaluation.run_retail_baseline --mode live -
 ```
 
 - `--split` 可选 `dev`、`test`、`all`，默认 `all`。
+- `--component` 可选 `both`、`intent`、`retrieval`，默认 `both`；只运行指定组件的 live 阶段，未选组件标 `NOT_RUN_COMPONENT`。
+- 分阶段或 A/B 对照时，用 `--budget-ledger` 指定同一份累计账本，并用 `--stage-label`、`--ab-label`、`--config-label` 记录阶段与配置身份；未完成条目按计划上界占用，重跑不会清零。检索候选可用 `--vector-from` 复用已封存的 V 预测，避免重复付费。
+- 检索链最终固定交付 `top_k=5`；内部每路召回量由生产配置 `mcp/tool_manager.py:retrieval_config` 决定，预检、运行记录和实际请求共用该配置。
 - `vector` 要求 ChromaDB 已在 `CHROMA_HOST:CHROMA_PORT`（默认 `127.0.0.1:8002`）运行，且本地 Embedding 缓存完整；缺失时直接停止，不自动下载模型。29 段知识按 `evidence_id` 幂等导入隔离集合，旧集合不受影响。
 - `live` 在创建模型客户端前检查预算与显式单价；缺失即拒绝。有密钥不代表可以调用。远程 Embedding 被显式屏蔽，意图向量回退到本地字符 n-gram。
 - 运行产物写入 `data/evaluation/retail/<run_id>/`（已忽略）：`run.json`、`metrics.json`、`intent_predictions.jsonl`、`retrieval_predictions.jsonl`、`usage.jsonl`。
-- 状态含义：`OFFLINE_READY_REAL_BASELINE_PENDING_BUDGET`（离线就绪、真实基线待预算）、`PARTIAL_RUN`、`SMOKE_COMPLETE`（指定子集烟测完成，不代表完整基线）、`BASELINE_COMPLETE`。Fake 或离线检查只证明接线、计分与边界，不代表真实模型成绩。
+- 状态含义：`OFFLINE_READY_REAL_BASELINE_PENDING_BUDGET`（离线就绪、真实基线待预算）、`PARTIAL_RUN`、`SMOKE_COMPLETE`（指定子集烟测完成，不代表完整基线）、`COMPONENT_COMPLETE`（所选组件完整跑完，不代表整体基线）、`BASELINE_COMPLETE`（识别与检索完整跑完）。Fake 或离线检查只证明接线、计分与边界，不代表真实模型成绩。
+
+## 零售沙箱运行
+
+设置 `RETAIL_MODE=true` 后，HTTP API 与 CLI 切换到单 Agent 零售沙箱：支持订单查询、退货申请和知识咨询。默认客服模式不受影响；两种入口共用同一套零售逻辑。
+
+固定运行资料位于 `evaluation/data/retail_sandbox/`：公开种子 `db.json`、`policy.md`、29 段 `knowledge.jsonl`、上游 MIT `LICENSE` 与 `sources.json`。启动时校验种子、政策与知识哈希、知识条数及 500 用户／1000 订单／50 商品；该目录不含官方隐藏任务、gold、用户模拟器或判定器。
+
+```powershell
+# 启动本地 Redis 与 ChromaDB（沿用 compose.yml 的卷）
+docker compose up -d redis chromadb
+
+# 必填：模型接入与当前官方单价；单价缺失时拒绝启动付费链路
+$env:RETAIL_MODE = "true"
+$env:ANTHROPIC_API_KEY = "<key>"
+$env:LLM_MODEL = "<model>"
+$env:RETAIL_INPUT_CNY_PER_MTOK = "<当前输入单价>"
+$env:RETAIL_OUTPUT_CNY_PER_MTOK = "<当前输出单价>"
+
+# HTTP 入口
+uv run --locked --offline uvicorn api.main:app --host 127.0.0.1 --port 8000
+Invoke-RestMethod -Method Post http://127.0.0.1:8000/chat -ContentType 'application/json' `
+  -Body '{"user_id":"sandbox-client","conv_id":"conv-1","message":"帮我查一下我的订单"}'
+
+# CLI 入口；RETAIL_CLIENT_USER 与 RETAIL_CONV_ID 缺省分别为 cli_user 和随机值
+uv run --locked --offline python -m api.main --cli
+```
+
+- `RETAIL_DB_PATH`：SQLite 路径，默认 `data/retail/retail.db`。首次启动从固定种子初始化；已有非空业务库不会自动重置，需要新数据时请显式指定新的空路径。
+- `RETAIL_SEED_PATH`、`RETAIL_POLICY_PATH`、`RETAIL_KNOWLEDGE_PATH`：默认指向上述固定资料，通常无需设置。
+- `RETAIL_COLLECTION`：知识集合名，默认 `retail_knowledge_v1`；只导入冻结的 29 段知识，旧演示政策不参与。
+- `RETAIL_MEMORY_COLLECTION_SUFFIX`、`RETAIL_MEMORY_KEY_PREFIX`：记忆集合后缀与 Redis 键前缀，默认 `_retail`、`retail:`；并行运行时请显式区分。
+- `RETAIL_BUDGET_LEDGER`、`RETAIL_BUDGET_CNY`：跨进程累计账本路径与上限，默认 `data/retail/budget_ledger.db`、`5` 元。所有 Agent、改写、重排、摘要请求共用同一账本；预算不足或价格不可核实会停止付费调用，账本不会自动清零。
+- `RETAIL_EVENT_LOG`：业务事件 JSONL，默认 `data/retail/events.jsonl`。
+- `RETAIL_PROFILE_ENABLED`：用户画像开关，默认 `false`；启用会增加一次付费请求并计入账本。
+- `RETAIL_CASE_ID`、`RETAIL_RUN_ID`：可选的运行标识，写入事件与账本；`RETAIL_AGENT_MAX_TOKENS`（默认 2048）、`RETAIL_MAX_MESSAGE_CHARS`（默认 4000）、`RETAIL_MAX_CONTEXT_CHARS`（默认 12000）限制单轮输入输出。
+- 身份绑定：服务端通过邮箱或“姓名＋邮编”绑定沙箱用户；请求里的 `user_id`、`conv_id` 不是订单授权，只能查询和操作当前绑定用户的订单。
+- 退货：仅 `delivered` 订单可申请；去向只能是原支付方式或用户已有礼品卡。详情由程序保存并实际展示，只有当前用户对同一详情的明确确认才能写入；修改详情需重新展示并重新确认，多订单逐笔确认与提交。人工交接只记录模拟事件，不代表真实工单、邮件或资金到账。
 
 ## 测试
 
@@ -131,6 +171,12 @@ uv run --locked --offline pytest tests/integration/test_memory.py -q
 
 # HTTP API 与 CLI 集成测试，需先启动 redis 与 chromadb，使用 Fake 模型
 uv run --locked --offline pytest tests/integration/test_api.py -q
+
+# 零售沙箱单元测试：临时 SQLite 与 Fake 模型，不发真实请求
+uv run --locked --offline pytest tests/test_retail_agent.py tests/test_retail_store.py tests/test_retail_ledger.py tests/test_retail_live.py -q
+
+# 零售沙箱 API／CLI 集成测试，需先启动 redis 与 chromadb，使用 Fake 模型
+uv run --locked --offline pytest tests/integration/test_retail_sandbox.py -q
 
 # 当前全部测试
 uv run --locked --offline pytest tests -q
@@ -172,6 +218,9 @@ uv run --locked --offline pytest tests -q
 - `core/skill_loader.py` 与 `skills/`：三个业务 Skill 的加载、按 Agent 匹配、热重载与 `ECHOMIND_SKILLS_DIR` 覆盖。
 - `mcp/tool_manager.py`：工具注册、查询改写、并行召回、去重、LLM 重排、TTL 缓存、熔断与降级。降级结果标记 `degraded=True` 且不计为成功命中。
 - `mcp/knowledge_base.py`：ChromaDB 文档切片、幂等导入与语义检索；返回文档 ID、标题、内容、相似度与片段序号。
+- `agents/retail_agent.py`、`agents/retail_runtime.py`、`agents/retail_tools.py`：单 Agent 零售沙箱的决策循环、运行时装配，以及订单查询、退货申请与知识工具。
+- `mcp/retail_store.py`：零售沙箱 SQLite 存储、身份绑定、退货确认状态机与事务写入。
+- `skills/retail_support/SKILL.md`：零售沙箱每轮生效的业务指引；不与其他模式的审计规则混用。
 - `memory/conversation_memory.py`：Redis 工作记忆、会话摘要、ChromaDB 情景记忆与用户画像；压缩与追加按会话加锁。
 - `monitor/performance_monitor.py`：Agent／工具统计采样、Z-score 异常检测、阈值告警、路由惩罚反馈、优化建议、Prometheus 与 webhook。
 - `evaluation/evaluator.py`：意图 Accuracy／Macro-F1、LLM-as-Judge 对话评分、回归检测、只读基线与独立报告文件。
@@ -184,8 +233,8 @@ uv run --locked --offline pytest tests -q
 
 ## 当前限制
 
-- 真实模型未验证；自动化测试与本地烟测只使用 Fake 客户端或占位密钥，不构成模型质量结论。
-- 没有登录、RBAC、支付、订单查询或退款执行；`user_id`／`conv_id` 不是认证身份。
+- 真实模型表现只覆盖现有回归样本，不代表通用质量或生产可靠性。
+- 没有登录与 RBAC；默认客服模式不查询订单或执行退款；零售沙箱只提供模拟订单查询与退货申请，不执行真实支付、退款、邮件或工单。`user_id`／`conv_id` 不是认证身份。
 - CORS 允许任意来源，API 默认仅监听 `127.0.0.1`，不适合直接作为生产部署。
 - 记忆压缩与追加只在单进程内互斥，不提供分布式锁。
 - 监控与评测已接入 API 启动流程；真实 webhook、Prometheus 外部抓取和真实 Judge 评分尚未验证。

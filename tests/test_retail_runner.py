@@ -522,3 +522,143 @@ def test_intent_retry_cannot_send_after_cost_bound_failure(monkeypatch):
     assert any(
         item["status"] == "refused_before_request" for item in request_log
     )
+
+
+def test_budget_ledger_keeps_started_entry_at_planned_upper_bound(tmp_path):
+    ledger_path = tmp_path / "budget.json"
+    ledger = runner._read_budget_ledger(ledger_path, 5.0)
+    runner._ledger_start(ledger, "run-1", "A-dev", 1.5, 5.0)
+    runner._write_budget_ledger(ledger_path, ledger)
+
+    reloaded = runner._read_budget_ledger(ledger_path, 5.0)
+    # 未完成记录按计划上界占用，重跑不能把未知费用清零。
+    assert runner._ledger_committed(reloaded) == pytest.approx(1.5)
+
+    runner._ledger_finish(
+        reloaded,
+        "run-1",
+        {"status": "complete", "spent_cny": 0.2, "unsettled_cny": 0.05},
+    )
+    runner._write_budget_ledger(ledger_path, reloaded)
+
+    finished = runner._read_budget_ledger(ledger_path, 5.0)
+    assert runner._ledger_committed(finished) == pytest.approx(0.25)
+
+    with pytest.raises(runner.BaselineRefused) as refused:
+        runner._read_budget_ledger(ledger_path, 10.0)
+    assert refused.value.status == runner.STATUS_REFUSED_BUDGET
+
+
+def test_live_stages_run_only_selected_component(monkeypatch):
+    intent_client = _LoopClient()
+    tool_client = _LoopClient()
+    recognizer, manager = _build_recognizer_and_manager(
+        monkeypatch, intent_client, tool_client
+    )
+    intents, queries = _sample_rows()
+
+    # 只选意图：不创建、也不调用检索组件。
+    lifecycle = runner._ClientLifecycle()
+    lifecycle.track(intent_client)
+    guard = BudgetGuard(1.0, 1.0, 1.0)
+    guarded_intent = runner._GuardedClient(
+        intent_client, guard, []
+    )
+    recognizer.client = guarded_intent
+    outcome = asyncio.run(
+        runner._run_live_stages(
+            recognizer,
+            None,
+            intents,
+            queries,
+            [],
+            guarded_intent,
+            lifecycle,
+        )
+    )
+    assert outcome["intent_skipped"] is False
+    assert outcome["pipeline_skipped"] is True
+    assert len(outcome["intent"][0]) == 2
+    assert tool_client.create_loops == []
+
+    # 只选检索：识别器为 None 时不得调用识别，也不得创建识别客户端。
+    intent_calls_before = len(intent_client.create_loops)
+    tool_lifecycle = runner._ClientLifecycle()
+    tool_lifecycle.track(tool_client)
+    guarded_tool = runner._GuardedClient(tool_client, guard, [])
+    manager._client = guarded_tool
+    outcome = asyncio.run(
+        runner._run_live_stages(
+            None,
+            manager,
+            intents,
+            queries,
+            [],
+            guarded_tool,
+            tool_lifecycle,
+        )
+    )
+    assert outcome["intent_skipped"] is True
+    assert outcome["pipeline_skipped"] is False
+    assert len(outcome["pipeline"][0]) == 2
+    assert len(intent_client.create_loops) == intent_calls_before
+
+
+def test_production_retrieval_config_matches_preflight_and_final_top5(monkeypatch):
+    tool_client = _LoopClient()
+    _, manager = _build_recognizer_and_manager(
+        monkeypatch, _LoopClient(), tool_client
+    )
+    diagnostics = {}
+
+    result = asyncio.run(
+        manager.search_with_rewrite(
+            "knowledge_search", "退货政策", top_k=5, diagnostics=diagnostics
+        )
+    )
+    settings = tool_module.retrieval_config(5)
+
+    # 预检与生产共用同一配置，最终只交 top5。
+    assert diagnostics["top_k"] == 5
+    assert diagnostics["rewrite_n"] == settings["rewrite_n"]
+    assert diagnostics["recall_k"] == settings["recall_k"]
+    # 内部召回量随生产配置变化，但始终不低于是次最终交付量。
+    assert diagnostics["recall_k"] == max(
+        diagnostics["top_k"], tool_module.MIN_RECALL_K
+    )
+    assert len(result.data) == 5
+
+    preflight = runner._preflight_upper_bound(
+        BudgetGuard(1.0, 1.0, 1.0),
+        [],
+        _sample_rows()[1],
+        "test-model",
+    )
+    assert preflight["retrieval_config"] == settings
+    assert preflight["rerank_candidate_upper_bound"] == (
+        settings["rewrite_n"] + 1
+    ) * settings["recall_k"]
+
+
+def test_retrieval_source_item_keeps_identity_and_provenance():
+    item = {
+        "evidence_id": "K01.P01",
+        "id": "K01.P01",
+        "doc_id": "K01",
+        "title": "退货政策",
+        "content": "不应记录的正文",
+        "score": 0.42,
+        "source_kind": "policy",
+        "source_refs": ["policy.md"],
+        "policy_release": "v1",
+        "policy_commit": "abc",
+        "scope": "retail",
+        "category": "return",
+    }
+
+    recorded = runner._retrieval_source_item(item)
+
+    assert recorded["evidence_id"] == "K01.P01"
+    assert recorded["source_refs"] == ["policy.md"]
+    assert recorded["policy_commit"] == "abc"
+    assert "content" not in recorded
