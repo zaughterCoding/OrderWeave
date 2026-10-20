@@ -124,6 +124,8 @@ uv run --locked --offline python -m evaluation.run_retail_baseline --mode live -
 
 设置 `RETAIL_MODE=true` 后，HTTP API 与 CLI 切换到单 Agent 零售沙箱：支持订单查询、退货申请和知识咨询。默认客服模式不受影响；两种入口共用同一套零售逻辑。
 
+零售模式下，九个订单／用户／退货相关业务工具由主程序启动的本地 stdio MCP 子进程提供，主程序通过官方 `mcp` SDK（锁定 `1.12.4`）完成初始化、工具发现与 `tools/call`，不提供外部客户端或 HTTP MCP 入口。`search_knowledge_base` 仍在主程序内走原有 RAG 链路。子进程与主程序使用同一个 SQLite 绝对路径，不复制业务状态；工具调用失败不会自动改走进程内直调。
+
 固定运行资料位于 `evaluation/data/retail_sandbox/`：公开种子 `db.json`、`policy.md`、29 段 `knowledge.jsonl`、上游 MIT `LICENSE` 与 `sources.json`。启动时校验种子、政策与知识哈希、知识条数及 500 用户／1000 订单／50 商品；该目录不含官方隐藏任务、gold、用户模拟器或判定器。
 
 ```powershell
@@ -152,10 +154,39 @@ uv run --locked --offline python -m api.main --cli
 - `RETAIL_MEMORY_COLLECTION_SUFFIX`、`RETAIL_MEMORY_KEY_PREFIX`：记忆集合后缀与 Redis 键前缀，默认 `_retail`、`retail:`；并行运行时请显式区分。
 - `RETAIL_BUDGET_LEDGER`、`RETAIL_BUDGET_CNY`：跨进程累计账本路径与上限，默认 `data/retail/budget_ledger.db`、`5` 元。所有 Agent、改写、重排、摘要请求共用同一账本；预算不足或价格不可核实会停止付费调用，账本不会自动清零。
 - `RETAIL_EVENT_LOG`：业务事件 JSONL，默认 `data/retail/events.jsonl`。
+- `RETAIL_MCP_TIMEOUT_SECONDS`：MCP 初始化与单次工具调用的读取超时秒数，默认 `30`，必须为正数。
+- `RETAIL_MCP_STDERR_LOG`：工具子进程诊断日志路径，默认 `data/retail/mcp_stderr.log`；stdout 只用于协议消息。
 - `RETAIL_PROFILE_ENABLED`：用户画像开关，默认 `false`；启用会增加一次付费请求并计入账本。
 - `RETAIL_CASE_ID`、`RETAIL_RUN_ID`：可选的运行标识，写入事件与账本；`RETAIL_AGENT_MAX_TOKENS`（默认 2048）、`RETAIL_MAX_MESSAGE_CHARS`（默认 4000）、`RETAIL_MAX_CONTEXT_CHARS`（默认 12000）限制单轮输入输出。
 - 身份绑定：服务端通过邮箱或“姓名＋邮编”绑定沙箱用户；请求里的 `user_id`、`conv_id` 不是订单授权，只能查询和操作当前绑定用户的订单。
 - 退货：仅 `delivered` 订单可申请；去向只能是原支付方式或用户已有礼品卡。详情由程序保存并实际展示，只有当前用户对同一详情的明确确认才能写入；修改详情需重新展示并重新确认，多订单逐笔确认与提交。人工交接只记录模拟事件，不代表真实工单、邮件或资金到账。
+
+## τ-retail 固定子集评测
+
+该入口在项目内另建独立 Python 3.12 环境运行固定上游文字评测组件，不改变主环境或主 `uv.lock`。固定上游为 `sierra-research/tau2-bench` `v1.0.1`／提交 `fc0055dc4e0a316c3f83133267fbd6faaa770992`；任务顺序固定为 11、12、46、48、51、83、92、108，各 1 次，`concurrency=1`、`trials=1`、计划 `seed=300`（只记录在配置和协议日志，当前未传给模型 SDK，不承诺确定性复现）、`max_steps=200`、`max_errors=10`。被测业务始终走本文档所述的 `RetailService`／`RetailAgent`／`RetailStore`，不使用官方被测 Agent。
+
+```powershell
+# 一次性建立独立评测环境（项目内；不安装 voice/knowledge/gym/experiments extras）
+uv venv --python 3.12 .venv-tau
+uv pip install --python .venv-tau/Scripts/python.exe `
+  "tau2 @ git+https://github.com/sierra-research/tau2-bench@fc0055dc4e0a316c3f83133267fbd6faaa770992"
+
+# 必填：三个角色共用同一 DeepSeek Anthropic 兼容端点；密钥只从根 .env 读取
+$env:ANTHROPIC_API_KEY = "<key>"
+$env:ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+
+# 免费预检：核对任务、种子、环境、价格、配置与费用计划，不发送模型请求，不产生费用
+uv run --locked --offline python evaluation/run_tau_retail.py preflight --run-id <run-id>
+
+# 显式付费运行：8 案各 1 次，共用项目内持久化账本，累计上限 ¥5；不足即记 PARTIAL 并停止
+uv run --locked --offline python evaluation/run_tau_retail.py run --run-id <run-id>
+```
+
+固定资料与依赖记录位于 `evaluation/data/tau_retail/`（含原版任务、政策、公开种子、许可与 `requirements-freeze.txt`），运行说明见同目录 `ENVIRONMENT.md`。预检通过后把源码、资产、角色配置与顺序哈希写入 `data/evaluation/tau_retail/<run-id>/manifest.json`；正式运行前会复核，源码变化时拒绝继续。产物包含逐案原序对话、工具与确认事件、前后完整业务快照、官方 DB／NL 分量、Judge 原始输出、项目行为检查和共享账本。只有 Agent 与用户均正常停止、两个原评分分量有效时，该案才计入有效完成 `M/8`；`S/M` 中的 `S` 为原 reward 两分量乘积为 1 的案件数，只有 `M=8` 时报告 `S/8`。业务金额沿用原任务的 USD，模型费用账本使用 CNY。
+
+DB 分量使用每案实际完整 SQLite 业务快照，经官方 `RetailDB` 模型和官方 hash 比较得到；预测侧不执行官方原生 strict replay，只以实际快照作为状态来源，不能把该适配描述为原生轨迹回放。`summary.json` 中 `run_status` 只表示计划案例是否执行并保存行（`EXECUTION_COMPLETE`／`EXECUTION_PARTIAL`），`evaluation_status` 单独表示评测是否有效完整（`EVALUATION_COMPLETE`／`PARTIAL`／`EVALUATOR_INVALID`），`successful_effective_completed`／`failed_effective_completed` 在有效完成案例内区分任务成败。配置中的 `seed=300` 未实际传给模型 SDK，不能据此声称结果可确定复现。
+
+结果只代表“τ³-bench v1.0.1 retail 固定 8 任务／项目适配环境／DeepSeek 用户与评分配置”，不是全量排行榜、原生官方运行环境成绩、独立盲测或生产可用性证明；模型失败是有效实验结果，不通过反复重跑刷分。公开复现不依赖被忽略的 `docs/`。
 
 ## 测试
 
@@ -175,8 +206,15 @@ uv run --locked --offline pytest tests/integration/test_api.py -q
 # 零售沙箱单元测试：临时 SQLite 与 Fake 模型，不发真实请求
 uv run --locked --offline pytest tests/test_retail_agent.py tests/test_retail_store.py tests/test_retail_ledger.py tests/test_retail_live.py -q
 
+# 零售业务工具的直调／MCP 确定性对照与协议边界，使用真实本地子进程与临时 SQLite
+uv run --locked --offline pytest tests/test_retail_mcp.py -q
+
 # 零售沙箱 API／CLI 集成测试，需先启动 redis 与 chromadb，使用 Fake 模型
 uv run --locked --offline pytest tests/integration/test_retail_sandbox.py -q
+
+# τ-retail 运行器、桥接与评分适配测试：需先建 .venv-tau，不访问网络
+uv run --locked --offline pytest tests/test_run_tau_retail.py tests/test_tau_retail.py -q
+uv run --locked --offline pytest tests/test_tau_eval.py -q
 
 # 当前全部测试
 uv run --locked --offline pytest tests -q
@@ -219,6 +257,7 @@ uv run --locked --offline pytest tests -q
 - `mcp/tool_manager.py`：工具注册、查询改写、并行召回、去重、LLM 重排、TTL 缓存、熔断与降级。降级结果标记 `degraded=True` 且不计为成功命中。
 - `mcp/knowledge_base.py`：ChromaDB 文档切片、幂等导入与语义检索；返回文档 ID、标题、内容、相似度与片段序号。
 - `agents/retail_agent.py`、`agents/retail_runtime.py`、`agents/retail_tools.py`：单 Agent 零售沙箱的决策循环、运行时装配，以及订单查询、退货申请与知识工具。
+- `mcp/retail_server.py`、`mcp/retail_client.py`、`mcp/retail_protocol.py`：本地 stdio MCP 工具服务、受信任主程序客户端与请求上下文 `_meta` 校验；项目内 `mcp/` 仍是原工具与存储包，与官方 `mcp` SDK 同名共存。
 - `mcp/retail_store.py`：零售沙箱 SQLite 存储、身份绑定、退货确认状态机与事务写入。
 - `skills/retail_support/SKILL.md`：零售沙箱每轮生效的业务指引；不与其他模式的审计规则混用。
 - `memory/conversation_memory.py`：Redis 工作记忆、会话摘要、ChromaDB 情景记忆与用户画像；压缩与追加按会话加锁。
