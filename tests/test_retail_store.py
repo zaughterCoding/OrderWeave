@@ -785,3 +785,202 @@ def test_frozen_policy_and_knowledge_assets_are_complete_and_ordered():
     assert "7 天" not in joined or "未规定" in joined
     assert "one tool call at a time" in policy
     assert "explicit user confirmation" in policy
+
+
+def test_english_prepare_display_confirm_submit(tmp_path):
+    """英文业务链：待确认详情、明确确认、提交与真实业务快照。"""
+    store = RetailStore(tmp_path / "retail.db", SEED, language="en")
+    bind(store)
+    store.begin_turn("client-a", "conv-a")
+
+    prepared = prepare(
+        store,
+        CHEN_ORDER,
+        ["8551474201", "4545791457"],
+        CHEN_CREDIT,
+    )
+    text = prepared["display_text"]
+    assert "RETURN REQUEST DETAILS (PENDING CONFIRMATION)" in text
+    assert "Estimated refund amount: $1,124.98" in text
+    assert "Refund destination:" in text
+    assert "退货" not in text
+    assert prepared["note"].startswith("The details have not been shown")
+
+    display(store, prepared["op_id"], turn=1)
+    store.begin_turn("client-a", "conv-a")
+
+    rejected = submit(
+        store,
+        CHEN_ORDER,
+        ["8551474201", "4545791457"],
+        CHEN_CREDIT,
+        "No, cancel that.",
+    )
+    assert rejected["success"] is False
+    assert "explicit confirmation" in rejected["error"]
+    assert (
+        store.get_order_details("client-a", "conv-a", CHEN_ORDER)["order"][
+            "status"
+        ]
+        == "delivered"
+    )
+
+    approved = submit(
+        store,
+        CHEN_ORDER,
+        ["8551474201", "4545791457"],
+        CHEN_CREDIT,
+        "Yes, please submit this return.",
+    )
+    assert approved["success"] is True
+    assert approved["status"] == "return requested"
+    assert approved["return_items"] == ["4545791457", "8551474201"]
+    assert approved["estimated_amount"] == "$1,124.98"
+
+    order = store.get_order_details("client-a", "conv-a", CHEN_ORDER)["order"]
+    assert order["status"] == "return requested"
+    assert order["return_items"] == ["4545791457", "8551474201"]
+
+
+def test_english_acceptance_of_displayed_amount_can_complete_submission(tmp_path):
+    """明确提交指令加接受已展示金额，应走同一生产提交路径。"""
+    store = RetailStore(tmp_path / "retail.db", SEED, language="en")
+    bind(store)
+    store.begin_turn("client-a", "conv-a")
+    prepared = prepare(
+        store,
+        CHEN_ORDER,
+        ["8551474201", "4545791457"],
+        CHEN_CREDIT,
+    )
+    display(store, prepared["op_id"], turn=1)
+    store.begin_turn("client-a", "conv-a")
+
+    approved = submit(
+        store,
+        CHEN_ORDER,
+        ["8551474201", "4545791457"],
+        CHEN_CREDIT,
+        "Yes, please submit this return. The estimated refund of $1,124.98 "
+        "to my original credit card payment method works for me.",
+    )
+    assert approved["success"] is True
+    assert approved["status"] == "return requested"
+    order = store.get_order_details("client-a", "conv-a", CHEN_ORDER)["order"]
+    assert order["status"] == "return requested"
+    assert order["return_items"] == ["4545791457", "8551474201"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "The estimated refund of $1,124.98 to my credit card works for me.",
+        "Yes, please submit this return. The estimated refund of $1,000.00 works for me.",
+        "Yes, please submit this return if the estimated refund of $1,124.98 works for me.",
+        "Yes, please submit this return. The estimated refund of $1,124.98 to my bank account works for me.",
+        "Yes, please submit this return with an extra item. The estimated refund of $1,124.98 works for me.",
+        "My friend said yes. The estimated refund of $1,124.98 works for me.",
+        "Yes, please submit this return. The estimated refund of $1,124.98 does not work for me.",
+    ],
+)
+def test_english_amount_acceptance_keeps_confirmation_guards(tmp_path, message):
+    """仅有金额接受、金额不符、条件、改去向、改商品、引用他人或否定仍不得写入。"""
+    store = RetailStore(tmp_path / "retail.db", SEED, language="en")
+    bind(store)
+    store.begin_turn("client-a", "conv-a")
+    prepared = prepare(
+        store,
+        CHEN_ORDER,
+        ["8551474201", "4545791457"],
+        CHEN_CREDIT,
+    )
+    display(store, prepared["op_id"], turn=1)
+    store.begin_turn("client-a", "conv-a")
+
+    rejected = submit(
+        store,
+        CHEN_ORDER,
+        ["8551474201", "4545791457"],
+        CHEN_CREDIT,
+        message,
+    )
+    assert rejected["success"] is False
+    order = store.get_order_details("client-a", "conv-a", CHEN_ORDER)["order"]
+    assert order["status"] == "delivered"
+    assert store.active_pending("client-a", "conv-a")[0]["status"] == "displayed"
+
+
+def test_chinese_confirmation_rules_remain_strict(store):
+    """英文金额接受规则不改变中文否定规则和明确确认。"""
+    bind(store)
+    store.begin_turn("client-a", "conv-a")
+    prepared = prepare(store, CHEN_ORDER, ["4545791457"], CHEN_CREDIT)
+    display(store, prepared["op_id"], turn=1)
+    store.begin_turn("client-a", "conv-a")
+
+    rejected = submit(
+        store, CHEN_ORDER, ["4545791457"], CHEN_CREDIT, "确认，但是把数量改成两件"
+    )
+    assert rejected["success"] is False
+    approved = submit(
+        store, CHEN_ORDER, ["4545791457"], CHEN_CREDIT, "确认，就按这些申请退货"
+    )
+    assert approved["success"] is True
+
+
+def test_handoff_summary_uses_server_identity_state(store):
+    """交接摘要不得保留与已绑定身份矛盾的模型陈述。"""
+    bind(store)
+    before = store.business_snapshot()
+    result = store.record_handoff(
+        "client-a",
+        "conv-a",
+        "用户（尚未验证身份）没有订单号，希望人工查看订单。",
+        "用户明确要求人工",
+    )
+    assert result["success"] is True
+    assert store.business_snapshot() == before
+
+    event = store.list_events("client-a", "conv-a")[-1]
+    payload = event["payload"]
+    assert event["event_type"] == "handoff_requested"
+    assert payload["identity"] == {
+        "source": "server_session",
+        "bound": True,
+        "user_id": "chen_silva_7485",
+    }
+    assert "服务端会话已绑定用户 chen_silva_7485" in payload["summary"]
+    assert "尚未验证身份" not in payload["summary"]
+    assert "没有订单号" in payload["summary"]
+    assert "希望人工查看订单" in payload["summary"]
+    assert payload["reason"] == "用户明确要求人工"
+
+    reopened = RetailStore(store.db_path, SEED)
+    persisted = reopened.list_events("client-a", "conv-a")[-1]["payload"]
+    assert persisted["summary"] == payload["summary"]
+    assert persisted["identity"] == payload["identity"]
+
+
+def test_handoff_summary_reports_unbound_server_state(store):
+    """未绑定会话也不得沿用模型摘要中的已验证陈述。"""
+    store.record_handoff(
+        "client-unbound",
+        "conv-unbound",
+        "用户身份已验证。希望人工处理订单问题。",
+        "超出范围",
+    )
+    event = store.list_events("client-unbound", "conv-unbound")[-1]
+    payload = event["payload"]
+    assert payload["identity"] == {
+        "source": "server_session",
+        "bound": False,
+        "user_id": None,
+    }
+    assert "服务端会话尚未绑定用户" in payload["summary"]
+    assert "身份已验证" not in payload["summary"]
+    assert "希望人工处理订单问题" in payload["summary"]
+
+
+def test_english_rejects_invalid_language(tmp_path):
+    with pytest.raises(RetailStoreError):
+        RetailStore(tmp_path / "retail.db", SEED, language="fr")

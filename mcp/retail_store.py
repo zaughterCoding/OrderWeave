@@ -117,6 +117,66 @@ _ALL_SCOPE_WORDS = (
     "均",
 )
 
+# 英文确认按整句判断；否定、疑问、条件、改口和引用优先于肯定词。
+_EN_NEGATIVE_RE = re.compile(
+    r"\b(?:no|nope|nah|not|don't|dont|do not|doesn't|cancel|wait|hold|stop|"
+    r"later|never|refuse|decline|instead|rather)\b"
+)
+_EN_QUESTION_RE = re.compile(
+    r"\b(?:if|whether|unless|assuming|provided|can you|could you|would you|"
+    r"will you|are you|is it|does it|do you|why|how|what|when|where|which|"
+    r"who|should i|shall i|maybe|perhaps|not sure|unsure|question)\b|[?]"
+)
+_EN_CHANGE_RE = re.compile(
+    r"\b(?:change|changed|switch|swap|different|another|other|add|remove|"
+    r"extra|additional|more|less|also|too|as well|first|before|after|then|"
+    r"actually|but|however|though)\b"
+)
+_EN_QUOTE_RE = re.compile(
+    r'["“”]|\byou said\b|\byour message\b|\bit says\b|\bthe instruction\b|'
+    r"\bthe prompt\b|\b(?:he|she|they|someone|somebody|friend|colleague|"
+    r"partner|spouse|manager)\s+said\b|\baccording to\b|"
+    r"\b(?:i|we)\s+(?:was|were)\s+told\b"
+)
+_EN_POSITIVE_RE = re.compile(
+    r"\b(?:yes|yeah|yep|yup|sure|okay|ok|confirm|confirmed|approve|approved|"
+    r"proceed|submit|go ahead|go for it|sounds good|that works|please do|"
+    r"do it|correct|absolutely|definitely|handle|process)\b"
+)
+_EN_WEAK_CONFIRMATIONS = {
+    "yes",
+    "yeah",
+    "yep",
+    "yup",
+    "sure",
+    "ok",
+    "okay",
+    "correct",
+    "confirmed",
+    "soundsgood",
+    "thatworks",
+    "goahead",
+    "proceed",
+    "pleasedo",
+    "submit",
+}
+_EN_ALL_SCOPE_RE = re.compile(
+    r"\b(?:both|all|both orders|all of them|everything|the two orders|"
+    r"both returns)\b"
+)
+_EN_AMOUNT_RE = re.compile(r"(?<!\d)\$\s*([0-9][0-9,]*(?:\.[0-9]{1,2})?)")
+_EN_TERMS_ACCEPTANCE_RE = re.compile(
+    r"\b(?:works? for me|fine with me|fine by me|okay with me|ok with me|"
+    r"i accept|i agree|acceptable|good with me|no problem)\b"
+)
+_EN_AMOUNT_CONTEXT_RE = re.compile(
+    r"\b(?:refund|amount|estimate|estimated|total)\b"
+)
+_EN_DESTINATION_RE = re.compile(
+    r"\b(?:gift card|credit card|debit card|paypal|venmo|bank account|"
+    r"checking account|store credit|cash|cheque|check|card)\b"
+)
+
 
 class RetailStoreError(RuntimeError):
     """种子、会话或数据库状态不允许继续。"""
@@ -155,6 +215,13 @@ def _fmt_cents(cents: int) -> str:
     sign = "-" if cents < 0 else ""
     cents = abs(int(cents))
     return f"{sign}{cents // 100}.{cents % 100:02d}"
+
+
+def _fmt_usd(cents: int) -> str:
+    """订单业务金额始终为数据库原始美元，不做汇率换算。"""
+    sign = "-" if cents < 0 else ""
+    cents = abs(int(cents))
+    return f"{sign}${cents // 100:,}.{cents % 100:02d}"
 
 
 def normalize_order_id(raw: Any) -> str:
@@ -201,19 +268,235 @@ def _clean_clause(clause: str) -> bool:
 
 
 def _clauses(text: str) -> List[str]:
-    return [item.strip() for item in re.split(r"[\n,;.!?，。；！？]", text) if item.strip()]
+    # 句点和小数点、逗号和千分位都可能是金额的一部分，不能直接按字符切分。
+    parts = re.split(
+        r"\n|(?<!\d)[,;!?]|[,;!?](?!\d)|(?<!\d)\.(?!\d)|[，。；！？]",
+        text,
+    )
+    return [item.strip() for item in parts if item.strip()]
+
+
+_HANDOFF_IDENTITY_RE = re.compile(
+    r"(?i)(?:\bidentity\b|\bverified\b|\bverification\b|\bauthenticated\b|"
+    r"\bbound\b|身份|验证|认证|绑定)"
+)
+
+
+def _handoff_summary_with_identity(
+    summary: str,
+    retail_user_id: Optional[str],
+    language: str,
+) -> str:
+    """用服务端会话状态重建交接摘要中的身份说明。
+
+    模型摘要中的身份陈述一律丢弃，避免与真实绑定状态并存；句内仅含
+    身份内容的括注可单独移除，其余可核对内容保留。未知业务事实不由
+    本函数补造。
+    """
+    sentences: List[str] = []
+    for raw in re.split(r"(?<=[.!?。！？;；])\s*|\n+", str(summary or "")):
+        item = raw.strip()
+        if not item:
+            continue
+        if _HANDOFF_IDENTITY_RE.search(item):
+            # 只删除带身份陈述的括注；同句其他事实保留。剩余文本仍有
+            # 身份陈述时整句丢弃，避免矛盾信息残留。
+            item = re.sub(
+                r"[（(][^()（）]*(?:identity|verified|verification|"
+                r"authenticated|bound|身份|验证|认证|绑定)"
+                r"[^()（）]*[)）]",
+                "",
+                item,
+                flags=re.IGNORECASE,
+            )
+            item = re.sub(r"\s{2,}", " ", item).strip()
+            if not item or _HANDOFF_IDENTITY_RE.search(item):
+                continue
+        sentences.append(item)
+    if str(language).lower() == "en":
+        if retail_user_id:
+            identity = (
+                "Identity status: the server session is bound to user "
+                f"{retail_user_id}."
+            )
+        else:
+            identity = "Identity status: the server session has no bound user."
+    else:
+        if retail_user_id:
+            identity = f"身份状态：服务端会话已绑定用户 {retail_user_id}。"
+        else:
+            identity = "身份状态：服务端会话尚未绑定用户。"
+    return " ".join([identity, *sentences]).strip()[:1200]
+
+
+def _displayed_amount_acceptance(
+    clause: str, pending: Dict[str, Any]
+) -> bool:
+    """判断子句是否只是在接受已展示的预计金额。
+
+    仅放行带匹配金额、退款/金额语境和接受措辞的子句；金额不一致或提到
+    未展示的退款去向时仍拒绝。真正的提交指令仍须由其他肯定子句给出。
+    """
+    lowered = clause.lower()
+    if (
+        _EN_NEGATIVE_RE.search(lowered)
+        or _EN_QUESTION_RE.search(lowered)
+        or _EN_CHANGE_RE.search(lowered)
+        or _order_ids_in(clause)
+        or not _EN_TERMS_ACCEPTANCE_RE.search(lowered)
+        or not _EN_AMOUNT_CONTEXT_RE.search(lowered)
+    ):
+        return False
+    amounts = [
+        _to_cents(match.group(1).replace(",", ""))
+        for match in _EN_AMOUNT_RE.finditer(lowered)
+    ]
+    if not amounts or any(
+        amount != int(pending.get("amount_cents", -1)) for amount in amounts
+    ):
+        return False
+    display_text = str(pending.get("display_text") or "").lower()
+    for match in _EN_DESTINATION_RE.finditer(lowered):
+        if match.group(0) not in display_text:
+            return False
+    return True
+
+
+def _evaluate_confirmation_en(
+    message: str,
+    pending: Dict[str, Any],
+    displayed: List[Dict[str, Any]],
+) -> ConfirmationDecision:
+    """英文确认判断；否定、疑问、条件和改口优先否决。"""
+    text = _normalize_text(message)
+    if not text:
+        return ConfirmationDecision(False, "none", "The confirmation is empty")
+    if len(text) > 400:
+        return ConfirmationDecision(
+            False, "none", "The confirmation is too long to judge safely"
+        )
+    if _EN_QUOTE_RE.search(text.lower()):
+        return ConfirmationDecision(
+            False, "none", "Quoted or reported wording does not confirm"
+        )
+    if _EN_NEGATIVE_RE.search(text.lower()):
+        return ConfirmationDecision(
+            False, "none", "The message contains a negative or delaying expression"
+        )
+    if _EN_QUESTION_RE.search(text.lower()):
+        return ConfirmationDecision(
+            False, "none", "The message contains a question, condition, or change request"
+        )
+    if _EN_CHANGE_RE.search(text.lower()):
+        return ConfirmationDecision(
+            False, "none", "The message contains a change or additional request"
+        )
+
+    target = normalize_order_id(pending.get("order_id", ""))
+    mentioned = _order_ids_in(text)
+    clauses = _clauses(text)
+
+    fillers = {"please", "thanks", "thank you", "great", "perfect", "fine", "good"}
+
+    def _positive_clauses(related: List[str]) -> bool:
+        # 至少一个实质肯定子句，其余只能是“please/thanks”等礼貌填充。
+        if not related:
+            return False
+        saw_positive = False
+        for clause in related:
+            lowered = clause.lower()
+            if _EN_NEGATIVE_RE.search(lowered):
+                return False
+            if _EN_QUESTION_RE.search(lowered) or _EN_CHANGE_RE.search(lowered):
+                return False
+            if _displayed_amount_acceptance(clause, pending):
+                # 这是对已展示金额的接受，本身不等于提交指令；继续找肯定子句。
+                continue
+            compact = re.sub(r"[\s,.!;:。！？；：]", "", lowered)
+            scope_only = re.sub(
+                r"\b(?:both|all|the|two|orders?|returns?|of|them|everything|items?)\b",
+                "",
+                lowered,
+            )
+            scope_only = re.sub(r"[\s,.!;:。！？；：]", "", scope_only)
+            if _EN_POSITIVE_RE.search(lowered) or compact in _EN_WEAK_CONFIRMATIONS:
+                saw_positive = True
+                continue
+            if compact in fillers or not scope_only:
+                continue
+            return False
+        return saw_positive
+
+    if len(displayed) <= 1:
+        if mentioned and target not in mentioned:
+            return ConfirmationDecision(
+                False, "single", "The confirmation refers to another order"
+            )
+        if mentioned:
+            related = [
+                clause
+                for clause in clauses
+                if target.lower() in clause.lower()
+                or target.lstrip("#").lower() in clause.lower()
+            ]
+            if _positive_clauses(related):
+                return ConfirmationDecision(True, "single", "Explicit confirmation")
+            return ConfirmationDecision(
+                False, "single", "The clause naming the order is not a clear confirmation"
+            )
+        if _positive_clauses(clauses):
+            return ConfirmationDecision(
+                True, "single", "Clear affirmative after the details were shown"
+            )
+        return ConfirmationDecision(
+            False,
+            "single",
+            "No clear confirmation was found; show the details again and ask explicitly",
+        )
+
+    if mentioned:
+        if target not in mentioned:
+            return ConfirmationDecision(
+                False, "single", "The current message does not confirm this order"
+            )
+        related = [
+            clause
+            for clause in clauses
+            if target.lower() in clause.lower()
+            or target.lstrip("#").lower() in clause.lower()
+        ]
+        if _positive_clauses(related):
+            return ConfirmationDecision(
+                True, "single", "Confirmed this order among multiple pending details"
+            )
+        return ConfirmationDecision(
+            False, "single", "The clause for this order is not a clear confirmation"
+        )
+
+    if _EN_ALL_SCOPE_RE.search(text.lower()) and _positive_clauses(clauses):
+        return ConfirmationDecision(
+            True, "all", "Explicitly confirmed all displayed details"
+        )
+    return ConfirmationDecision(
+        False,
+        "none",
+        "Multiple pending details exist, but the message does not confirm a clear scope",
+    )
 
 
 def evaluate_confirmation(
     message: str,
     pending: Dict[str, Any],
     displayed: List[Dict[str, Any]],
+    language: str = "zh",
 ) -> ConfirmationDecision:
     """判断当前用户消息是否明确批准指定待确认详情。
 
     单笔详情接受明确的“确认/提交/同意/就按这些”或整句简短肯定；
     多笔详情必须点名订单或明确覆盖全部，否定和改口不会被当成同意。
     """
+    if str(language).lower() == "en":
+        return _evaluate_confirmation_en(message, pending, displayed)
     text = _normalize_text(message)
     if not text:
         return ConfirmationDecision(False, "none", "确认语句为空")
@@ -281,27 +564,43 @@ def evaluate_confirmation(
     )
 
 
-def _payment_label(payment: Optional[Dict[str, Any]], payment_id: str) -> str:
+def _payment_label(
+    payment: Optional[Dict[str, Any]],
+    payment_id: str,
+    language: str = "zh",
+) -> str:
     payment = payment or {}
     source = str(payment.get("source") or "").strip()
+    english = str(language).lower() == "en"
     if source == "credit_card":
-        brand = str(payment.get("brand") or "信用卡")
+        brand = str(payment.get("brand") or ("credit card" if english else "信用卡"))
         last_four = str(payment.get("last_four") or "")
+        if english:
+            suffix = f" ending in {last_four}" if last_four else ""
+            return f"credit card {brand}{suffix} ({payment_id})"
         suffix = f" 尾号 {last_four}" if last_four else ""
         return f"信用卡 {brand}{suffix}（{payment_id}）"
     if source == "paypal":
-        return f"PayPal（{payment_id}）"
+        return f"PayPal ({payment_id})" if english else f"PayPal（{payment_id}）"
     if source == "gift_card":
         balance = payment.get("balance")
+        if english:
+            suffix = (
+                f", balance ${float(balance):,.2f}" if balance is not None else ""
+            )
+            return f"gift card ({payment_id}{suffix})"
         suffix = f"，余额 ¥{balance}" if balance is not None else ""
         return f"礼品卡（{payment_id}{suffix}）"
-    return f"{source or '支付方式'}（{payment_id}）"
+    label = source or ("payment method" if english else "支付方式")
+    return f"{label} ({payment_id})" if english else f"{label}（{payment_id}）"
 
 
-def _options_text(options: Any) -> str:
+def _options_text(options: Any, language: str = "zh") -> str:
+    english = str(language).lower() == "en"
     if not isinstance(options, dict) or not options:
-        return "无额外选项"
-    return "，".join(f"{key}: {value}" for key, value in options.items())
+        return "no additional options" if english else "无额外选项"
+    separator = ", " if english else "，"
+    return separator.join(f"{key}: {value}" for key, value in options.items())
 
 
 class RetailStore:
@@ -312,12 +611,20 @@ class RetailStore:
         db_path: str | Path,
         seed_path: str | Path,
         expected_seed_sha256: str = EXPECTED_SEED_SHA256,
+        language: str = "zh",
     ):
         self.db_path = Path(db_path).expanduser().resolve()
         self.seed_path = Path(seed_path).expanduser().resolve()
         self.expected_seed_sha256 = expected_seed_sha256
+        self.language = str(language or "zh").lower()
+        if self.language not in {"zh", "en"}:
+            raise RetailStoreError(f"不支持的语言: {language}")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+
+    def _t(self, zh: str, en: str) -> str:
+        """按当前业务语言选择提示语；默认中文。"""
+        return en if self.language == "en" else zh
 
     # ── 连接与初始化 ─────────────────────────────────────────────────────
 
@@ -684,7 +991,11 @@ class RetailStore:
         ).fetchone()
         if row is None or not row["retail_user_id"]:
             raise RetailStoreError(
-                "尚未完成身份核对；请先按邮箱或姓名加邮编查找当前用户。"
+                self._t(
+                    "尚未完成身份核对；请先按邮箱或姓名加邮编查找当前用户。",
+                    "Identity has not been verified; look up the current user "
+                    "by email or by full name and zip code first.",
+                )
             )
         return str(row["retail_user_id"])
 
@@ -701,7 +1012,11 @@ class RetailStore:
             if bound and bound != retail_user_id:
                 return {
                     "success": False,
-                    "error": "本会话已绑定其他用户，不能切换；请新开会话。",
+                    "error": self._t(
+                        "本会话已绑定其他用户，不能切换；请新开会话。",
+                        "This session is already bound to another user; "
+                        "start a new session to switch users.",
+                    ),
                 }
             if not bound:
                 connection.execute(
@@ -722,7 +1037,9 @@ class RetailStore:
                 (retail_user_id,),
             ).fetchone()
             if user is None:
-                raise RetailStoreError("绑定的用户不存在")
+                raise RetailStoreError(
+                    self._t("绑定的用户不存在", "The bound user does not exist")
+                )
             record = json.loads(user["payload"])
             name = record.get("name") or {}
             return {
@@ -741,7 +1058,10 @@ class RetailStore:
     ) -> Dict[str, Any]:
         email_lower = str(email or "").strip().lower()
         if not email_lower:
-            return {"success": False, "error": "邮箱不能为空"}
+            return {
+                "success": False,
+                "error": self._t("邮箱不能为空", "Email cannot be empty"),
+            }
         with closing(self._connect()) as connection:
             rows = connection.execute(
                 "SELECT user_id FROM users WHERE email_lower=?",
@@ -750,12 +1070,19 @@ class RetailStore:
         if not rows:
             return {
                 "success": False,
-                "error": "未找到与该邮箱匹配的沙箱用户；请核对后重试。",
+                "error": self._t(
+                    "未找到与该邮箱匹配的沙箱用户；请核对后重试。",
+                    "No sandbox user matches that email; check it and try again.",
+                ),
             }
         if len(rows) > 1:
             return {
                 "success": False,
-                "error": "该邮箱匹配到多个沙箱用户，无法安全绑定；请改用姓名和邮编。",
+                "error": self._t(
+                    "该邮箱匹配到多个沙箱用户，无法安全绑定；请改用姓名和邮编。",
+                    "That email matches multiple sandbox users; use the full "
+                    "name and zip code instead.",
+                ),
             }
         return self._bind(
             client_user_id, conv_id, str(rows[0]["user_id"]), "email"
@@ -775,7 +1102,11 @@ class RetailStore:
         if not first or not last or not zip_value:
             return {
                 "success": False,
-                "error": "姓名或邮编不完整；请提供名、姓和邮编。",
+                "error": self._t(
+                    "姓名或邮编不完整；请提供名、姓和邮编。",
+                    "The name or zip code is incomplete; provide the first "
+                    "name, last name, and zip code.",
+                ),
             }
         with closing(self._connect()) as connection:
             rows = connection.execute(
@@ -786,12 +1117,20 @@ class RetailStore:
         if not rows:
             return {
                 "success": False,
-                "error": "未找到匹配的沙箱用户；请核对姓名和邮编后重试。",
+                "error": self._t(
+                    "未找到匹配的沙箱用户；请核对姓名和邮编后重试。",
+                    "No sandbox user matches that name and zip code; check "
+                    "them and try again.",
+                ),
             }
         if len(rows) > 1:
             return {
                 "success": False,
-                "error": "该姓名和邮编匹配到多个用户，无法安全绑定；请改用邮箱。",
+                "error": self._t(
+                    "该姓名和邮编匹配到多个用户，无法安全绑定；请改用邮箱。",
+                    "That name and zip code match multiple users; use the "
+                    "email instead.",
+                ),
             }
         return self._bind(
             client_user_id, conv_id, str(rows[0]["user_id"]), "name_zip"
@@ -809,7 +1148,9 @@ class RetailStore:
             (user_id,),
         ).fetchone()
         if row is None:
-            raise RetailStoreError("用户记录不存在")
+            raise RetailStoreError(
+                self._t("用户记录不存在", "The user record does not exist")
+            )
         return json.loads(row["payload"])
 
     def get_user_details(
@@ -850,7 +1191,11 @@ class RetailStore:
                 if row is None:
                     return {
                         "success": False,
-                        "error": "未找到属于当前用户的该订单；请核对订单号。",
+                        "error": self._t(
+                            "未找到属于当前用户的该订单；请核对订单号。",
+                            "No order with that number belongs to the current "
+                            "user; check the order number.",
+                        ),
                     }
                 order = json.loads(row["payload"])
                 user = self._user_record(connection, user_id)
@@ -871,7 +1216,9 @@ class RetailStore:
             "order": order,
             "order_version": int(row["version"]),
             "original_payment_method_id": original_id,
-            "original_payment_description": _payment_label(original, original_id)
+            "original_payment_description": _payment_label(
+                original, original_id, self.language
+            )
             if original_id
             else "",
         }
@@ -885,14 +1232,20 @@ class RetailStore:
         """商品目录是公开资料；用户和订单仍按绑定身份限制。"""
         product_key = str(product_id or "").strip()
         if not product_key:
-            return {"success": False, "error": "product_id 不能为空"}
+            return {
+                "success": False,
+                "error": self._t("product_id 不能为空", "product_id cannot be empty"),
+            }
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT payload FROM products WHERE product_id=?",
                 (product_key,),
             ).fetchone()
         if row is None:
-            return {"success": False, "error": "商品记录不存在"}
+            return {
+                "success": False,
+                "error": self._t("商品记录不存在", "The product record does not exist"),
+            }
         return {"success": True, "product": json.loads(row["payload"])}
 
     # ── 退货准备与确认 ───────────────────────────────────────────────────
@@ -983,15 +1336,32 @@ class RetailStore:
         item_ids: Any,
     ) -> Tuple[List[str], List[Dict[str, Any]], int]:
         if not isinstance(item_ids, list):
-            raise RetailStoreError("item_ids 必须是数组")
+            raise RetailStoreError(
+                self._t("item_ids 必须是数组", "item_ids must be an array")
+            )
         if not item_ids:
-            raise RetailStoreError("item_ids 不能为空；空列表不能提交退货")
+            raise RetailStoreError(
+                self._t(
+                    "item_ids 不能为空；空列表不能提交退货",
+                    "item_ids cannot be empty; an empty list cannot be returned",
+                )
+            )
         if len(item_ids) > 20:
-            raise RetailStoreError("一次最多提交 20 件退货商品")
+            raise RetailStoreError(
+                self._t(
+                    "一次最多提交 20 件退货商品",
+                    "At most 20 return items can be submitted at once",
+                )
+            )
         requested: List[str] = []
         for item_id in item_ids:
             if not isinstance(item_id, str) or not item_id.strip():
-                raise RetailStoreError("item_ids 中的每一项都必须是非空字符串")
+                raise RetailStoreError(
+                    self._t(
+                        "item_ids 中的每一项都必须是非空字符串",
+                        "Each entry in item_ids must be a non-empty string",
+                    )
+                )
             requested.append(item_id.strip())
 
         available = Counter(
@@ -1001,11 +1371,19 @@ class RetailStore:
         for item_id, count in wanted.items():
             if available.get(item_id, 0) == 0:
                 raise RetailStoreError(
-                    f"商品 {item_id} 不属于该订单；请使用订单中的具体 item_id。"
+                    self._t(
+                        f"商品 {item_id} 不属于该订单；请使用订单中的具体 item_id。",
+                        f"Item {item_id} is not in this order; use the exact "
+                        "item_id from the order.",
+                    )
                 )
             if count > available[item_id]:
                 raise RetailStoreError(
-                    f"商品 {item_id} 申请 {count} 件，超过订单中的 {available[item_id]} 件。"
+                    self._t(
+                        f"商品 {item_id} 申请 {count} 件，超过订单中的 {available[item_id]} 件。",
+                        f"Requested {count} of item {item_id}, but the order "
+                        f"contains {available[item_id]}.",
+                    )
                 )
 
         order_items = order.get("items") or []
@@ -1030,7 +1408,12 @@ class RetailStore:
                 }
             )
         if total_cents <= 0:
-            raise RetailStoreError("退货金额必须大于 0")
+            raise RetailStoreError(
+                self._t(
+                    "退货金额必须大于 0",
+                    "The return amount must be greater than 0",
+                )
+            )
         return requested, lines, total_cents
 
     @staticmethod
@@ -1049,7 +1432,9 @@ class RetailStore:
     ) -> Tuple[str, Dict[str, Any], bool]:
         payment_id = str(payment_method_id or "").strip()
         if not payment_id:
-            raise RetailStoreError("payment_method_id 不能为空")
+            raise RetailStoreError(
+                self._t("payment_method_id 不能为空", "payment_method_id cannot be empty")
+            )
         payments = user.get("payment_methods") or {}
         payment = payments.get(payment_id)
         original_id = self._original_payment_id(order)
@@ -1058,12 +1443,22 @@ class RetailStore:
             return payment_id, payment or {}, True
         if payment is None:
             raise RetailStoreError(
-                "退款去向不属于当前用户的支付资料；只能使用原支付方式或本人已有礼品卡。"
+                self._t(
+                    "退款去向不属于当前用户的支付资料；只能使用原支付方式或本人已有礼品卡。",
+                    "The refund destination is not among the current user's "
+                    "payment methods; use the original payment method or one "
+                    "of the user's gift cards.",
+                )
             )
         if str(payment.get("source")) != "gift_card":
             raise RetailStoreError(
-                "退款去向必须是原支付方式或当前用户已有的礼品卡；"
-                "不能改到其他信用卡、PayPal 或他人支付方式。"
+                self._t(
+                    "退款去向必须是原支付方式或当前用户已有的礼品卡；"
+                    "不能改到其他信用卡、PayPal 或他人支付方式。",
+                    "The refund destination must be the original payment "
+                    "method or one of the user's gift cards; it cannot be "
+                    "another credit card, PayPal, or someone else's method.",
+                )
             )
         return payment_id, payment, False
 
@@ -1084,7 +1479,11 @@ class RetailStore:
                 if row is None:
                     return {
                         "success": False,
-                        "error": "未找到属于当前用户的该订单；请核对订单号。",
+                        "error": self._t(
+                            "未找到属于当前用户的该订单；请核对订单号。",
+                            "No order with that number belongs to the current "
+                            "user; check the order number.",
+                        ),
                     }
                 order = json.loads(row["payload"])
                 user = self._user_record(connection, user_id)
@@ -1092,9 +1491,11 @@ class RetailStore:
                 if status != "delivered":
                     return {
                         "success": False,
-                        "error": (
+                        "error": self._t(
                             f"订单 {normalized} 当前状态为 {status}；"
-                            "只有 delivered（已送达）订单可以提交退货申请。"
+                            "只有 delivered（已送达）订单可以提交退货申请。",
+                            f"Order {normalized} is currently {status}; only "
+                            "delivered orders can be returned.",
                         ),
                     }
                 requested, lines, total_cents = self._validate_item_request(
@@ -1108,26 +1509,52 @@ class RetailStore:
             return {"success": False, "error": str(ex)}
 
         op_id = f"RT-{uuid.uuid4().hex[:12]}"
-        payment_description = _payment_label(payment, payment_id)
-        payment_note = "原支付方式" if is_original else "本人已有礼品卡"
-        display_lines = "\n".join(
-            f"- {line['name']}（item_id: {line['item_id']}，{_options_text(line['options'])}）"
-            f" × {line['quantity']}，单价 ¥{line['unit_price']}，"
-            f"小计 ¥{line['line_amount']}"
-            for line in lines
-        )
-        display_text = (
-            "【退货申请详情（待确认）】\n"
-            f"操作编号：{op_id}\n"
-            f"订单号：{normalized}\n"
-            f"订单状态：delivered（已送达）\n"
-            f"退货商品：\n{display_lines}\n"
-            f"退货件数：{len(requested)} 件\n"
-            f"预计申请金额：¥{_fmt_cents(total_cents)}（按订单成交价计算，不代表已到账）\n"
-            f"退款去向：{payment_description}（{payment_note}）\n"
-            "请回复“确认，就按这些申请退货”以提交。提交后订单状态将变为 "
-            "return requested（已申请退货），不代表退款已到账、邮件已发送或仓库已收货。"
-        )
+        payment_description = _payment_label(payment, payment_id, self.language)
+        if self.language == "en":
+            payment_note = "original payment method" if is_original else "existing gift card"
+            display_lines = "\n".join(
+                f"- {line['name']} (item_id: {line['item_id']}, "
+                f"{_options_text(line['options'], 'en')}) x {line['quantity']}, "
+                f"unit price {_fmt_usd(_to_cents(line['unit_price']))}, "
+                f"line total {_fmt_usd(_to_cents(line['line_amount']))}"
+                for line in lines
+            )
+            display_text = (
+                "RETURN REQUEST DETAILS (PENDING CONFIRMATION)\n"
+                f"Operation ID: {op_id}\n"
+                f"Order: {normalized}\n"
+                "Order status: delivered\n"
+                f"Items to return:\n{display_lines}\n"
+                f"Number of items: {len(requested)}\n"
+                f"Estimated refund amount: {_fmt_usd(total_cents)} "
+                "(based on the order price; this is not a completed refund)\n"
+                f"Refund destination: {payment_description} ({payment_note})\n"
+                "Reply with an explicit confirmation, such as \"Yes, please "
+                "submit this return\", to proceed. After submission the order "
+                "status becomes return requested. This does not mean the refund "
+                "has been issued, an email has been sent, or the warehouse has "
+                "received the items."
+            )
+        else:
+            payment_note = "原支付方式" if is_original else "本人已有礼品卡"
+            display_lines = "\n".join(
+                f"- {line['name']}（item_id: {line['item_id']}，{_options_text(line['options'])}）"
+                f" × {line['quantity']}，单价 ¥{line['unit_price']}，"
+                f"小计 ¥{line['line_amount']}"
+                for line in lines
+            )
+            display_text = (
+                "【退货申请详情（待确认）】\n"
+                f"操作编号：{op_id}\n"
+                f"订单号：{normalized}\n"
+                f"订单状态：delivered（已送达）\n"
+                f"退货商品：\n{display_lines}\n"
+                f"退货件数：{len(requested)} 件\n"
+                f"预计申请金额：¥{_fmt_cents(total_cents)}（按订单成交价计算，不代表已到账）\n"
+                f"退款去向：{payment_description}（{payment_note}）\n"
+                "请回复“确认，就按这些申请退货”以提交。提交后订单状态将变为 "
+                "return requested（已申请退货），不代表退款已到账、邮件已发送或仓库已收货。"
+            )
         items_payload = {"item_ids": requested, "lines": lines}
         now = _now()
         with self._tx() as connection:
@@ -1191,11 +1618,20 @@ class RetailStore:
             "item_ids": requested,
             "payment_method_id": payment_id,
             "payment_description": payment_description,
-            "estimated_amount": _fmt_cents(total_cents),
+            "estimated_amount": (
+                _fmt_usd(total_cents)
+                if self.language == "en"
+                else _fmt_cents(total_cents)
+            ),
             "amount_cents": total_cents,
             "display_text": display_text,
             "status": "prepared",
-            "note": "详情尚未展示；必须把 display_text 原样展示给当前用户，并等待下一轮明确确认。",
+            "note": self._t(
+                "详情尚未展示；必须把 display_text 原样展示给当前用户，并等待下一轮明确确认。",
+                "The details have not been shown yet; show display_text exactly "
+                "to the current user and wait for an explicit confirmation in "
+                "the next turn.",
+            ),
         }
 
     def mark_pending_displayed(
@@ -1271,11 +1707,20 @@ class RetailStore:
             if prepared_rows:
                 return {
                     "success": False,
-                    "error": "退货详情尚未展示给用户，不能提交；请先展示并等待下一轮明确确认。",
+                    "error": self._t(
+                        "退货详情尚未展示给用户，不能提交；请先展示并等待下一轮明确确认。",
+                        "The return details have not been shown to the user; "
+                        "show them first and wait for an explicit confirmation "
+                        "in the next turn.",
+                    ),
                 }
             return {
                 "success": False,
-                "error": "没有已展示的待确认详情；请先准备并展示退货详情。",
+                "error": self._t(
+                    "没有已展示的待确认详情；请先准备并展示退货详情。",
+                    "There are no displayed pending details; prepare and show "
+                    "the return details first.",
+                ),
             }
 
         displayed = [
@@ -1300,20 +1745,34 @@ class RetailStore:
         if match is None:
             return {
                 "success": False,
-                "error": "提交参数与已展示的详情不一致；请重新准备、展示并确认新详情。",
+                "error": self._t(
+                    "提交参数与已展示的详情不一致；请重新准备、展示并确认新详情。",
+                    "The submission does not match the displayed details; "
+                    "prepare, show, and confirm the new details again.",
+                ),
             }
         if int(match["prepared_turn"]) == turn:
             return {
                 "success": False,
-                "error": "准备详情的同一轮不能提交；请先向用户展示并等待明确确认。",
+                "error": self._t(
+                    "准备详情的同一轮不能提交；请先向用户展示并等待明确确认。",
+                    "Details cannot be submitted in the same turn they are "
+                    "prepared; show them and wait for an explicit confirmation.",
+                ),
             }
         if match["displayed_turn"] is None or int(match["displayed_turn"]) >= turn:
             return {
                 "success": False,
-                "error": "确认必须发生在详情实际展示之后；请重新展示全部详情后再确认。",
+                "error": self._t(
+                    "确认必须发生在详情实际展示之后；请重新展示全部详情后再确认。",
+                    "Confirmation must come after the details were actually "
+                    "shown; show all details again before confirming.",
+                ),
             }
 
-        decision = evaluate_confirmation(user_message, match, displayed)
+        decision = evaluate_confirmation(
+            user_message, match, displayed, language=self.language
+        )
         if not decision.approved:
             self._record_rejection(
                 client_user_id,
@@ -1326,7 +1785,11 @@ class RetailStore:
             )
             return {
                 "success": False,
-                "error": f"未获得当前用户的明确确认：{decision.reason}",
+                "error": self._t(
+                    f"未获得当前用户的明确确认：{decision.reason}",
+                    "The current user has not given explicit confirmation: "
+                    f"{decision.reason}",
+                ),
                 "confirmation_scope": decision.scope,
             }
 
@@ -1342,35 +1805,73 @@ class RetailStore:
                     or pending_row["client_user_id"] != client_user_id
                     or pending_row["conv_id"] != conv_id
                 ):
-                    raise RetailStoreError("该确认已使用或待确认状态已变化")
+                    raise RetailStoreError(
+                        self._t(
+                            "该确认已使用或待确认状态已变化",
+                            "This confirmation was already used or its pending "
+                            "state has changed",
+                        )
+                    )
                 user_id = self._require_binding(connection, client_user_id, conv_id)
                 if str(pending_row["retail_user_id"]) != user_id:
-                    raise RetailStoreError("会话绑定用户与待确认记录不一致")
+                    raise RetailStoreError(
+                        self._t(
+                            "会话绑定用户与待确认记录不一致",
+                            "The session-bound user does not match the pending "
+                            "confirmation record",
+                        )
+                    )
 
                 order_row = self._order_row(connection, normalized, user_id)
                 if order_row is None:
-                    raise RetailStoreError("订单不属于当前用户或已不存在")
+                    raise RetailStoreError(
+                        self._t(
+                            "订单不属于当前用户或已不存在",
+                            "The order does not belong to the current user or "
+                            "no longer exists",
+                        )
+                    )
                 order_version = int(order_row["version"])
                 if order_version != int(pending_row["order_version"]):
                     raise RetailStoreError(
-                        "订单在展示后已发生变化；请重新查询、展示并确认。"
+                        self._t(
+                            "订单在展示后已发生变化；请重新查询、展示并确认。",
+                            "The order changed after the details were shown; "
+                            "look it up, show the details, and confirm again.",
+                        )
                     )
                 order = json.loads(order_row["payload"])
                 if str(order.get("status")) != "delivered":
                     raise RetailStoreError(
-                        f"订单当前状态为 {order.get('status')}；只有 delivered 可提交退货。"
+                        self._t(
+                            f"订单当前状态为 {order.get('status')}；只有 delivered 可提交退货。",
+                            f"The order is currently {order.get('status')}; only "
+                            "delivered orders can be returned.",
+                        )
                     )
                 requested, _, total_cents = self._validate_item_request(
                     order, json.loads(pending_row["items_json"]).get("item_ids")
                 )
                 if total_cents != int(pending_row["amount_cents"]):
-                    raise RetailStoreError("订单金额已变化；请重新展示并确认。")
+                    raise RetailStoreError(
+                        self._t(
+                            "订单金额已变化；请重新展示并确认。",
+                            "The order amount changed; show the details and "
+                            "confirm again.",
+                        )
+                    )
                 user = self._user_record(connection, user_id)
                 resolved_id, _, _ = self._resolve_payment(
                     user, order, pending_row["payment_method_id"]
                 )
                 if resolved_id != pending_row["payment_method_id"]:
-                    raise RetailStoreError("退款去向已变化；请重新展示并确认。")
+                    raise RetailStoreError(
+                        self._t(
+                            "退款去向已变化；请重新展示并确认。",
+                            "The refund destination changed; show the details "
+                            "and confirm again.",
+                        )
+                    )
 
                 consumed = connection.execute(
                     "UPDATE pending_returns SET status='consumed', consumed_at=?,"
@@ -1382,7 +1883,8 @@ class RetailStore:
 
                 updated_order = copy.deepcopy(order)
                 updated_order["status"] = "return requested"
-                updated_order["return_items"] = list(requested)
+                # 与官方工具一致，订单中的 return_items 按 item_id 排序保存。
+                updated_order["return_items"] = sorted(requested)
                 updated_order["return_payment_method_id"] = resolved_id
                 result = connection.execute(
                     "UPDATE orders SET status=?, version=version+1, payload=?"
@@ -1395,7 +1897,12 @@ class RetailStore:
                     ),
                 )
                 if result.rowcount != 1:
-                    raise RetailStoreError("订单状态已变化，退货写入未生效")
+                    raise RetailStoreError(
+                        self._t(
+                            "订单状态已变化，退货写入未生效",
+                            "The order status changed; the return was not written",
+                        )
+                    )
                 connection.execute(
                     "INSERT INTO return_operations"
                     "(op_id, client_user_id, conv_id, retail_user_id, order_id,"
@@ -1449,19 +1956,33 @@ class RetailStore:
                 f"unexpected: {ex}",
                 {"item_ids": wanted_ids, "payment_method_id": payment_id},
             )
-            return {"success": False, "error": f"退货写入失败: {ex}"}
+            return {
+                "success": False,
+                "error": self._t(
+                    f"退货写入失败: {ex}",
+                    f"The return could not be written: {ex}",
+                ),
+            }
 
         return {
             "success": True,
             "op_id": match["op_id"],
             "order_id": normalized,
             "status": "return requested",
-            "return_items": requested,
+            "return_items": sorted(requested),
             "return_payment_method_id": resolved_id,
-            "estimated_amount": _fmt_cents(int(match["amount_cents"])),
-            "note": (
+            "estimated_amount": (
+                _fmt_usd(int(match["amount_cents"]))
+                if self.language == "en"
+                else _fmt_cents(int(match["amount_cents"]))
+            ),
+            "note": self._t(
                 "已提交退货申请，订单状态为 return requested。"
-                "这不表示退款已到账、仓库已收货、邮件已发送或已创建真实工单。"
+                "这不表示退款已到账、仓库已收货、邮件已发送或已创建真实工单。",
+                "The return request was submitted and the order status is "
+                "return requested. This does not mean the refund has been "
+                "issued, the warehouse received the items, an email was sent, "
+                "or a real support ticket was created.",
             ),
         }
 
@@ -1469,15 +1990,29 @@ class RetailStore:
     def _validate_item_request_shape(item_ids: Any) -> Tuple[List[str], int, int]:
         """提交前的参数形状检查；完整归属与数量在事务内复查。"""
         if not isinstance(item_ids, list):
-            raise RetailStoreError("item_ids 必须是数组")
+            raise RetailStoreError(
+                self._t("item_ids 必须是数组", "item_ids must be an array")
+            )
         if not item_ids:
-            raise RetailStoreError("item_ids 不能为空")
+            raise RetailStoreError(
+                self._t("item_ids 不能为空", "item_ids cannot be empty")
+            )
         if len(item_ids) > 20:
-            raise RetailStoreError("一次最多提交 20 件退货商品")
+            raise RetailStoreError(
+                self._t(
+                    "一次最多提交 20 件退货商品",
+                    "At most 20 return items can be submitted at once",
+                )
+            )
         result: List[str] = []
         for item_id in item_ids:
             if not isinstance(item_id, str) or not item_id.strip():
-                raise RetailStoreError("item_ids 中的每一项都必须是非空字符串")
+                raise RetailStoreError(
+                    self._t(
+                        "item_ids 中的每一项都必须是非空字符串",
+                        "Each entry in item_ids must be a non-empty string",
+                    )
+                )
             result.append(item_id.strip())
         return result, len(result), len(set(result))
 
@@ -1513,21 +2048,40 @@ class RetailStore:
         handoff_id = f"HO-{uuid.uuid4().hex[:12]}"
         with self._tx() as connection:
             session = self._ensure_session(connection, client_user_id, conv_id)
-            retail_user_id = session["retail_user_id"]
+            retail_user_id = (
+                str(session["retail_user_id"])
+                if session["retail_user_id"]
+                else None
+            )
+            corrected_summary = _handoff_summary_with_identity(
+                summary, retail_user_id, self.language
+            )
             self._event(
                 connection,
                 client_user_id,
                 conv_id,
-                str(retail_user_id) if retail_user_id else None,
+                retail_user_id,
                 "handoff_requested",
-                {"summary": str(summary)[:1200], "reason": str(reason)[:300]},
+                {
+                    "summary": corrected_summary,
+                    "reason": str(reason)[:300],
+                    "identity": {
+                        "source": "server_session",
+                        "bound": bool(retail_user_id),
+                        "user_id": retail_user_id,
+                    },
+                },
                 op_id=handoff_id,
             )
         return {
             "success": True,
             "handoff_id": handoff_id,
             "status": "recorded_mock",
-            "note": "已记录模拟交接事件；未连接真实坐席，也未创建真实工单。",
+            "note": self._t(
+                "已记录模拟交接事件；未连接真实坐席，也未创建真实工单。",
+                "A simulated handoff event was recorded; no live agent was "
+                "connected and no real support ticket was created.",
+            ),
         }
 
     # ── 供验收使用的快照与统计 ───────────────────────────────────────────
@@ -1576,17 +2130,31 @@ class RetailStore:
         }
 
 
-def safe_calculate(expression: str) -> Dict[str, Any]:
+def safe_calculate(expression: str, language: str = "zh") -> Dict[str, Any]:
     """只计算金额所需的四则运算，不执行名称、属性或函数调用。"""
+    english = str(language).lower() == "en"
     text = str(expression or "").strip()
     if not text:
-        return {"success": False, "error": "expression 不能为空"}
+        return {
+            "success": False,
+            "error": "expression cannot be empty" if english else "expression 不能为空",
+        }
     if len(text) > 200:
-        return {"success": False, "error": "expression 过长"}
+        return {
+            "success": False,
+            "error": "expression is too long" if english else "expression 过长",
+        }
     try:
         tree = ast.parse(text, mode="eval")
     except SyntaxError as ex:
-        return {"success": False, "error": f"表达式无法解析: {ex.msg}"}
+        return {
+            "success": False,
+            "error": (
+                f"Could not parse the expression: {ex.msg}"
+                if english
+                else f"表达式无法解析: {ex.msg}"
+            ),
+        }
 
     def evaluate(node: ast.AST) -> Decimal:
         if isinstance(node, ast.Expression):
@@ -1609,12 +2177,22 @@ def safe_calculate(expression: str) -> Dict[str, Any]:
                 result = left * right
             else:
                 if right == 0:
-                    raise ValueError("不能除以 0")
+                    raise ValueError(
+                        "Cannot divide by 0" if english else "不能除以 0"
+                    )
                 result = left / right
             if abs(result) > Decimal("1000000000000"):
-                raise ValueError("结果超出允许范围")
+                raise ValueError(
+                    "The result is outside the allowed range"
+                    if english
+                    else "结果超出允许范围"
+                )
             return result
-        raise ValueError(f"不允许的表达式节点: {type(node).__name__}")
+        raise ValueError(
+            f"Unsupported expression node: {type(node).__name__}"
+            if english
+            else f"不允许的表达式节点: {type(node).__name__}"
+        )
 
     try:
         value = evaluate(tree)
@@ -1625,5 +2203,10 @@ def safe_calculate(expression: str) -> Dict[str, Any]:
         "success": True,
         "expression": text,
         "result": f"{quantized:.2f}",
-        "note": "仅用于金额计算；订单金额仍以 get_order_details 为准。",
+        "note": (
+            "For arithmetic only; order amounts still come from "
+            "get_order_details."
+            if english
+            else "仅用于金额计算；订单金额仍以 get_order_details 为准。"
+        ),
     }

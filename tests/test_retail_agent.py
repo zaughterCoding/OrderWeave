@@ -155,3 +155,56 @@ def test_service_rejects_empty_and_oversized_messages(store):
 
     __import__("asyncio").run(scenario())
     assert store.current_turn("client", "conv") == 0
+
+
+def test_english_agent_uses_english_prompt_and_tool_descriptions(tmp_path):
+    """英文评测模式只替换模型可见文案，业务与中文默认路径不变。"""
+    store = RetailStore(tmp_path / "retail.db", SEED, language="en")
+    agent = RetailAgent(
+        client=None,
+        model="fake-model",
+        store=store,
+        tool_manager=None,
+        max_tokens=2048,
+    )
+
+    assert agent.language == "en"
+    assert "Retail order and returns service" in agent.profile.role
+    assert "you are the retail customer service agent" in (
+        agent.system_prompt.lower()
+    )
+    assert "退货" not in agent.system_prompt
+
+    tools = agent._shared_tools
+    assert "search_knowledge_base" not in tools
+    assert len(tools) == 9
+    assert "sandbox user" in tools["find_user_id_by_email"].description
+    assert "pending-confirmation" in tools["prepare_return"].description.lower()
+    assert "order list" in tools["get_user_details"].description.lower()
+    assert "order ids" in tools["get_user_details"].description.lower()
+    assert "get_user_details" in agent.system_prompt
+
+    zh_store = RetailStore(tmp_path / "zh.db", SEED)
+    zh_agent = RetailAgent(
+        client=None,
+        model="fake-model",
+        store=zh_store,
+        tool_manager=None,
+        max_tokens=2048,
+    )
+    assert zh_agent.language == "zh"
+    assert "退货" in zh_agent.system_prompt
+    assert "沙箱用户" in zh_agent._shared_tools["find_user_id_by_email"].description
+    assert "订单列表" in zh_agent._shared_tools["get_user_details"].description
+    assert "get_user_details" in zh_agent.system_prompt
+
+
+def test_get_user_details_description_matches_returned_orders(store):
+    """工具说明提到订单列表，实际返回也确实包含本人订单号。"""
+    store.find_user_by_email("client", "conv", EMAIL)
+    details = store.get_user_details("client", "conv")
+    assert details["success"] is True
+    assert ORDER in details["user"]["orders"]
+    assert "订单列表" in retail_tools(store)["get_user_details"].description
+    english = retail_tools(store, language="en")["get_user_details"].description
+    assert "order list" in english.lower()
