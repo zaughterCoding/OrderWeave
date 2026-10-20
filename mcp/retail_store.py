@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = "1"
+SUPPORT_STATE_FORMAT_VERSION = 1
+MAX_SUPPORT_STATE_BYTES = 256 * 1024
 EXPECTED_SEED_SHA256 = "413a65160adbdb5fde0ffc0015c49b6d70250b10c18128de169b597af7766765"
 EXPECTED_SEED_COUNTS = {"users": 500, "orders": 1000, "products": 50}
 
@@ -180,6 +182,10 @@ _EN_DESTINATION_RE = re.compile(
 
 class RetailStoreError(RuntimeError):
     """种子、会话或数据库状态不允许继续。"""
+
+
+class SupportStateError(RetailStoreError):
+    """独立支持记录读写失败；不得因此回放已完成的业务写入。"""
 
 
 @dataclass(frozen=True)
@@ -776,6 +782,14 @@ class RetailStore:
             );
             CREATE INDEX IF NOT EXISTS idx_events_session
                 ON retail_events(client_user_id, conv_id, event_id);
+            CREATE TABLE IF NOT EXISTS retail_support_state (
+                client_user_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                format_version INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (client_user_id, conv_id)
+            );
             """
         )
 
@@ -2084,6 +2098,87 @@ class RetailStore:
             ),
         }
 
+    # ── 独立支持工作记录 ─────────────────────────────────────────────────
+
+    def load_support_state(
+        self,
+        client_user_id: str,
+        conv_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """读取同一会话的有限支持记录；不存在时返回 None。"""
+        if not str(client_user_id or "").strip() or not str(conv_id or "").strip():
+            raise SupportStateError("支持记录缺少会话隔离键")
+        try:
+            with closing(self._connect()) as connection:
+                row = connection.execute(
+                    "SELECT format_version, payload_json "
+                    "FROM retail_support_state "
+                    "WHERE client_user_id = ? AND conv_id = ?",
+                    (str(client_user_id), str(conv_id)),
+                ).fetchone()
+        except sqlite3.Error as ex:
+            raise SupportStateError(f"读取支持记录失败: {ex}") from ex
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError) as ex:
+            raise SupportStateError(f"支持记录 JSON 损坏: {ex}") from ex
+        if not isinstance(payload, dict):
+            raise SupportStateError("支持记录顶层不是对象")
+        if int(row["format_version"]) != SUPPORT_STATE_FORMAT_VERSION:
+            raise SupportStateError(
+                f"不支持的支持记录格式版本: {row['format_version']}"
+            )
+        return payload
+
+    def save_support_state(
+        self,
+        client_user_id: str,
+        conv_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        """同一事务内覆盖本会话支持记录；失败保留旧记录。"""
+        if not str(client_user_id or "").strip() or not str(conv_id or "").strip():
+            raise SupportStateError("支持记录缺少会话隔离键")
+        if not isinstance(payload, dict):
+            raise SupportStateError("支持记录必须是对象")
+        version = payload.get("format_version")
+        if version != SUPPORT_STATE_FORMAT_VERSION:
+            raise SupportStateError(f"不支持的支持记录格式版本: {version}")
+        try:
+            encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        except (TypeError, ValueError) as ex:
+            raise SupportStateError(f"支持记录无法序列化: {ex}") from ex
+        if len(encoded.encode("utf-8")) > MAX_SUPPORT_STATE_BYTES:
+            raise SupportStateError(
+                f"支持记录超过 {MAX_SUPPORT_STATE_BYTES} 字节，拒绝静默截断"
+            )
+        now = _now()
+        try:
+            with self._tx() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO retail_support_state (
+                        client_user_id, conv_id, format_version,
+                        payload_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(client_user_id, conv_id) DO UPDATE SET
+                        format_version = excluded.format_version,
+                        payload_json = excluded.payload_json,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        str(client_user_id),
+                        str(conv_id),
+                        SUPPORT_STATE_FORMAT_VERSION,
+                        encoded,
+                        now,
+                    ),
+                )
+        except sqlite3.Error as ex:
+            raise SupportStateError(f"写入支持记录失败: {ex}") from ex
+
     # ── 供验收使用的快照与统计 ───────────────────────────────────────────
 
     def business_snapshot(self) -> Dict[str, Any]:
@@ -2116,6 +2211,7 @@ class RetailStore:
                     "pending_returns",
                     "return_operations",
                     "retail_events",
+                    "retail_support_state",
                 )
             }
             meta = {

@@ -133,7 +133,7 @@ class KnowledgeBase:
     def _evidence_metadata(passage: Dict[str, Any]) -> Dict[str, Any]:
         """把证据元数据压成 Chroma 允许的标量。"""
         refs = passage.get("source_refs") or []
-        return {
+        metadata = {
             "title": str(passage.get("title", "")),
             "doc_id": str(passage.get("doc_id", "")),
             "evidence_id": str(passage.get("evidence_id", "")),
@@ -147,6 +147,17 @@ class KnowledgeBase:
             "chunk_index": 0,
             "total_chunks": 1,
         }
+        # 支持资料才带适用字段；旧 29 段保持原元数据不变。
+        for key in (
+            "product_id",
+            "issue",
+            "support_version",
+            "step_id",
+            "support_stage",
+        ):
+            if key in passage and passage.get(key) is not None:
+                metadata[key] = str(passage.get(key))
+        return metadata
 
     def upsert_evidence(self, passages: List[Dict[str, Any]]) -> int:
         """按 evidence_id 原样写入知识段，不切块；返回新增数量。
@@ -262,10 +273,20 @@ class KnowledgeBase:
                         "policy_commit": meta.get("policy_commit", ""),
                         "scope": meta.get("scope", ""),
                         "category": meta.get("category", ""),
+                        "product_id": meta.get("product_id", ""),
+                        "issue": meta.get("issue", ""),
+                        "support_version": meta.get("support_version", ""),
+                        "step_id": meta.get("step_id", ""),
+                        "support_stage": meta.get("support_stage", ""),
                     }
                 )
 
         return items
+
+    def list_ids(self) -> List[str]:
+        """返回集合内的稳定证据 ID，供导入完整性与幂等检查。"""
+        result = self._collection.get(include=[])
+        return sorted(str(item) for item in (result.get("ids") or []))
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """在线程池中执行同步的 ChromaDB 查询。"""

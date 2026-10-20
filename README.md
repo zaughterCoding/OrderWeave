@@ -162,6 +162,33 @@ uv run --locked --offline python -m api.main --cli
 - 身份绑定：服务端通过邮箱或“姓名＋邮编”绑定沙箱用户；请求里的 `user_id`、`conv_id` 不是订单授权，只能查询和操作当前绑定用户的订单。
 - 退货：仅 `delivered` 订单可申请；去向只能是原支付方式或用户已有礼品卡。详情由程序保存并实际展示，只有当前用户对同一详情的明确确认才能写入；修改详情需重新展示并重新确认，多订单逐笔确认与提交。人工交接只记录模拟事件，不代表真实工单、邮件或资金到账。
 
+### 无线耳机有限支持（默认关闭）
+
+`RETAIL_SUPPORT_ENABLED` 默认 `false`。开启后，单 Agent 与多 Agent 都只额外支持公开种子中的 `Wireless Earbuds`（`product_id=9924732112`）在蓝牙无法发现／配对／连接时的有限建议；资料是项目自编沙箱材料，不是厂商手册，也没有经过真实设备、品牌客服或真实模型验证。未知按键时长、恢复出厂、驱动、固件、兼容性、维修、换货、保修和硬件损坏结论均不覆盖；排查失败不等于退货资格。
+
+```powershell
+$env:RETAIL_MODE = "true"
+$env:RETAIL_SUPPORT_ENABLED = "true"
+$env:RETAIL_SUPPORT_COLLECTION = "retail_earbuds_support_v1"
+$env:RETAIL_AGENT_MODE = "single"   # 或 multi
+```
+
+- 开启要求 `RETAIL_LANGUAGE=zh`、知识检索开启，且支持集合不能与 `RETAIL_COLLECTION` 同名；冲突、缺文件或清单哈希不符会明确拒绝启动。
+- 新集合导入旧 29 段固定证据加 6 段项目自编耳机资料，共 35 段；旧集合、旧 29 段校验和 T16 资产保持不变，不会自动清空或改写。
+- 同一会话的有限工作记录保存在现有 SQLite 的独立表中，按 `(client_user_id, conv_id)` 隔离，可在进程重启后继续；不依赖可选 Redis、用户画像或跨会话记忆。
+- 支持记录只保存当前诉求、用户真实反馈、实际展示过的建议与证据、未解决项和最近有限对话；检索到但未展示的内容不算建议，用户报告不等于工具实测，模型摘要不作为可信进度。
+- 用户当前明确选择退货后仍走原 `prepare_return` → 展示 → 后续真实确认 → 提交链路；“如果不行就退”“先排查、不行再退”只是条件选择，不构成提交授权。
+- 关闭开关时，原单／多 Agent、29 段知识、英文评测和旧客服模式语义不变，也不增加支持专用阶段。
+
+对应的离线验收只使用 Fake 模型、真实 SQLite、真实 stdio MCP 和已有 ChromaDB 缓存：
+
+```powershell
+uv run --locked --offline python -m pytest tests/test_retail_support.py -q
+uv run --locked --offline python -m pytest tests/integration/test_retail_support.py -q
+```
+
+这些检查验证接线、状态隔离、重启续接、资料适用性与业务保护，不代表真实模型回答质量、检索指标或多 Agent 收益。详见 `evaluation/data/retail_support/README.md`。
+
 ## τ-retail 固定子集评测
 
 该入口在项目内另建独立 Python 3.12 环境运行固定上游文字评测组件，不改变主环境或主 `uv.lock`。固定上游为 `sierra-research/tau2-bench` `v1.0.1`／提交 `fc0055dc4e0a316c3f83133267fbd6faaa770992`；任务顺序固定为 11、12、46、48、51、83、92、108，各 1 次，`concurrency=1`、`trials=1`、计划 `seed=300`（只记录在配置和协议日志，当前未传给模型 SDK，不承诺确定性复现）、`max_steps=200`、`max_errors=10`。被测业务始终走本文档所述的 `RetailService`／`RetailAgent`／`RetailStore`，不使用官方被测 Agent。

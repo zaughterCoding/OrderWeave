@@ -366,6 +366,11 @@ class ChatResponse(BaseModel):
     entities: Dict[str, List[str]] = Field(default_factory=dict)
     intent_confidence: float = 0.0
     intent_source_scores: Dict[str, float] = Field(default_factory=dict)
+    support_enabled: bool = False
+    support_scope: str = ""
+    support_stage: str = ""
+    support_state_error: str = ""
+    support_context_limit: bool = False
 
 
 class ToolTraceResponse(BaseModel):
@@ -414,7 +419,7 @@ def _require_orchestrator() -> None:
 async def health():
     if _retail_runtime is not None:
         summary = _retail_runtime.service.summary()
-        return {
+        body = {
             "status": "ok",
             "mode": "retail",
             "agent_mode": summary.get("agent_mode", "single"),
@@ -422,6 +427,13 @@ async def health():
             "store": _retail_runtime.store.stats(),
             "budget": _retail_runtime.ledger.summary(),
         }
+        if _retail_runtime.config.support_enabled:
+            body["support"] = {
+                "enabled": True,
+                "collection": _retail_runtime.config.support_collection,
+                "language": _retail_runtime.config.language,
+            }
+        return body
     _require_orchestrator()
     return {"status": "ok", "agents": _orchestrator.get_stats()}
 
@@ -470,6 +482,11 @@ async def chat(req: ChatRequest):
             entities={},
             intent_confidence=1.0,
             intent_source_scores={},
+            support_enabled=result.support_enabled,
+            support_scope=result.support_scope,
+            support_stage=result.support_stage,
+            support_state_error=result.support_state_error,
+            support_context_limit=result.support_context_limit,
         )
 
     if _orchestrator is None or _memory is None:
@@ -674,11 +691,21 @@ async def knowledge_stats():
         raise HTTPException(503, "知识库未初始化")
     total = await _knowledge_base.doc_count_async()
     if _retail_runtime is not None:
+        config = _retail_runtime.config
+        if not config.support_enabled:
+            return {
+                "total_chunks": total,
+                "collection": config.knowledge_collection,
+                "frozen": True,
+                "mode": "retail",
+            }
         return {
             "total_chunks": total,
-            "collection": _retail_runtime.config.knowledge_collection,
+            "collection": config.support_collection,
             "frozen": True,
             "mode": "retail",
+            "support_enabled": True,
+            "support_material": "project_authored_sandbox",
         }
     return {"total_chunks": total}
 
@@ -751,7 +778,8 @@ async def _retail_cli() -> None:
     conv_id = os.getenv("RETAIL_CONV_ID", "").strip() or str(uuid.uuid4())
     print(
         f"零售模式：会话 {conv_id}，客户端用户 {user_id}；"
-        f"Agent 模式 {runtime.config.agent_mode}；数据库 {runtime.config.db_path}"
+        f"Agent 模式 {runtime.config.agent_mode}；数据库 {runtime.config.db_path}；"
+        f"有限支持 {'开启' if runtime.config.support_enabled else '关闭'}"
     )
     try:
         await runtime.start()

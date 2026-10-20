@@ -180,6 +180,10 @@ class Request:
     # 零售编排在同一真实请求内共享的写操作状态；由 RetailMultiAgent 创建。
     retail_primary: Optional[str] = None
     retail_guard: Optional[Dict[str, Any]] = None
+    # 有限支持上下文由 Host 在角色调用前写入，不是模型自报进度。
+    retail_support: Optional[Dict[str, Any]] = None
+    retail_support_enabled: bool = False
+    retail_support_blocked: bool = False
 
 
 @dataclass
@@ -1020,6 +1024,7 @@ class AgentOrchestrator:
         policy_text: str = "",
         retail_role_classes: Optional[Dict[str, type]] = None,
         retail_role_clients: Optional[Dict[str, Any]] = None,
+        retail_support_enabled: bool = False,
     ):
         if not model:
             raise ValueError("model is required")
@@ -1037,6 +1042,7 @@ class AgentOrchestrator:
         self._model = model
         self.language = str(language or "zh").lower()
         self.retail_mode = bool(retail_mode)
+        self.retail_support_enabled = bool(retail_support_enabled and retail_mode)
         self.policy_text = policy_text
 
         if intent_recognizer is not None:
@@ -1096,6 +1102,7 @@ class AgentOrchestrator:
                         profile=profile,
                         language=self.language,
                         policy_text=self.policy_text,
+                        support_enabled=self.retail_support_enabled,
                     )
                 ]
             # 零售模式的工具由运行时经 MCP 发现后统一注入。
@@ -1228,30 +1235,35 @@ class AgentOrchestrator:
                 req.entities = recognized_entities
 
         if self._needs_clarification(req):
-            result = OrchestratorResult(
-                request_id=req.request_id,
-                response=(
-                    "I cannot tell which issue you want to handle yet. Please "
-                    "clarify whether it is about an order or delivery, a return "
-                    "or billing issue, account details, or a technical problem."
-                    if retail_mode and language == "en"
-                    else "我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？"
-                ),
-                agent_type=AgentType.GENERAL,
-                intent=req.intent,
-                escalated=False,
-                latency_ms=(time.monotonic() - t0) * 1000,
-                agent_types=[AgentType.GENERAL],
-                primary_agent=AgentType.GENERAL,
-                routing_reason="低置信度 OTHER 意图，先澄清用户需求",
-                routing_confidence=req.intent_confidence,
-            )
-            self._record_tool_trace(result)
-            return result
+            if retail_mode and self._support_routing(req) is not None:
+                # 支持范围的澄清由 General 结合 Host 上下文完成，避免通用
+                # 低置信度分支先截断用户已说明的耳机问题。
+                pass
+            else:
+                result = OrchestratorResult(
+                    request_id=req.request_id,
+                    response=(
+                        "I cannot tell which issue you want to handle yet. Please "
+                        "clarify whether it is about an order or delivery, a return "
+                        "or billing issue, account details, or a technical problem."
+                        if retail_mode and language == "en"
+                        else "我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？"
+                    ),
+                    agent_type=AgentType.GENERAL,
+                    intent=req.intent,
+                    escalated=False,
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                    agent_types=[AgentType.GENERAL],
+                    primary_agent=AgentType.GENERAL,
+                    routing_reason="低置信度 OTHER 意图，先澄清用户需求",
+                    routing_confidence=req.intent_confidence,
+                )
+                self._record_tool_trace(result)
+                return result
 
         # 复杂请求可能涉及多个 Agent，例如同一条消息里既有登录失败
         # 又有重复扣款。
-        decision = self._route_decision(req)
+        decision = self._support_routing(req) or self._route_decision(req)
         if (
             retail_mode
             and req.retail_pending
@@ -1326,6 +1338,17 @@ class AgentOrchestrator:
             supporting_responses = [
                 await self._execute(req, at) for at in supporting
             ]
+            if getattr(self, "retail_support_enabled", False):
+                from agents.retail_support import merge_role_handoff
+
+                for agent_type, response in zip(supporting, supporting_responses):
+                    req.retail_support = merge_role_handoff(
+                        req.retail_support,
+                        agent_type.value,
+                        decision.primary_agent.value,
+                        req.turn,
+                        response,
+                    )
             primary_response = await self._execute(req, decision.primary_agent)
             valid_responses = supporting_responses + [primary_response]
             # Composer 以主角色结论为主，辅助内容附后。
@@ -1453,6 +1476,90 @@ class AgentOrchestrator:
                 return target
 
         return AgentType.GENERAL
+
+    def _support_routing(self, req: Request) -> Optional[RoutingDecision]:
+        """有限支持模式由 Host 按当前诉求选择下一步，不扩成固定流水线。"""
+        if not getattr(self, "retail_support_enabled", False):
+            return None
+        packet = getattr(req, "retail_support", None)
+        if not isinstance(packet, dict) or packet.get("enabled") is not True:
+            return None
+        scope = str(packet.get("scope_state") or "")
+        if scope == "ambiguous":
+            return RoutingDecision(
+                primary_agent=AgentType.GENERAL,
+                supporting_agents=[],
+                reason="support_scope_requires_clarification",
+                confidence=0.95,
+            )
+        if scope == "out_of_scope":
+            return RoutingDecision(
+                primary_agent=AgentType.GENERAL,
+                supporting_agents=[],
+                reason="support_request_out_of_scope",
+                confidence=0.95,
+            )
+        if scope != "active":
+            return None
+        demand = packet.get("current_demand") or {}
+        demand_kind = str(demand.get("kind") or "none")
+        record = packet.get("work_record") or {}
+        stage = str(record.get("stage") or "")
+        if demand_kind == "human":
+            return RoutingDecision(
+                primary_agent=AgentType.ESCALATION,
+                supporting_agents=[],
+                reason="support_user_requested_human_handoff",
+                confidence=1.0,
+            )
+        if demand_kind == "return":
+            return RoutingDecision(
+                primary_agent=AgentType.BILLING,
+                supporting_agents=[],
+                reason="support_user_currently_chose_return",
+                confidence=0.95,
+            )
+        if demand_kind == "conditional_return":
+            return RoutingDecision(
+                primary_agent=AgentType.TECHNICAL,
+                supporting_agents=[],
+                reason="support_conditional_return_requires_troubleshooting_first",
+                confidence=0.9,
+            )
+        if demand_kind == "resolved":
+            return RoutingDecision(
+                primary_agent=AgentType.GENERAL,
+                supporting_agents=[],
+                reason="support_issue_user_reported_resolved",
+                confidence=0.9,
+            )
+        if stage == "return_requested":
+            return RoutingDecision(
+                primary_agent=AgentType.BILLING,
+                supporting_agents=[],
+                reason="support_return_flow_continuation",
+                confidence=0.9,
+            )
+        if demand_kind == "none" and stage in ("resolved", "handoff_recorded"):
+            return RoutingDecision(
+                primary_agent=AgentType.GENERAL,
+                supporting_agents=[],
+                reason="support_record_already_closed_or_handed_off",
+                confidence=0.8,
+            )
+        if self._pool.get(AgentType.TECHNICAL):
+            return RoutingDecision(
+                primary_agent=AgentType.TECHNICAL,
+                supporting_agents=[],
+                reason="support_limited_troubleshooting",
+                confidence=0.9,
+            )
+        return RoutingDecision(
+            primary_agent=AgentType.GENERAL,
+            supporting_agents=[],
+            reason="support_no_technical_role_available",
+            confidence=0.4,
+        )
 
     def _route_decision(self, req: Request) -> RoutingDecision:
         """构造结构化路由决策。

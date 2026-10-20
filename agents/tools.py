@@ -259,8 +259,15 @@ def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]
     }
 
 
-def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
-    """构造所有 Agent 共用的 RAG 工具。"""
+def build_shared_rag_tools(
+    tool_manager: Any,
+    filter_for_request: Optional[Callable[[Request, Any], bool]] = None,
+) -> Dict[str, AgentToolSpec]:
+    """构造所有 Agent 共用的 RAG 工具。
+
+    filter_for_request 仅在有限支持启用时传入，用于在合并前剔除不适用证据；
+    默认不改变原检索链。
+    """
 
     async def search_knowledge_base(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
         query = str(args.get("query") or req.message or "").strip()
@@ -270,10 +277,14 @@ def build_shared_rag_tools(tool_manager: Any) -> Dict[str, AgentToolSpec]:
         if tool_manager is None:
             return {"success": False, "error": "RAG 工具未初始化", "results": []}
 
+        extra: Dict[str, Any] = {}
+        if filter_for_request is not None:
+            extra["item_filter"] = lambda item: filter_for_request(req, item)
         result = await tool_manager.search_with_rewrite(
             "knowledge_search",
             query,
             top_k=top_k,
+            **extra,
         )
         degraded = bool(getattr(result, "degraded", False))
         if not getattr(result, "success", False):

@@ -12,12 +12,19 @@ import logging
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agents.agent_orchestrator import AgentOrchestrator, ResponseComposer
 from agents.retail_agent import RetailAgent, RetailService
+from agents.retail_support import (
+    MAX_HANDOFF_CHARS,
+    SUPPORT_EVIDENCE_IDS,
+    SUPPORT_ISSUE,
+    SUPPORT_PRODUCT_ID,
+    SUPPORT_STEP_IDS,
+)
 from agents.retail_multi_agent import (
     RetailBillingAgent,
     RetailEscalationAgent,
@@ -53,6 +60,15 @@ EXPECTED_KNOWLEDGE_SHA256 = (
     "e7360f9d22531ed836da12fe34d90c971a9300a3ed943031d75f8f6dc3b734c0"
 )
 EXPECTED_KNOWLEDGE_SEGMENTS = 29
+EXPECTED_SUPPORT_KNOWLEDGE_SHA256 = (
+    "ca15b525e749a1f0b89e7fe87bfe5fe4b42dfb929558c7997222e4f1fac8c044"
+)
+EXPECTED_SUPPORT_SEGMENTS = 6
+COMBINED_KNOWLEDGE_SEGMENTS = (
+    EXPECTED_KNOWLEDGE_SEGMENTS + EXPECTED_SUPPORT_SEGMENTS
+)
+SUPPORT_MANIFEST_FORMAT = "agent_ecommerce_retail_support_manifest"
+DEFAULT_SUPPORT_COLLECTION = "retail_earbuds_support_v1"
 RETRIEVAL_TOP_K = 5
 
 _COLLECTION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,61}[A-Za-z0-9]$")
@@ -163,6 +179,132 @@ def _load_knowledge(path: Path) -> List[Dict[str, Any]]:
     return rows
 
 
+def _load_support_knowledge(path: Path) -> List[Dict[str, Any]]:
+    """加载项目自编 6 段；旧 29 段始终由固定文件单独校验。"""
+    rows: List[Dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                row = json.loads(text)
+            except json.JSONDecodeError as ex:
+                raise RuntimeError(
+                    f"支持知识第 {line_number} 行不是合法 JSON: {ex}"
+                ) from ex
+            if not isinstance(row, dict):
+                raise RuntimeError(f"支持知识第 {line_number} 行必须是对象")
+            rows.append(row)
+    if len(rows) != EXPECTED_SUPPORT_SEGMENTS:
+        raise RuntimeError(
+            "支持知识片段数量不符: "
+            f"{len(rows)} != {EXPECTED_SUPPORT_SEGMENTS}"
+        )
+    evidence_ids = [str(row.get("evidence_id") or "") for row in rows]
+    if tuple(evidence_ids) != SUPPORT_EVIDENCE_IDS:
+        raise RuntimeError(
+            "支持知识 evidence_id 不符: "
+            f"{evidence_ids} != {list(SUPPORT_EVIDENCE_IDS)}"
+        )
+    for row in rows:
+        if str(row.get("product_id") or "") != SUPPORT_PRODUCT_ID:
+            raise RuntimeError(
+                f"支持知识商品不匹配: {row.get('evidence_id')}"
+            )
+        if str(row.get("issue") or "") != SUPPORT_ISSUE:
+            raise RuntimeError(
+                f"支持知识问题不匹配: {row.get('evidence_id')}"
+            )
+        step_id = str(row.get("step_id") or "")
+        if step_id and step_id not in SUPPORT_STEP_IDS:
+            raise RuntimeError(
+                f"支持知识步骤不在固定集合: {row.get('evidence_id')} {step_id}"
+            )
+        if str(row.get("source_kind") or "") != "project_authored_sandbox":
+            raise RuntimeError(
+                f"支持知识来源不是项目自编沙箱: {row.get('evidence_id')}"
+            )
+        if str(row.get("language") or "") != "zh":
+            raise RuntimeError(
+                f"支持知识必须是中文: {row.get('evidence_id')}"
+            )
+    return rows
+
+
+def _load_support_manifest(
+    path: Path,
+    support_knowledge_path: Path,
+) -> Dict[str, Any]:
+    """校验清单格式、资产哈希、旧 29 段与新 35 段口径。"""
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as ex:
+        raise RuntimeError(f"无法读取支持清单: {ex}") from ex
+    if not isinstance(manifest, dict):
+        raise RuntimeError("支持清单顶层必须是对象")
+    if manifest.get("format") != SUPPORT_MANIFEST_FORMAT:
+        raise RuntimeError(
+            f"支持清单格式不符: {manifest.get('format')!r}"
+        )
+    if manifest.get("nature") != "project_authored_sandbox_not_vendor_documentation":
+        raise RuntimeError("支持清单必须声明项目自编沙箱性质")
+    product = manifest.get("product") or {}
+    if (
+        str(product.get("product_id") or "") != SUPPORT_PRODUCT_ID
+        or str(product.get("issue") or "") != SUPPORT_ISSUE
+    ):
+        raise RuntimeError("支持清单商品或问题不在固定范围")
+
+    for entry in (manifest.get("files") or {}).values():
+        if not isinstance(entry, dict):
+            raise RuntimeError("支持清单 files 条目必须是对象")
+        relative = str(entry.get("path") or "")
+        expected = str(entry.get("sha256") or "")
+        if not relative or not expected:
+            raise RuntimeError("支持清单 files 缺少 path 或 sha256")
+        asset_path = Path(relative)
+        if not asset_path.is_absolute():
+            asset_path = _PROJECT_ROOT / asset_path
+        if not asset_path.is_file():
+            raise RuntimeError(f"支持资产不存在: {asset_path}")
+        actual = _sha256_file(asset_path)
+        if actual != expected:
+            raise RuntimeError(
+                f"支持资产哈希不一致: {asset_path} {actual} != {expected}"
+            )
+
+    support = manifest.get("support_knowledge") or {}
+    if int(support.get("count") or 0) != EXPECTED_SUPPORT_SEGMENTS:
+        raise RuntimeError("支持清单片段数量不是 6")
+    if tuple(support.get("evidence_ids") or ()) != SUPPORT_EVIDENCE_IDS:
+        raise RuntimeError("支持清单 evidence_id 列表不符")
+    if tuple(support.get("step_ids") or ()) != SUPPORT_STEP_IDS:
+        raise RuntimeError("支持清单 step_id 列表不符")
+    declared_support_path = Path(str(support.get("path") or ""))
+    if not declared_support_path.is_absolute():
+        declared_support_path = _PROJECT_ROOT / declared_support_path
+    if declared_support_path.resolve() != support_knowledge_path.resolve():
+        raise RuntimeError("支持清单知识路径与运行时配置不一致")
+    if str(support.get("sha256") or "") != EXPECTED_SUPPORT_KNOWLEDGE_SHA256:
+        raise RuntimeError("支持清单知识哈希不是冻结值")
+
+    legacy = manifest.get("legacy_knowledge") or {}
+    if int(legacy.get("count") or 0) != EXPECTED_KNOWLEDGE_SEGMENTS:
+        raise RuntimeError("支持清单旧知识数量不是 29")
+    if str(legacy.get("sha256") or "") != EXPECTED_KNOWLEDGE_SHA256:
+        raise RuntimeError("支持清单旧知识哈希与冻结值不一致")
+    combined = manifest.get("combined") or {}
+    if int(combined.get("count") or 0) != COMBINED_KNOWLEDGE_SEGMENTS:
+        raise RuntimeError("支持清单合并数量不是 35")
+    if str(combined.get("collection_default") or "") != DEFAULT_SUPPORT_COLLECTION:
+        raise RuntimeError("支持清单默认集合名不符")
+    scenarios = manifest.get("scenarios") or {}
+    if len(scenarios.get("case_ids") or []) != 8:
+        raise RuntimeError("支持清单必须有 8 个固定验收案例")
+    return manifest
+
+
 def _register_knowledge_tool(
     tool_manager: MCPToolManager,
     knowledge_base: KnowledgeBase,
@@ -240,6 +382,29 @@ class RetailRuntimeConfig:
     agent_mode: str = "single"
     enable_memory: bool = True
     enable_knowledge: bool = True
+    # T17 默认关闭；开启时只加独立支持集合与工作记录，不改旧 29 段集合。
+    language: str = "zh"
+    support_enabled: bool = False
+    support_collection: str = DEFAULT_SUPPORT_COLLECTION
+    support_knowledge_path: Path = field(
+        default_factory=lambda: (
+            _PROJECT_ROOT
+            / "evaluation"
+            / "data"
+            / "retail_support"
+            / "knowledge.jsonl"
+        )
+    )
+    support_manifest_path: Path = field(
+        default_factory=lambda: (
+            _PROJECT_ROOT
+            / "evaluation"
+            / "data"
+            / "retail_support"
+            / "manifest.json"
+        )
+    )
+    support_max_chars: int = MAX_HANDOFF_CHARS
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -264,6 +429,32 @@ class RetailRuntimeConfig:
             raise RuntimeError(
                 "RETAIL_AGENT_MODE 只能是 single 或 multi: " + agent_mode
             )
+        language = _env_text("RETAIL_LANGUAGE", "zh").lower()
+        if language not in {"zh", "en"}:
+            raise RuntimeError("RETAIL_LANGUAGE 只能是 zh 或 en: " + language)
+        support_enabled = _env_bool("RETAIL_SUPPORT_ENABLED", False)
+        support_collection = _validate_collection_name(
+            _env_text("RETAIL_SUPPORT_COLLECTION", DEFAULT_SUPPORT_COLLECTION),
+            "RETAIL_SUPPORT_COLLECTION",
+        )
+        enable_knowledge = _env_bool("RETAIL_ENABLE_KNOWLEDGE", True)
+        if support_enabled:
+            if not retail_mode_enabled():
+                raise RuntimeError(
+                    "RETAIL_SUPPORT_ENABLED=true 需要 RETAIL_MODE=true"
+                )
+            if language != "zh":
+                raise RuntimeError(
+                    "RETAIL_SUPPORT_ENABLED 只支持中文零售 profile（RETAIL_LANGUAGE=zh）"
+                )
+            if not enable_knowledge:
+                raise RuntimeError(
+                    "RETAIL_SUPPORT_ENABLED=true 需要 RETAIL_ENABLE_KNOWLEDGE=true"
+                )
+            if support_collection == collection:
+                raise RuntimeError(
+                    "RETAIL_SUPPORT_COLLECTION 不能与 RETAIL_COLLECTION 同名"
+                )
         return cls(
             db_path=_env_path(
                 "RETAIL_DB_PATH", _PROJECT_ROOT / "data" / "retail" / "retail.db"
@@ -333,7 +524,33 @@ class RetailRuntimeConfig:
             ),
             agent_mode=agent_mode,
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
-            enable_knowledge=_env_bool("RETAIL_ENABLE_KNOWLEDGE", True),
+            enable_knowledge=enable_knowledge,
+            language=language,
+            support_enabled=support_enabled,
+            support_collection=support_collection,
+            support_knowledge_path=_env_path(
+                "RETAIL_SUPPORT_KNOWLEDGE_PATH",
+                _PROJECT_ROOT
+                / "evaluation"
+                / "data"
+                / "retail_support"
+                / "knowledge.jsonl",
+            ),
+            support_manifest_path=_env_path(
+                "RETAIL_SUPPORT_MANIFEST_PATH",
+                _PROJECT_ROOT
+                / "evaluation"
+                / "data"
+                / "retail_support"
+                / "manifest.json",
+            ),
+            support_max_chars=max(
+                1000,
+                min(
+                    MAX_HANDOFF_CHARS,
+                    int(_env_text("RETAIL_SUPPORT_MAX_CHARS", str(MAX_HANDOFF_CHARS))),
+                ),
+            ),
         )
 
 
@@ -378,7 +595,8 @@ class RetailRuntime:
                 if self.tool_manager is None:
                     raise RuntimeError("启用知识检索但未构建工具管理器")
                 tools["search_knowledge_base"] = retail_knowledge_tool(
-                    self.tool_manager
+                    self.tool_manager,
+                    support_enabled=self.config.support_enabled,
                 )
             self.agent.set_shared_tools(tools)
         except Exception:
@@ -413,6 +631,17 @@ def build_retail_runtime(
     """按环境配置构造零售运行时；不会自动重置已有业务库。"""
     config = config or RetailRuntimeConfig.from_env()
 
+    if config.support_enabled:
+        if str(config.language).lower() != "zh":
+            raise RuntimeError("有限支持只支持中文零售 profile")
+        if not config.enable_knowledge:
+            raise RuntimeError("有限支持需要启用知识检索")
+        if config.support_collection == config.knowledge_collection:
+            raise RuntimeError("支持集合不能与旧知识集合同名")
+        _validate_collection_name(
+            config.support_collection, "RETAIL_SUPPORT_COLLECTION"
+        )
+
     for path, label in (
         (config.seed_path, "公开种子"),
         (config.policy_path, "固定政策"),
@@ -433,6 +662,28 @@ def build_retail_runtime(
         )
     knowledge_rows = _load_knowledge(config.knowledge_path)
 
+    support_rows: List[Dict[str, Any]] = []
+    if config.support_enabled:
+        for path, label in (
+            (config.support_knowledge_path, "支持知识"),
+            (config.support_manifest_path, "支持清单"),
+        ):
+            if not path.is_file():
+                raise RuntimeError(f"{label}文件不存在: {path}")
+        support_sha = _sha256_file(config.support_knowledge_path)
+        if support_sha != EXPECTED_SUPPORT_KNOWLEDGE_SHA256:
+            raise RuntimeError(
+                "支持知识哈希不一致: "
+                f"{support_sha} != {EXPECTED_SUPPORT_KNOWLEDGE_SHA256}"
+            )
+        _load_support_manifest(
+            config.support_manifest_path,
+            config.support_knowledge_path,
+        )
+        support_rows = _load_support_knowledge(config.support_knowledge_path)
+        if len(knowledge_rows) + len(support_rows) != COMBINED_KNOWLEDGE_SEGMENTS:
+            raise RuntimeError("旧 29 段与支持 6 段合并后不是 35 段")
+
     ledger = RetailLedger(
         path=config.ledger_path,
         budget_cny=config.budget_cny,
@@ -451,13 +702,17 @@ def build_retail_runtime(
         stage="agent",
     )
 
-    store = RetailStore(config.db_path, config.seed_path)
+    store = RetailStore(
+        config.db_path, config.seed_path, language=config.language
+    )
     language = store.language
     mcp_client = RetailMCPClient(
         db_path=config.db_path,
         seed_path=config.seed_path,
         language=language,
-        expected_specs=retail_tools(store, None, language=language),
+        expected_specs=retail_tools(
+            store, None, language=language, support_enabled=config.support_enabled
+        ),
         project_root=_PROJECT_ROOT,
         python_executable=sys.executable,
         startup_timeout=config.mcp_timeout_seconds,
@@ -482,24 +737,51 @@ def build_retail_runtime(
     knowledge_base = None
     tool_manager = None
     if config.enable_knowledge:
+        collection_name = (
+            config.support_collection
+            if config.support_enabled
+            else config.knowledge_collection
+        )
+        expected_segments = (
+            COMBINED_KNOWLEDGE_SEGMENTS
+            if config.support_enabled
+            else EXPECTED_KNOWLEDGE_SEGMENTS
+        )
         knowledge_base = KnowledgeBase(
             chroma_host=config.chroma_host,
             chroma_port=config.chroma_port,
             chroma_path=str(config.chroma_path),
-            collection_name=config.knowledge_collection,
+            collection_name=collection_name,
             load_demo_documents=False,
         )
-        added = knowledge_base.upsert_evidence(knowledge_rows)
+        incoming_rows = (
+            list(knowledge_rows) + list(support_rows)
+            if config.support_enabled
+            else list(knowledge_rows)
+        )
+        added = knowledge_base.upsert_evidence(incoming_rows)
         total = knowledge_base.doc_count
-        if total != EXPECTED_KNOWLEDGE_SEGMENTS:
+        if total != expected_segments:
             raise RuntimeError(
-                "零售知识集合必须只包含冻结片段，当前数量不符: "
-                f"{total} != {EXPECTED_KNOWLEDGE_SEGMENTS}；"
-                f"请为新运行使用独立 RETAIL_COLLECTION，不自动清理旧集合。"
+                "零售知识集合数量不符: "
+                f"{total} != {expected_segments}；"
+                f"请为新运行使用独立集合，不自动清理已有集合 {collection_name}。"
             )
+        if config.support_enabled:
+            expected_ids = {
+                str(row.get("evidence_id") or "") for row in incoming_rows
+            }
+            actual_ids = set(knowledge_base.list_ids())
+            if actual_ids != expected_ids:
+                missing = sorted(expected_ids - actual_ids)
+                extra = sorted(actual_ids - expected_ids)
+                raise RuntimeError(
+                    "支持集合证据 ID 不完整或包含额外片段；不自动清理。"
+                    f" 缺少={missing} 额外={extra}"
+                )
         logger.info(
             "零售知识集合 %s: %s 个片段，本次写入 %s 个",
-            config.knowledge_collection,
+            collection_name,
             total,
             added,
         )
@@ -539,6 +821,7 @@ def build_retail_runtime(
                 "billing": RetailBillingAgent,
                 "escalation": RetailEscalationAgent,
             },
+            retail_support_enabled=config.support_enabled,
         )
         agent = RetailMultiAgent(
             orchestrator,
@@ -570,6 +853,8 @@ def build_retail_runtime(
                 f"sha256={EXPECTED_POLICY_SHA256}"
             ),
             max_tokens=config.max_tokens,
+            language=language,
+            support_enabled=config.support_enabled,
         )
 
     service = RetailService(
@@ -583,6 +868,9 @@ def build_retail_runtime(
         profile_enabled=config.profile_enabled,
         max_message_chars=config.max_message_chars,
         max_context_chars=config.max_context_chars,
+        language=language,
+        support_enabled=config.support_enabled,
+        support_max_chars=config.support_max_chars,
     )
 
     return RetailRuntime(

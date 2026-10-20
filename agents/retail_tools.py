@@ -12,6 +12,7 @@ from agents.tools import (
     build_shared_rag_tools,
     make_tool,
 )
+from agents.retail_support import support_evidence_applicable
 from mcp.retail_store import RetailStore, safe_calculate
 
 _RETAIL_KNOWLEDGE_DESCRIPTION = (
@@ -35,15 +36,32 @@ RETAIL_STATE_TOOLS = (
     "transfer_to_human_agents",
 )
 RETAIL_ALL_TOOLS = RETAIL_STATE_TOOLS + RETAIL_READ_ONLY_TOOLS
+# 支持模式的商品资料角色只保留公开商品查询、必要计算和知识检索；
+# 身份、订单、准备／提交与交接由主执行者和原业务链负责。
+RETAIL_SUPPORT_TECHNICAL_TOOLS = (
+    "get_product_details",
+    "calculate",
+    "search_knowledge_base",
+)
 
 
-def retail_knowledge_tool(tool_manager: Any) -> AgentToolSpec:
+def retail_knowledge_tool(
+    tool_manager: Any,
+    support_enabled: bool = False,
+) -> AgentToolSpec:
     """复用既有 RAG 处理函数，只替换为零售模式可见的描述。
 
     T12 保留的 A 召回最终只返回 5 条；这里把模型可见的 top_k 上限也
-    收到 5，避免单次咨询扩大证据集合。
+    收到 5，避免单次咨询扩大证据集合。支持模式增加适用性过滤。
     """
-    shared = build_shared_rag_tools(tool_manager)["search_knowledge_base"]
+    filter_for_request = None
+    if support_enabled:
+        filter_for_request = lambda req, item: support_evidence_applicable(
+            item, getattr(req, "retail_support", None)
+        )
+    shared = build_shared_rag_tools(
+        tool_manager, filter_for_request=filter_for_request
+    )["search_knowledge_base"]
     properties = dict(shared.input_schema["properties"])
     properties["top_k"] = {
         "type": "integer",
@@ -69,6 +87,7 @@ def retail_tools(
     store: RetailStore,
     tool_manager: Any = None,
     language: Optional[str] = None,
+    support_enabled: bool = False,
 ) -> Dict[str, AgentToolSpec]:
     """构造零售 Agent 的完整工具白名单。"""
     lang = str(language or getattr(store, "language", "zh")).lower()
@@ -388,7 +407,9 @@ def retail_tools(
         ),
     }
     if tool_manager is not None:
-        tools["search_knowledge_base"] = retail_knowledge_tool(tool_manager)
+        tools["search_knowledge_base"] = retail_knowledge_tool(
+            tool_manager, support_enabled=support_enabled
+        )
     return tools
 
 

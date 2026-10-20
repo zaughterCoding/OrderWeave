@@ -45,6 +45,9 @@ def _rerank_preview(item: Any) -> str:
 # 检索链的生产配置；预检和运行记录都从这里读取，避免只改评测常量。
 REWRITE_N = 3
 MIN_RECALL_K = 5
+# 支持资料适用性过滤会排除不适用片段；先扩大召回，避免前 5 条被旧政策
+# 占满后把唯一适用的 PAIR 步骤过滤掉。
+SUPPORT_RECALL_K = 20
 
 
 def retrieval_config(top_k: int) -> Dict[str, Any]:
@@ -414,8 +417,13 @@ class MCPToolManager:
         top_k: int = 5,
         context: Optional[Dict[str, Any]] = None,
         diagnostics: Optional[Dict[str, Any]] = None,
+        item_filter: Optional[Callable[[Any], bool]] = None,
     ) -> ToolResult:
-        """执行改写、并行召回、合并去重和重排。"""
+        """执行改写、并行召回、合并去重和重排。
+
+        item_filter 在合并后、重排前应用，只用于支持资料的适用性过滤；
+        默认 None 时保持原检索链。
+        """
         diag = diagnostics if diagnostics is not None else {}
         total_start = time.monotonic()
         settings = retrieval_config(top_k)
@@ -430,6 +438,9 @@ class MCPToolManager:
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
         recall_k = settings["recall_k"]
+        if item_filter is not None:
+            recall_k = max(recall_k, SUPPORT_RECALL_K)
+            diag["support_recall_k"] = recall_k
         recall_start = time.monotonic()
         tasks = [
             self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
@@ -494,6 +505,10 @@ class MCPToolManager:
             )
 
         diag["subquery_results"] = subquery_results
+        if item_filter is not None:
+            before_filter = len(merged)
+            merged = [item for item in merged if item_filter(item)]
+            diag["filtered_out"] = before_filter - len(merged)
         diag["candidate_count"] = len(merged)
         diag["pre_rerank_ids"] = [
             item.get("evidence_id") or item.get("id")

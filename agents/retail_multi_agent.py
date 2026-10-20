@@ -25,14 +25,48 @@ from agents.agent_orchestrator import (
     Request,
     _stop_exception,
 )
+from agents.retail_support import handoff_summary_from_packet
 from agents.retail_tools import (
     RETAIL_ALL_TOOLS,
     RETAIL_READ_ONLY_TOOLS,
     RETAIL_STATE_TOOLS,
+    RETAIL_SUPPORT_TECHNICAL_TOOLS,
 )
 from agents.tools import validate_tool_input
 
 logger = logging.getLogger(__name__)
+
+_SUPPORT_TECH_HEADER_ZH = (
+    "你是零售商品资料 Agent。在项目自编无线耳机有限支持沙箱内，使用 "
+    "search_knowledge_base 检索沙箱资料，并结合 get_product_details 与 calculate "
+    "给出有限建议；只处理固定商品和蓝牙配对问题，资料未定义的内容直接说明未知。"
+    "不读取账户或订单，不准备、不提交退货，不记录交接。"
+)
+_SUPPORT_TECH_HEADER_EN = (
+    "You are the retail product information agent in a project-authored earbuds "
+    "support sandbox. Use search_knowledge_base together with get_product_details "
+    "and calculate only for the fixed product and Bluetooth pairing issue. State "
+    "unknowns explicitly. Do not read accounts or orders, prepare or submit a "
+    "return, or record a handoff."
+)
+
+_SUPPORT_RULES_EN = """
+Limited project-authored earbuds support (sandbox):
+- Only Wireless Earbuds (9924732112) with Bluetooth discovery, pairing, or connection failure.
+- Use search_knowledge_base for the project-authored sandbox material. Suggest only PAIR-01 to PAIR-03, and do not repeat steps the user already reported unless explaining why.
+- Never call it a vendor manual, never invent button durations, factory reset, drivers, firmware, compatibility, repair, exchange, warranty, or hardware-damage conclusions. Say the material is insufficient for anything else.
+- Return eligibility is not established by failed troubleshooting. Do not read accounts/orders as a technical agent, bind identity, prepare/submit a return, or record a handoff from this role.
+- If the user chooses a return or a human, the existing business flow handles it. Do not promise a refund, live agent, or ticket.
+"""
+
+_SUPPORT_RULES_ZH = """
+项目自编无线耳机有限支持（沙箱）：
+- 只处理 Wireless Earbuds（9924732112）的蓝牙无法发现、配对或连接失败。
+- 使用 search_knowledge_base 检索项目自编沙箱资料，只提出 PAIR-01 至 PAIR-03 范围内的建议；用户已报告的步骤不要无解释地重复推荐。
+- 不得称为厂商手册，不得编造按键时长、恢复出厂、驱动、固件、兼容性、维修、换货、保修或硬件损坏结论；其余内容明确说明资料不足。
+- 排查失败不等于退货资格。作为商品资料角色不得读取账户订单、不得绑定身份、不得准备／提交退货或记录交接。
+- 用户选择退货或人工时，由既有业务流程处理；不承诺退款、真实坐席或工单。
+"""
 
 _SHARED_RULES_EN = """
 Shared retail rules:
@@ -74,6 +108,7 @@ class RetailRoleMixin:
         profile: Optional[AgentProfile] = None,
         language: Optional[str] = None,
         policy_text: str = "",
+        support_enabled: bool = False,
     ):
         lang = str(language or "zh").lower()
         base_profile = profile or self.profile
@@ -89,12 +124,20 @@ class RetailRoleMixin:
         self.max_tool_uses_per_response = 1
         self.capture_tool_results = True
         self.policy_text = str(policy_text or "")
+        self.support_enabled = bool(support_enabled)
+        if self.support_enabled and self.agent_type == AgentType.TECHNICAL:
+            # 仅支持模式实际下发商品查询、计算与知识检索；关闭时保持原白名单。
+            self.retail_allowed_tools = RETAIL_SUPPORT_TECHNICAL_TOOLS
         self.system_prompt = self._compose_system_prompt(lang)
 
     def _compose_system_prompt(self, language: str) -> str:
         if language == "en":
             header = self.retail_prompt_en.strip()
+            if self.support_enabled and self.agent_type == AgentType.TECHNICAL:
+                header = _SUPPORT_TECH_HEADER_EN
             rules = _SHARED_RULES_EN.strip()
+            if self.support_enabled:
+                rules = f"{rules}\n\n{_SUPPORT_RULES_EN.strip()}"
             if self.policy_text.strip():
                 return (
                     f"{header}\n\n{rules}\n\n[Fixed transaction policy]\n"
@@ -102,7 +145,11 @@ class RetailRoleMixin:
                 )
             return f"{header}\n\n{rules}"
         header = self.retail_prompt_zh.strip()
+        if self.support_enabled and self.agent_type == AgentType.TECHNICAL:
+            header = _SUPPORT_TECH_HEADER_ZH
         rules = _SHARED_RULES_ZH.strip()
+        if self.support_enabled:
+            rules = f"{rules}\n\n{_SUPPORT_RULES_ZH.strip()}"
         if self.policy_text.strip():
             return (
                 f"{header}\n\n{rules}\n\n[固定交易政策]\n来源：固定政策原文\n\n"
@@ -113,10 +160,17 @@ class RetailRoleMixin:
     def _is_primary(self, req: Request) -> bool:
         return not req.retail_primary or req.retail_primary == self.agent_type.value
 
+    def _supporting_read_only(self) -> set[str]:
+        allowed = set(RETAIL_READ_ONLY_TOOLS)
+        if getattr(self, "support_enabled", False):
+            # 支持模式辅助商品角色仍需可用的适用检索。
+            allowed.add("search_knowledge_base")
+        return allowed
+
     def _tools_for_request(self, req: Request) -> Dict[str, Any]:
         allowed = set(self.retail_allowed_tools)
         if not self._is_primary(req):
-            allowed &= set(RETAIL_READ_ONLY_TOOLS)
+            allowed &= self._supporting_read_only()
         return {
             name: spec
             for name, spec in self.get_tools().items()
@@ -148,7 +202,7 @@ class RetailRoleMixin:
                 else "本轮已生成待确认详情，不能在同一轮提交或执行其他业务操作；"
                 "请展示完整详情并等待用户明确确认。"
             )
-        if not self._is_primary(req) and name not in RETAIL_READ_ONLY_TOOLS:
+        if not self._is_primary(req) and name not in self._supporting_read_only():
             return (
                 "Only the primary agent of this request may bind identity, "
                 "prepare or submit a return, or record a handoff."
@@ -210,8 +264,12 @@ class RetailRoleMixin:
             "turn": req.turn,
             "bound_user_id": req.retail_user_id,
             "pending_confirmation": req.retail_pending,
+            "support_enabled": bool(getattr(self, "support_enabled", False)),
             "rules": rules,
         }
+        if getattr(req, "retail_support", None) is not None:
+            # 支持记录必须在目标角色调用前进入实际消息，而不是只留在编排器状态。
+            packet["support"] = req.retail_support
         return json.dumps(packet, ensure_ascii=False)
 
 
@@ -415,11 +473,29 @@ class RetailEscalationAgent(RetailRoleMixin, BaseAgent):
                 else f" 已展示订单 {first.get('order_id')}（操作 {first.get('op_id')}）"
                 "的待确认退货详情，尚未提交。"
             )
+        if getattr(req, "retail_support", None) is not None:
+            summary = handoff_summary_from_packet(
+                req.retail_support, req.retail_pending, self.language
+            )
+            demand = (req.retail_support.get("current_demand") or {}).get("kind")
+            reason = (
+                "user requested a human"
+                if demand == "human"
+                else "support sandbox limit reached or out of scope"
+            )
+        else:
+            summary = (
+                f"Retail support handoff. Intent: {intent}. "
+                f"User message: {message}.{pending_note}"
+            )
+            reason = (
+                "user requested a human"
+                if intent in ("human_handoff", "escalation")
+                else "out of scope"
+            )
         args = {
-            "summary": f"Retail support handoff. Intent: {intent}. User message: {message}.{pending_note}",
-            "reason": "user requested a human" if intent in (
-                "human_handoff", "escalation"
-            ) else "out of scope",
+            "summary": summary,
+            "reason": reason,
         }
         tool_t0 = time.monotonic()
         result: Any = {}
