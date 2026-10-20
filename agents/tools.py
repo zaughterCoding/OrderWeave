@@ -52,6 +52,98 @@ def make_tool(
     )
 
 
+def validate_tool_input(
+    spec: AgentToolSpec,
+    args: Any,
+    language: str = "zh",
+) -> None:
+    """按工具 Schema 严格校验参数；主程序与 MCP 工具端共用同一规则。
+
+    只覆盖本项目的工具 Schema 子集：必填、未知字段、类型、数值范围与数组
+    长度／元素类型。bool 不能冒充整数或数值。校验失败抛出 ValueError。
+    """
+    english = str(language).lower() == "en"
+
+    def fail(zh: str, en: str) -> None:
+        raise ValueError(en if english else zh)
+
+    if not isinstance(args, dict):
+        fail("工具参数必须是 JSON 对象", "Tool arguments must be a JSON object")
+    schema = spec.input_schema
+    for field_name in schema.get("required", []):
+        if field_name not in args:
+            fail(
+                f"缺少必需参数: {field_name}",
+                f"Missing required argument: {field_name}",
+            )
+    properties = schema.get("properties", {})
+    unknown = set(args) - set(properties)
+    if unknown and schema.get("additionalProperties") is False:
+        fail(
+            f"不允许的工具参数: {', '.join(sorted(unknown))}",
+            f"Unsupported tool arguments: {', '.join(sorted(unknown))}",
+        )
+    type_map = {"string": str, "number": (int, float), "integer": int, "boolean": bool}
+    for key, value in args.items():
+        prop = properties.get(key, {})
+        expected = prop.get("type")
+        if expected in type_map:
+            # bool 是 int 的子类，因此不能通过数值类型的校验。
+            if isinstance(value, bool) and expected in ("integer", "number"):
+                fail(
+                    f"参数 {key} 类型错误，期望 {expected}",
+                    f"Argument {key} has the wrong type; expected {expected}",
+                )
+            if not isinstance(value, type_map[expected]):
+                fail(
+                    f"参数 {key} 类型错误，期望 {expected}",
+                    f"Argument {key} has the wrong type; expected {expected}",
+                )
+        if expected in ("integer", "number") and isinstance(value, (int, float)) and not isinstance(value, bool):
+            minimum = prop.get("minimum")
+            maximum = prop.get("maximum")
+            if minimum is not None and value < minimum:
+                fail(
+                    f"参数 {key} 小于最小值 {minimum}",
+                    f"Argument {key} is below the minimum {minimum}",
+                )
+            if maximum is not None and value > maximum:
+                fail(
+                    f"参数 {key} 大于最大值 {maximum}",
+                    f"Argument {key} is above the maximum {maximum}",
+                )
+        if expected == "array":
+            if not isinstance(value, list):
+                fail(
+                    f"参数 {key} 类型错误，期望 array",
+                    f"Argument {key} has the wrong type; expected array",
+                )
+            min_items = prop.get("minItems")
+            max_items = prop.get("maxItems")
+            if min_items is not None and len(value) < int(min_items):
+                fail(
+                    f"参数 {key} 少于最少项数 {min_items}",
+                    f"Argument {key} has fewer than {min_items} items",
+                )
+            if max_items is not None and len(value) > int(max_items):
+                fail(
+                    f"参数 {key} 超过最多项数 {max_items}",
+                    f"Argument {key} has more than {max_items} items",
+                )
+            item_type = (prop.get("items") or {}).get("type")
+            if item_type in type_map:
+                for index, item in enumerate(value):
+                    if (
+                        isinstance(item, bool)
+                        and item_type in ("integer", "number")
+                    ) or not isinstance(item, type_map[item_type]):
+                        fail(
+                            f"参数 {key}[{index}] 类型错误，期望 {item_type}",
+                            f"Argument {key}[{index}] has the wrong type; "
+                            f"expected {item_type}",
+                        )
+
+
 def inspect_request_context(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
     """通用工具：返回当前请求的脱敏快照。"""
     return {

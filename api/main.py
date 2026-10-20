@@ -180,6 +180,7 @@ async def lifespan(app: FastAPI):
 
         try:
             _retail_runtime = build_retail_runtime()
+            await _retail_runtime.start()
             _skill_manager = _retail_runtime.skill_manager
             _tool_manager = _retail_runtime.tool_manager
             _knowledge_base = _retail_runtime.knowledge_base
@@ -751,6 +752,7 @@ async def _retail_cli() -> None:
         f"数据库 {runtime.config.db_path}"
     )
     try:
+        await runtime.start()
         while True:
             try:
                 message = input("你: ").strip()

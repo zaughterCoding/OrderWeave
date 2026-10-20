@@ -30,6 +30,7 @@ from agents.tools import (
     escalation_tools,
     general_tools,
     technical_tools,
+    validate_tool_input,
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
@@ -207,6 +208,7 @@ class BaseAgent:
     max_tool_rounds: int = 3
     max_tool_uses_per_response: Optional[int] = None
     capture_tool_results: bool = False
+    language: str = "zh"
 
     def __init__(
         self,
@@ -214,6 +216,7 @@ class BaseAgent:
         model: str,
         skill_manager: Optional[Any] = None,
         profile: Optional[AgentProfile] = None,
+        language: Optional[str] = None,
     ):
         self._client = client
         self.profile = profile or self.profile
@@ -221,6 +224,8 @@ class BaseAgent:
         self._skill_manager = skill_manager
         self.stats   = AgentStats()
         self._shared_tools: Dict[str, AgentToolSpec] = {}
+        if language:
+            self.language = str(language).lower()
 
     def get_tools(self) -> Dict[str, AgentToolSpec]:
         """返回该角色可用的工具白名单。"""
@@ -259,7 +264,12 @@ class BaseAgent:
             )
             return AgentResponse(
                 agent_type=self.agent_type,
-                content="抱歉，处理您的请求时出现问题，请稍后重试。",
+                content=(
+                    "Sorry, something went wrong while handling your request. "
+                    "Please try again shortly."
+                    if self.language == "en"
+                    else "抱歉，处理您的请求时出现问题，请稍后重试。"
+                ),
                 success=False,
                 latency_ms=ms,
                 tools_used=list(tools_used),
@@ -271,18 +281,37 @@ class BaseAgent:
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
+        english = self.language == "en"
         messages = []
         if req.context:
-            messages.append({"role": "user", "content": f"[背景信息]\n{_clean(req.context)}"})
-            messages.append({"role": "assistant", "content": "好的，我已了解背景信息。"})
+            label = "[Background]" if english else "[背景信息]"
+            ack = (
+                "Understood, I have reviewed the background information."
+                if english
+                else "好的，我已了解背景信息。"
+            )
+            messages.append({"role": "user", "content": f"{label}\n{_clean(req.context)}"})
+            messages.append({"role": "assistant", "content": ack})
         if req.entities:
             entities_text = json.dumps(req.entities, ensure_ascii=False)
-            messages.append({"role": "user", "content": f"[结构化实体]\n{_clean(entities_text)}"})
-            messages.append({"role": "assistant", "content": "好的，我会结合这些结构化实体处理。"})
+            label = "[Structured entities]" if english else "[结构化实体]"
+            ack = (
+                "Understood, I will use these structured entities."
+                if english
+                else "好的，我会结合这些结构化实体处理。"
+            )
+            messages.append({"role": "user", "content": f"{label}\n{_clean(entities_text)}"})
+            messages.append({"role": "assistant", "content": ack})
         role_packet = self._build_role_packet(req)
         if role_packet:
-            messages.append({"role": "user", "content": f"[角色输入契约]\n{_clean(role_packet)}"})
-            messages.append({"role": "assistant", "content": "好的，我会按照该角色的输入和输出契约处理。"})
+            label = "[Role input contract]" if english else "[角色输入契约]"
+            ack = (
+                "Understood, I will follow this role's input and output contract."
+                if english
+                else "好的，我会按照该角色的输入和输出契约处理。"
+            )
+            messages.append({"role": "user", "content": f"{label}\n{_clean(role_packet)}"})
+            messages.append({"role": "assistant", "content": ack})
         messages.append({"role": "user", "content": _clean(req.message)})
 
         tools = self.get_tools()
@@ -341,12 +370,25 @@ class BaseAgent:
                         skipped = True
                         result: Any = {
                             "success": False,
-                            "error": "每次模型响应最多执行一个工具调用；本次调用未执行。",
+                            "error": (
+                                "At most one tool call may be executed per model "
+                                "response; this call was not executed."
+                                if english
+                                else "每次模型响应最多执行一个工具调用；本次调用未执行。"
+                            ),
                         }
                         error_text = result["error"]
                     elif spec is None:
                         call_success = False
-                        result = {"success": False, "error": f"工具不在 {self.agent_type.value} Agent 白名单中"}
+                        result = {
+                            "success": False,
+                            "error": (
+                                f"Tool is not in the {self.agent_type.value} "
+                                "agent allowlist"
+                                if english
+                                else f"工具不在 {self.agent_type.value} Agent 白名单中"
+                            ),
+                        }
                         error_text = result["error"]
                     else:
                         guard_reason = self._guard_tool_call(
@@ -359,7 +401,9 @@ class BaseAgent:
                             error_text = guard_reason
                         else:
                             try:
-                                self._validate_tool_input(spec, args)
+                                validate_tool_input(
+                                    spec, args, language=self.language
+                                )
                                 result = spec.handler(req, args)
                                 if inspect.isawaitable(result):
                                     result = await result
@@ -447,53 +491,13 @@ class BaseAgent:
         return getattr(block, key, None)
 
     @staticmethod
-    def _validate_tool_input(spec: AgentToolSpec, args: Any) -> None:
-        if not isinstance(args, dict):
-            raise ValueError("工具参数必须是 JSON 对象")
-        schema = spec.input_schema
-        for field_name in schema.get("required", []):
-            if field_name not in args:
-                raise ValueError(f"缺少必需参数: {field_name}")
-        properties = schema.get("properties", {})
-        unknown = set(args) - set(properties)
-        if unknown and schema.get("additionalProperties") is False:
-            raise ValueError(f"不允许的工具参数: {', '.join(sorted(unknown))}")
-        type_map = {"string": str, "number": (int, float), "integer": int, "boolean": bool}
-        for key, value in args.items():
-            prop = properties.get(key, {})
-            expected = prop.get("type")
-            if expected in type_map:
-                # bool 是 int 的子类，因此不能通过数值类型的校验。
-                if isinstance(value, bool) and expected in ("integer", "number"):
-                    raise ValueError(f"参数 {key} 类型错误，期望 {expected}")
-                if not isinstance(value, type_map[expected]):
-                    raise ValueError(f"参数 {key} 类型错误，期望 {expected}")
-            if expected in ("integer", "number") and isinstance(value, (int, float)) and not isinstance(value, bool):
-                minimum = prop.get("minimum")
-                maximum = prop.get("maximum")
-                if minimum is not None and value < minimum:
-                    raise ValueError(f"参数 {key} 小于最小值 {minimum}")
-                if maximum is not None and value > maximum:
-                    raise ValueError(f"参数 {key} 大于最大值 {maximum}")
-            if expected == "array":
-                if not isinstance(value, list):
-                    raise ValueError(f"参数 {key} 类型错误，期望 array")
-                min_items = prop.get("minItems")
-                max_items = prop.get("maxItems")
-                if min_items is not None and len(value) < int(min_items):
-                    raise ValueError(f"参数 {key} 少于最少项数 {min_items}")
-                if max_items is not None and len(value) > int(max_items):
-                    raise ValueError(f"参数 {key} 超过最多项数 {max_items}")
-                item_type = (prop.get("items") or {}).get("type")
-                if item_type in type_map:
-                    for index, item in enumerate(value):
-                        if (
-                            isinstance(item, bool)
-                            and item_type in ("integer", "number")
-                        ) or not isinstance(item, type_map[item_type]):
-                            raise ValueError(
-                                f"参数 {key}[{index}] 类型错误，期望 {item_type}"
-                            )
+    def _validate_tool_input(
+        spec: AgentToolSpec,
+        args: Any,
+        language: str = "zh",
+    ) -> None:
+        """保留原入口；校验实现已提取到 agents.tools 供 MCP 工具端共用。"""
+        validate_tool_input(spec, args, language=language)
 
     def _guard_tool_call(
         self,
@@ -518,17 +522,34 @@ class BaseAgent:
 
     def _build_system_prompt(self, req: Request) -> str:
         """把角色契约与动态 Skills 合并进 system prompt。"""
-        profile_prompt = (
-            f"\n\n[角色契约]\n"
-            f"角色：{self.profile.role}\n"
-            f"职责：{self.profile.mission}\n"
-            f"处理流程：{' -> '.join(self.profile.workflow)}\n"
-            f"可用输入：{'；'.join(self.profile.input_contract)}\n"
-            f"输出要求：{'；'.join(self.profile.output_contract)}\n"
-            f"升级条件：{'；'.join(self.profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
-            f"允许的数据/工具范围：{'、'.join(self.profile.tool_scope) or '仅使用当前请求上下文'}\n"
-            "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
-        )
+        if self.language == "en":
+            profile_prompt = (
+                "\n\n[Role contract]\n"
+                f"Role: {self.profile.role}\n"
+                f"Mission: {self.profile.mission}\n"
+                f"Workflow: {' -> '.join(self.profile.workflow)}\n"
+                f"Available input: {'; '.join(self.profile.input_contract)}\n"
+                f"Output requirements: {'; '.join(self.profile.output_contract)}\n"
+                "Handoff conditions: "
+                f"{'; '.join(self.profile.handoff_conditions) or 'none; follow the general support rules'}\n"
+                "Allowed data/tools: "
+                f"{', '.join(self.profile.tool_scope) or 'only the current request context'}\n"
+                "Do not claim to have performed a query, modification, or "
+                "refund that was not actually performed; if evidence is "
+                "missing, say that verification is needed."
+            )
+        else:
+            profile_prompt = (
+                f"\n\n[角色契约]\n"
+                f"角色：{self.profile.role}\n"
+                f"职责：{self.profile.mission}\n"
+                f"处理流程：{' -> '.join(self.profile.workflow)}\n"
+                f"可用输入：{'；'.join(self.profile.input_contract)}\n"
+                f"输出要求：{'；'.join(self.profile.output_contract)}\n"
+                f"升级条件：{'；'.join(self.profile.handoff_conditions) or '无，按通用客服规则处理'}\n"
+                f"允许的数据/工具范围：{'、'.join(self.profile.tool_scope) or '仅使用当前请求上下文'}\n"
+                "不要声称执行了未提供的查询、修改或退款操作；缺少证据时明确说明需要核验。"
+            )
         base_prompt = f"{self.system_prompt}{profile_prompt}"
         if self._skill_manager is None:
             return base_prompt

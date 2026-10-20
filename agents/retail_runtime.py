@@ -11,11 +11,17 @@ import json
 import logging
 import os
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agents.retail_agent import RetailAgent, RetailService
+from agents.retail_tools import (
+    retail_knowledge_tool,
+    retail_tool_scope,
+    retail_tools,
+)
 from core.skill_loader import SkillManager
 from evaluation.retail_ledger import (
     BudgetedClient,
@@ -23,6 +29,7 @@ from evaluation.retail_ledger import (
     build_budgeted_client,
 )
 from mcp.knowledge_base import KnowledgeBase
+from mcp.retail_client import RetailMCPClient
 from mcp.retail_store import RetailStore
 from mcp.tool_manager import MCPToolManager, Tool
 from memory.conversation_memory import MemoryManager
@@ -79,6 +86,23 @@ def _env_positive_float(name: str) -> float:
     if value <= 0:
         raise RuntimeError(f"{name} 必须大于 0")
     return value
+
+
+def _env_positive_seconds(name: str, default: float) -> float:
+    """MCP 超时必须有限且为正数。"""
+    raw = _env_text(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as ex:
+        raise RuntimeError(f"{name} 不是有效数字: {raw!r}") from ex
+    if value <= 0:
+        raise RuntimeError(f"{name} 必须大于 0")
+    return value
+
+
+def _env_optional_path(name: str) -> Optional[Path]:
+    raw = os.getenv(name, "").strip()
+    return Path(raw).expanduser().resolve() if raw else None
 
 
 def _sha256_file(path: Path) -> str:
@@ -201,6 +225,8 @@ class RetailRuntimeConfig:
     max_tokens: int
     max_message_chars: int
     max_context_chars: int
+    mcp_timeout_seconds: float
+    mcp_stderr_log: Optional[Path]
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -280,6 +306,13 @@ class RetailRuntimeConfig:
             max_context_chars=max(
                 2000, int(_env_text("RETAIL_MAX_CONTEXT_CHARS", "12000"))
             ),
+            mcp_timeout_seconds=_env_positive_seconds(
+                "RETAIL_MCP_TIMEOUT_SECONDS", 30.0
+            ),
+            mcp_stderr_log=(
+                _env_optional_path("RETAIL_MCP_STDERR_LOG")
+                or _PROJECT_ROOT / "data" / "retail" / "mcp_stderr.log"
+            ),
         )
 
 
@@ -295,10 +328,57 @@ class RetailRuntime:
     skill_manager: SkillManager
     agent: RetailAgent
     service: RetailService
+    mcp_client: RetailMCPClient
+    _started: bool = False
+    _closed: bool = False
+
+    async def start(self) -> None:
+        """启动工具子进程并在同一事件循环内装入 MCP 工具白名单。
+
+        失败时关闭本次已打开的资源；未启动时不会回退到进程内直调。
+        """
+        if self._closed:
+            raise RuntimeError("零售运行时已关闭，不能重新启动")
+        if self._started:
+            return
+        try:
+            await self.mcp_client.start()
+            discovered = self.mcp_client.tools()
+            expected = set(retail_tool_scope(has_knowledge=False))
+            if set(discovered) != expected:
+                raise RuntimeError(
+                    "MCP 工具白名单不一致: "
+                    f"{sorted(discovered)} != {sorted(expected)}"
+                )
+            # RAG 仍在主程序原链路执行，其余九个业务工具只通过 MCP 调用。
+            tools = dict(discovered)
+            tools["search_knowledge_base"] = retail_knowledge_tool(
+                self.tool_manager
+            )
+            self.agent.set_shared_tools(tools)
+        except Exception:
+            await self.close()
+            raise
+        self._started = True
 
     async def close(self) -> None:
-        await self.memory.close()
-        await self.client.aclose()
+        """按 MCP、记忆、模型客户端的顺序关闭，单步失败不跳过后续清理。"""
+        if self._closed:
+            return
+        self._closed = True
+        self._started = False
+        try:
+            await self.mcp_client.close()
+        except Exception:
+            logger.exception("关闭 MCP 工具服务失败")
+        try:
+            await self.memory.close()
+        except Exception:
+            logger.exception("关闭记忆服务失败")
+        try:
+            await self.client.aclose()
+        except Exception:
+            logger.exception("关闭模型客户端失败")
 
 
 def build_retail_runtime(
@@ -346,6 +426,18 @@ def build_retail_runtime(
     )
 
     store = RetailStore(config.db_path, config.seed_path)
+    language = store.language
+    mcp_client = RetailMCPClient(
+        db_path=config.db_path,
+        seed_path=config.seed_path,
+        language=language,
+        expected_specs=retail_tools(store, None, language=language),
+        project_root=_PROJECT_ROOT,
+        python_executable=sys.executable,
+        startup_timeout=config.mcp_timeout_seconds,
+        call_timeout=config.mcp_timeout_seconds,
+        stderr_log_path=config.mcp_stderr_log,
+    )
     memory = MemoryManager(
         redis_url=config.redis_url,
         chroma_host=config.chroma_host,
@@ -439,4 +531,5 @@ def build_retail_runtime(
         skill_manager=skill_manager,
         agent=agent,
         service=service,
+        mcp_client=mcp_client,
     )

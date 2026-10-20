@@ -9,6 +9,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import subprocess
 import uuid
 from types import SimpleNamespace
 
@@ -18,6 +20,7 @@ import redis
 from fastapi.testclient import TestClient
 
 import api.main as api_main
+from agents.retail_tools import retail_tool_scope
 from evaluation.retail_ledger import BudgetedClient
 from mcp.retail_store import RetailStore
 
@@ -221,6 +224,7 @@ def _configure_retail(monkeypatch, tmp_path, name: str):
     monkeypatch.setenv("RETAIL_OUTPUT_CNY_PER_MTOK", "1")
     monkeypatch.setenv("RETAIL_PROFILE_ENABLED", "false")
     monkeypatch.setenv("RETAIL_EVENT_LOG", str(tmp_path / "events.jsonl"))
+    monkeypatch.setenv("RETAIL_MCP_STDERR_LOG", str(tmp_path / "mcp_stderr.log"))
     monkeypatch.setenv("RETAIL_RUN_ID", f"t13-{name}")
     monkeypatch.setenv("RETAIL_CASE_ID", "integration")
     monkeypatch.setenv("RETAIL_CLIENT_USER", f"client-{name}")
@@ -260,6 +264,27 @@ def _cleanup(collection: str, suffix: str, prefix: str) -> None:
                 pass
     except Exception:
         pass
+
+
+def _mcp_log(tmp_path) -> str:
+    return (tmp_path / "mcp_stderr.log").read_text(encoding="utf-8")
+
+
+def _mcp_pids(text: str):
+    started = re.findall(r"started pid=(\d+)", text)
+    pids = {int(value) for value in re.findall(r"pid=(\d+)", text)}
+    return started, pids
+
+
+def _assert_process_stopped(pid: int) -> None:
+    result = subprocess.run(
+        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    assert f'"{pid}"' not in result.stdout
 
 
 def test_retail_api_multiturn_display_confirm_and_knowledge(
@@ -389,6 +414,14 @@ def test_retail_api_multiturn_display_confirm_and_knowledge(
             assert third_body["knowledge_used"] is True
             assert "K" in third_body["response"]
 
+            runtime = api_main._retail_runtime
+            assert runtime is not None
+            assert set(runtime.mcp_client.tools()) == set(
+                retail_tool_scope(has_knowledge=False)
+            )
+            assert "search_knowledge_base" in runtime.agent.get_tools()
+            assert runtime.mcp_client.call_count == 4
+
             monitor = client.get("/monitor")
             assert monitor.status_code == 200
             monitor_body = monitor.json()
@@ -396,6 +429,20 @@ def test_retail_api_multiturn_display_confirm_and_knowledge(
             assert len(monitor_body["recent_traces"]) >= 3
             assert monitor_body["budget"]["requests"] > 0
             assert monitor_body["budget"]["reservation_bound_violations"] == 0
+
+        log_text = _mcp_log(tmp_path)
+        started, pids = _mcp_pids(log_text)
+        assert len(started) == 1
+        assert len(pids) == 1
+        for tool_name in (
+            "find_user_id_by_email",
+            "get_order_details",
+            "prepare_return",
+            "return_delivered_order_items",
+        ):
+            assert log_text.count(f"call tool={tool_name} ") == 1
+        assert "call tool=search_knowledge_base" not in log_text
+        _assert_process_stopped(pids.pop())
 
         event_rows = [
             json.loads(line)
@@ -438,6 +485,13 @@ def test_retail_pending_survives_restart_and_confirm_after_reopen(
             assert prepared.status_code == 200
             assert prepared.json()["tools_used"][-1] == "prepare_return"
 
+        log_text = _mcp_log(tmp_path)
+        started, pids = _mcp_pids(log_text)
+        assert len(started) == 1
+        assert len(pids) == 1
+        first_pid = int(started[0])
+        _assert_process_stopped(first_pid)
+
         # 服务完全关闭后重新启动，待确认详情与轮次必须保留。
         with TestClient(api_main.app) as client:
             store = RetailStore(tmp_path / "retail.db", SEED)
@@ -457,6 +511,17 @@ def test_retail_pending_survives_restart_and_confirm_after_reopen(
             order = store.get_order_details(client_user, conv, ORDER)["order"]
             assert order["status"] == "return requested"
             assert order["return_items"] == [ITEM]
+
+        log_text = _mcp_log(tmp_path)
+        started, pids = _mcp_pids(log_text)
+        assert len(started) == 2
+        assert len(pids) == 2
+        assert first_pid in pids
+        assert log_text.count("call tool=prepare_return ") == 1
+        assert log_text.count("call tool=return_delivered_order_items ") == 1
+        assert "call tool=search_knowledge_base" not in log_text
+        for pid in pids:
+            _assert_process_stopped(pid)
     finally:
         _cleanup(collection, suffix, prefix)
 
@@ -503,5 +568,19 @@ def test_retail_cli_uses_same_service_and_writes_return(
             "return_displayed",
             "return_requested",
         ]
+
+        log_text = _mcp_log(tmp_path)
+        started, pids = _mcp_pids(log_text)
+        assert len(started) == 1
+        assert len(pids) == 1
+        for tool_name in (
+            "find_user_id_by_email",
+            "get_order_details",
+            "prepare_return",
+            "return_delivered_order_items",
+        ):
+            assert log_text.count(f"call tool={tool_name} ") == 1
+        assert "call tool=search_knowledge_base" not in log_text
+        _assert_process_stopped(pids.pop())
     finally:
         _cleanup(collection, suffix, prefix)

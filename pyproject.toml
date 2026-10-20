@@ -15,6 +15,7 @@ dependencies = [
     "prometheus-client==0.21.1",
     "httpx==0.28.1",
     "python-dotenv==1.0.1",
+    "mcp==1.12.4",
 ]
 
 [dependency-groups]
