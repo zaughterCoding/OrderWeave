@@ -1,8 +1,8 @@
 {
-  "version": "t18.2",
-  "previous_version": "t18.1",
-  "frozen_at": "2026-10-20T21:12:52+00:00",
-  "revision_note": "离线修复终止与退款去向分支；首次真实运行证据保留，不自动补跑。",
+  "version": "t18.4",
+  "previous_version": "t18.3",
+  "frozen_at": "2026-10-20T23:37:02.613922+00:00",
+  "revision_note": "列表去向问法允许人称指代，分句区分当前询问与后续步骤；用户原文、目标和确认门槛不变。",
   "product_id": "9924732112",
   "issue": "bluetooth_pairing",
   "fixtures": {
@@ -26,7 +26,16 @@
     "model_timeout_seconds": 180,
     "trial_timeout_seconds": 900
   },
-  "run_order": ["S01A", "S01B", "S02B", "S02A", "S03A", "S03B", "S04B", "S04A"],
+  "run_order": [
+    "S01A",
+    "S01B",
+    "S02B",
+    "S02A",
+    "S03A",
+    "S03B",
+    "S04B",
+    "S04A"
+  ],
   "cases": [
     {
       "id": "S01",
@@ -91,7 +100,9 @@
       },
       "expected": {
         "return_operations": 1,
-        "item_ids": ["6452271382"],
+        "item_ids": [
+          "6452271382"
+        ],
         "amount_cents": 25884,
         "payment_method_id": "credit_card_3362387",
         "order_status": "return requested"
@@ -144,11 +155,19 @@
       "expected": {
         "conditional_stage_return_operations": 0,
         "return_operations": 1,
-        "item_ids": ["6452271382"],
+        "item_ids": [
+          "6452271382"
+        ],
         "amount_cents": 25884,
         "payment_method_id": "credit_card_3362387",
         "order_status": "return requested",
-        "restart_preserves": ["taken_steps", "suggestions", "feedback", "unresolved", "demand"]
+        "restart_preserves": [
+          "taken_steps",
+          "suggestions",
+          "feedback",
+          "unresolved",
+          "demand"
+        ]
       }
     },
     {
@@ -177,7 +196,11 @@
         "handoff_events": 1,
         "return_writes": 0,
         "order_writes": 0,
-        "summary_includes": ["已尝试步骤", "未解决", "身份"]
+        "summary_includes": [
+          "已尝试步骤",
+          "未解决",
+          "身份"
+        ]
       }
     }
   ]

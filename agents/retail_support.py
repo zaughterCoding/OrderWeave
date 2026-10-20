@@ -54,6 +54,10 @@ class SupportAnalysis:
     tried_steps: List[Dict[str, str]] = field(default_factory=list)
     return_negative: bool = False
     human_request: bool = False
+    # 当前这句话对进行中退货流程的动作；与 demand_kind 分开，避免把补充回答
+    # 误当成新的技术排查诉求。取值：none、start、provide_info、
+    # related_question、conditional_return、cancel、switch_to_troubleshooting、human。
+    return_flow_action: str = "none"
     relevant: bool = False
     reason: str = ""
 
@@ -100,6 +104,28 @@ _DIRECT_CHOICE_WORDS = (
     "那就退了吧", "还是退了吧", "直接退", "现在就退", "帮我退", "我要退",
     "申请退货", "办理退货", "退了吧",
 )
+_REFUND_DESTINATION_WORDS = (
+    "原支付", "原付款", "原路退回", "原路退", "原卡", "原账户", "原帐户",
+    "礼品卡", "gift card", "original payment",
+)
+_CANCEL_RETURN_WORDS = (
+    "取消退货", "取消退款", "撤销退货", "撤回退货", "取消申请", "不退了",
+    "暂时不退", "先不退", "先别退", "不申请退", "不是要退",
+)
+_SWITCH_TO_TROUBLESHOOTING_WORDS = (
+    "继续排查", "继续排障", "回去排查", "回到排查", "先排查", "先继续排查",
+    "先继续检查", "先继续", "先修", "先解决", "恢复排查",
+)
+_CONFIRMATION_WORDS = (
+    "确认", "提交", "同意", "就按", "按这个", "按这些", "按上述", "没问题",
+)
+_RETURN_FLOW_STATUSES = (
+    "idle", "active", "awaiting_confirmation", "submitted", "cancelled",
+    "switched", "handed_off",
+)
+_RETURN_FLOW_AWAITING = (
+    "", "refund_destination", "return_information", "confirmation",
+)
 _RESOLVED_WORDS = (
     "解决了", "已解决", "好了", "可以了", "连上了", "配对成功", "成功了",
     "正常了", "没问题了", "搞定了",
@@ -140,6 +166,7 @@ def new_support_record(turn: int = 0) -> Dict[str, Any]:
         "retrieved_evidence": [],
         "unresolved": [],
         "demand": {},
+        "return_flow": new_return_flow(),
         "visible_history": [],
         "limit_flags": [],
         "limit_detail": {},
@@ -167,6 +194,7 @@ def _copy_record(record: Optional[Dict[str, Any]], turn: int) -> Dict[str, Any]:
         copied["demand"] = {}
     if not isinstance(copied.get("limit_detail"), dict):
         copied["limit_detail"] = {}
+    copied["return_flow"] = _normalize_return_flow(copied)
     copied["last_turn"] = int(turn)
     return copied
 
@@ -193,15 +221,131 @@ def _is_conditional_return(message: str) -> bool:
     """条件退货只在满足条件时成立，不能当作当前提交授权。"""
     if not _has_return_choice(message):
         return False
-    # 明确的假设连接词或“不行就”句式仍是条件；单纯陈述“还是不行”后
-    # 直接选择退货，属于用户当前选择。
-    if _contains_any(
+    # 只有真实的假设连接词或“不行就”句式才是条件。缺少“我要退”等短语
+    # 本身不构成条件；例如“退回原支付方式”是补充已进行中的退货信息。
+    return _contains_any(
         message,
         ("如果", "要是", "万一", "假如", "解决不了", "搞不定",
          "不行就", "不行再", "再不行"),
+    )
+
+
+def new_return_flow() -> Dict[str, Any]:
+    """退货流程的显式状态；只记录任务阶段，不构成身份或提交授权。"""
+    return {
+        "status": "idle",
+        "awaiting": "",
+        "start_turn": 0,
+        "last_turn": 0,
+        "last_action": "",
+        "closed_reason": "",
+    }
+
+
+def _normalize_return_flow(record: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """读取旧记录时补默认值；旧 stage=return_requested 视为进行中的退货。"""
+    source = record.get("return_flow") if isinstance(record, dict) else None
+    flow = new_return_flow()
+    if isinstance(source, dict):
+        status = str(source.get("status") or "idle")
+        if status not in _RETURN_FLOW_STATUSES:
+            status = "idle"
+        awaiting = str(source.get("awaiting") or "")
+        if awaiting not in _RETURN_FLOW_AWAITING:
+            awaiting = ""
+        flow.update(
+            {
+                "status": status,
+                "awaiting": awaiting,
+                "start_turn": int(source.get("start_turn") or 0),
+                "last_turn": int(source.get("last_turn") or 0),
+                "last_action": str(source.get("last_action") or ""),
+                "closed_reason": str(source.get("closed_reason") or ""),
+            }
+        )
+    if (
+        flow["status"] == "idle"
+        and isinstance(record, dict)
+        and str(record.get("stage") or "") == "return_requested"
     ):
+        # 旧格式没有 return_flow；沿用既有阶段，保证重启后仍能续接。
+        flow["status"] = "active"
+    return flow
+
+
+def _return_flow_active(flow: Dict[str, Any]) -> bool:
+    return str(flow.get("status") or "") in ("active", "awaiting_confirmation")
+
+
+def asks_refund_destination(text: str) -> bool:
+    """识别可见回复中的当前去向询问；业务记录与固定脚本共用同一口径。"""
+    destination = r"(?:退款去向|退款方式|退款路径|退款渠道|原支付|原付款|原路|礼品卡|退回哪里|去向)"
+    request_prefix = (
+        r"(?:请|麻烦|烦请)[^，,；;。！？?\n]{0,8}"
+        r"(?:选择|选|告知|告诉|指定|提供|确认|二选一)"
+        r"|(?:还需(?:要)?|需要)[您你]?[^，,；;。！？?\n]{0,8}(?:指定|选择|选|提供)"
+    )
+    request = (
+        rf"(?:{request_prefix})[^，,；;。！？?\n]{{0,18}}{destination}"
+        rf"|{destination}[^。！？?\n]{{0,25}}(?:二选一|还是|哪一项|哪一种|哪种|哪个|哪一个|请选择|请告知[。！？?]?$)"
+        r"|(?:希望|想)[^。！？?\n]{0,25}(?:退回|退到|退款|原支付|原付款|礼品卡|原路)"
+        r"|(?:退款|退回|退到)[^。！？?\n]{0,12}(?:哪里|哪儿|何处|什么账户)"
+    )
+    clauses = re.findall(r"[^。！？?；;，,\n]+[。！？?；;，,]?", str(text or ""))
+    current = [
+        clause for clause in clauses
+        if not re.search(r"无需|不用|不需要|稍后|之后|以后|已选择|已经选择|已确认", clause)
+    ]
+    if any(re.search(request, clause) for clause in current):
         return True
-    return not _contains_any(message, _DIRECT_CHOICE_WORDS)
+    # 列表式选项与“请告知选择哪一项”常分行，允许同一回复的明确选项指代。
+    return any(re.search(destination, clause) for clause in current) and any(
+        re.search(
+            r"(?:请|麻烦|烦请|告知|告诉我).{0,15}(?:选择|选|决定).{0,8}(?:哪|一项|一个|一种|[12一二①②])"
+            r"|[您你].{0,8}倾向.{0,8}哪", clause,
+        )
+        for clause in current
+        if not re.search(r"商品|订单|数量|颜色|尺码|型号|邮箱|姓名|邮编", clause)
+    )
+
+
+def _assistant_asks_refund_destination(text: str) -> bool:
+    return asks_refund_destination(text)
+
+
+def _assistant_asks_return_information(text: str) -> bool:
+    return asks_return_information(text)
+
+
+def asks_return_information(text: str) -> bool:
+    """只认当前索取身份或目标的信息，不把正文回顾与确认提醒交叉匹配。"""
+    return any(
+        re.search(
+            r"(?:请(?:您|你)?(?:提供|告知|补充|确认|核对)|告诉我|请问(?:您的|你的)?|需要[您你](?:提供|补充|告知))"
+            r"[^。！？?\n]{0,45}(?:邮箱|订单号|订单|商品|item_id|姓名|邮编)", clause,
+        )
+        for clause in re.split(r"[。！？?\n]", str(text or ""))
+        if not re.search(r"无需|不用|不需要|稍后|之后|以后", clause)
+    )
+
+
+def _looks_like_related_pairing_question(message: str) -> bool:
+    if not _contains_any(message, _PAIRING_WORDS):
+        return False
+    return _contains_any(
+        message, ("?", "？", "怎么", "如何", "为什么", "能不能", "是否", "可以吗", "吗")
+    )
+
+
+def _looks_like_independent_question(message: str) -> bool:
+    """识别与当前待补信息无关的独立问题，避免被误当作补充回答。"""
+    return _contains_any(
+        message,
+        (
+            "什么时候", "多久", "怎么还", "为什么", "在哪", "哪里",
+            "如何查询", "能不能查", "可以查", "查一下", "帮我查",
+        ),
+    )
 
 
 def analyze_message(
@@ -230,20 +374,71 @@ def analyze_message(
     resolved = _contains_any(lower, _RESOLVED_WORDS)
     unresolved = _contains_any(lower, _UNRESOLVED_WORDS)
     tried = _step_hits(text)
+    destination = _contains_any(lower, _REFUND_DESTINATION_WORDS)
+    cancel_return = _contains_any(lower, _CANCEL_RETURN_WORDS)
+    switch_troubleshooting = _contains_any(
+        lower, _SWITCH_TO_TROUBLESHOOTING_WORDS
+    )
     has_record = bool(
         isinstance(record, dict)
         and str(record.get("product_id") or "") == SUPPORT_PRODUCT_ID
     )
+    flow = _normalize_return_flow(record) if has_record else new_return_flow()
+    flow_active = bool(has_record and _return_flow_active(flow))
     identity_reference = bool(
         _ORDER_ID_RE.search(lower)
         or _EMAIL_RE.search(text)
         or _LONG_NUMBER_RE.search(lower)
     )
+    # 进行中的退货任务优先于本轮关键词；退出必须由取消、转排查或转人工明确触发。
+    if human:
+        flow_action = "human"
+    elif negative_return or cancel_return:
+        flow_action = (
+            "switch_to_troubleshooting" if switch_troubleshooting else "cancel"
+        )
+    elif switch_troubleshooting and flow_active:
+        flow_action = "switch_to_troubleshooting"
+    elif conditional:
+        flow_action = "conditional_return"
+    elif flow_active:
+        if has_pending and _contains_any(lower, _CONFIRMATION_WORDS):
+            flow_action = "none"
+        elif destination or return_choice or identity_reference:
+            flow_action = "provide_info"
+        elif _looks_like_related_pairing_question(lower):
+            flow_action = "related_question"
+        elif (
+            flow.get("awaiting") in ("refund_destination", "return_information")
+            and len(text) <= 120
+            and not _looks_like_independent_question(lower)
+        ):
+            # 等待必要信息时，短回答视为当前退货任务的补充或澄清，
+            # 由账单角色继续处理；是否提交只由服务端确认规则决定。
+            flow_action = "provide_info"
+        else:
+            flow_action = "none"
+    elif return_choice:
+        flow_action = "start"
+    else:
+        flow_action = "none"
+
+    # 显式等待信息或本轮提供了退货信息才算流程续接；仅凭旧 stage
+    # 不能把无关的独立问题继续注入退货上下文。
+    flow_continuation = bool(
+        flow_active
+        and (
+            flow.get("awaiting")
+            in ("refund_destination", "return_information", "confirmation")
+            or flow_action in ("provide_info", "related_question")
+        )
+    )
     # 只有带明确续接线索的消息才复用旧支持记录，避免把无关订单问题误注入。
     continuation = bool(
         has_record
         and (
-            return_choice
+            flow_continuation
+            or return_choice
             or human
             or resolved
             or unresolved
@@ -260,6 +455,7 @@ def analyze_message(
     result.product_mentioned = explicit or bare
     result.human_request = human
     result.return_negative = negative_return
+    result.return_flow_action = flow_action
     result.tried_steps = tried
 
     if ambiguous_multi:
@@ -311,10 +507,15 @@ def analyze_message(
 
     if human:
         result.demand_kind = "human"
-    elif negative_return:
+    elif flow_action in ("cancel", "switch_to_troubleshooting"):
         result.demand_kind = "none"
-    elif conditional:
+    elif flow_action == "conditional_return":
         result.demand_kind = "conditional_return"
+    elif flow_active and flow_action in ("provide_info", "none"):
+        # 本轮没有新的独立诉求；保留旧 demand.kind=return，表示任务仍在进行。
+        result.demand_kind = "none"
+    elif flow_action == "related_question":
+        result.demand_kind = "troubleshooting"
     elif return_choice:
         result.demand_kind = "return"
     elif resolved and not unresolved:
@@ -485,6 +686,71 @@ def update_support_record(
         and trace.get("result_success") is True
         for trace in tool_traces or []
     )
+    pending = list(pending_after or [])
+    active_pending = [
+        item
+        for item in pending
+        if str(item.get("status") or "") in ("prepared", "displayed")
+    ]
+    flow = _normalize_return_flow(updated)
+    flow_action = str(analysis.return_flow_action or "none")
+    if submitted_trace:
+        flow.update(
+            status="submitted",
+            awaiting="",
+            last_action="submitted",
+            closed_reason="return_submitted",
+        )
+    elif handoff_trace or flow_action == "human":
+        if _return_flow_active(flow):
+            flow.update(status="handed_off", awaiting="")
+        if flow["status"] == "handed_off":
+            flow.update(
+                last_action="human", closed_reason="user_requested_human"
+            )
+    elif flow_action == "cancel":
+        if _return_flow_active(flow) or flow["status"] == "idle":
+            flow.update(
+                status="cancelled",
+                awaiting="",
+                last_action="cancel",
+                closed_reason="user_cancelled",
+            )
+    elif flow_action == "switch_to_troubleshooting":
+        if _return_flow_active(flow) or flow["status"] == "idle":
+            flow.update(
+                status="switched",
+                awaiting="",
+                last_action="switch_to_troubleshooting",
+                closed_reason="user_switched_to_troubleshooting",
+            )
+    elif flow_action == "start":
+        if not _return_flow_active(flow):
+            flow["start_turn"] = int(turn)
+        flow.update(
+            status="active",
+            awaiting="return_information",
+            last_action="start",
+            closed_reason="",
+        )
+    elif flow_action in ("provide_info", "related_question", "none"):
+        if _return_flow_active(flow):
+            flow["last_action"] = flow_action
+    if active_pending and _return_flow_active(flow):
+        flow.update(
+            status="awaiting_confirmation",
+            awaiting="confirmation",
+            last_action="displayed",
+        )
+    elif _return_flow_active(flow):
+        if _assistant_asks_refund_destination(assistant_text):
+            flow["awaiting"] = "refund_destination"
+        elif _assistant_asks_return_information(assistant_text):
+            flow["awaiting"] = "return_information"
+    if flow["status"] != "idle" and flow_action != "none":
+        flow["last_turn"] = int(turn)
+    updated["return_flow"] = flow
+
     if handoff_trace:
         updated["handoff"] = {
             "status": "recorded_mock",
@@ -492,7 +758,17 @@ def update_support_record(
             "note": "未创建真实工单或连接真实坐席",
         }
         updated["stage"] = "handoff_recorded"
-    elif analysis.demand_kind == "return" or submitted_trace:
+    elif flow["status"] in ("cancelled", "switched"):
+        updated["stage"] = (
+            "resolved"
+            if analysis.feedback_kind == "resolved"
+            else "troubleshooting"
+        )
+    elif (
+        flow["status"] in ("active", "awaiting_confirmation", "submitted")
+        or analysis.demand_kind == "return"
+        or submitted_trace
+    ):
         updated["stage"] = "return_requested"
     elif analysis.demand_kind == "resolved" or analysis.feedback_kind == "resolved":
         updated["stage"] = "resolved"
@@ -505,7 +781,6 @@ def update_support_record(
     elif analysis.scope_state == "active":
         updated["stage"] = "troubleshooting"
 
-    pending = list(pending_after or [])
     unresolved: List[str] = []
     if updated["stage"] == "resolved":
         unresolved = []
@@ -516,10 +791,22 @@ def update_support_record(
             unresolved.append("退货详情已展示，等待用户明确确认")
         elif submitted_trace:
             unresolved.append("退货申请已提交（return requested），不代表退款到账")
+        elif flow["status"] == "awaiting_confirmation":
+            unresolved.append("退货详情已展示，等待用户明确确认")
+        elif flow.get("awaiting") == "refund_destination":
+            unresolved.append("退货流程进行中，等待用户补充退款去向")
+        elif flow.get("awaiting") == "return_information":
+            unresolved.append("退货流程进行中，等待用户补充身份、订单或商品信息")
         else:
             unresolved.append("用户已表达退货诉求，需按原业务工具核对身份、订单和详情")
     elif analysis.demand_kind == "conditional_return":
         unresolved.append("用户提出条件退货：若排查无效再选择退货；当前未授权提交")
+    if flow["status"] == "cancelled":
+        unresolved.append("用户取消当前退货流程，未执行提交")
+    elif flow["status"] == "switched":
+        unresolved.append("用户要求暂停退货并继续排查，未执行提交")
+    elif flow["status"] == "handed_off" and not handoff_trace:
+        unresolved.append("用户请求人工；当前未见实际交接事件")
     if analysis.feedback_kind == "unresolved" and updated["stage"] != "resolved":
         unresolved.append("蓝牙配对问题仍未解决")
     if displayed_steps and updated["stage"] in ("awaiting_feedback", "troubleshooting"):
@@ -630,6 +917,12 @@ def build_support_packet(
             "turn": int(turn),
             "source": "user_message",
         },
+        "return_flow": {
+            **_normalize_return_flow(record),
+            "action": analysis.return_flow_action,
+            "turn": int(turn),
+            "source": "host_deterministic_support_analysis",
+        },
         "user_feedback": [
             {
                 "kind": analysis.feedback_kind,
@@ -706,6 +999,7 @@ def handoff_summary_from_packet(
     feedback = record.get("feedback") or []
     unresolved = record.get("unresolved") or []
     stage = record.get("stage") or packet.get("scope_state") or "unknown"
+    flow = _normalize_return_flow(record)
     pending_items = list(pending or packet.get("pending_confirmation") or [])
     if str(language).lower() == "en":
         return _truncate(
@@ -743,6 +1037,10 @@ def handoff_summary_from_packet(
             if feedback else "无记录"
         ),
         "未解决事项：" + ("；".join(str(item) for item in unresolved) or "无记录"),
+        "退货流程：" + (
+            f"{flow.get('status')}；等待：{flow.get('awaiting') or '无'}"
+            if flow.get("status") != "idle" else "无"
+        ),
         "身份状态：以服务端绑定为准（"
         + ("已绑定" if identity.get("bound") else "未绑定")
         + "）",

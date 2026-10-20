@@ -431,6 +431,30 @@ class RetailService:
         )
         if support_blocked:
             analysis = SupportAnalysis(scope_state="inactive")
+        # 取消、转排查或转人工时，先使未提交的待确认详情失效，避免旧详情
+        # 在流程退出后仍被下一轮确认提交。失败沿用显式支持状态错误。
+        if (
+            self.support_enabled
+            and not support_blocked
+            and analysis.return_flow_action
+            in ("cancel", "switch_to_troubleshooting", "human")
+            and pending_before
+        ):
+            try:
+                self.store.cancel_pending(
+                    client_user_id,
+                    conv_id,
+                    f"return_flow_{analysis.return_flow_action}",
+                )
+                pending_before = self.store.active_pending(
+                    client_user_id, conv_id
+                )
+                pending_brief = self._pending_brief(pending_before)
+            except SupportStateError as ex:
+                support_state_error = str(ex)
+                support_blocked = True
+                analysis = SupportAnalysis(scope_state="inactive")
+                logger.warning("取消待确认退货失败: %s", ex)
         support_packet = None
         if self.support_enabled and analysis.relevant and not support_blocked:
             support_packet = build_support_packet(

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agents.agent_orchestrator import AgentType, Request
+from agents.agent_orchestrator import AgentOrchestrator, AgentType, Request
 from agents.retail_agent import RetailAgent
 from agents.retail_multi_agent import RetailBillingAgent, RetailTechnicalAgent
 from agents.retail_runtime import (
@@ -544,6 +544,266 @@ def test_role_packet_and_single_agent_actually_carry_support_record(tmp_path):
     assert "PAIR-01" not in single.system_prompt
     single_packet = json.loads(single._build_role_packet(req))
     assert single_packet["support"]["current_demand"]["kind"] == "human"
+
+
+def _active_return_record(awaiting: str = "refund_destination") -> dict:
+    record = new_support_record(1)
+    record["stage"] = "return_requested"
+    record["demand"] = {
+        "kind": "return",
+        "text": "我要退订单 #W1067251 里的无线耳机",
+        "turn": 1,
+        "source": "user_message",
+    }
+    record["return_flow"] = {
+        "status": "active",
+        "awaiting": awaiting,
+        "start_turn": 1,
+        "last_turn": 1,
+        "last_action": "start",
+        "closed_reason": "",
+    }
+    return record
+
+
+def _support_decision(packet: dict):
+    orchestrator = SimpleNamespace(
+        retail_support_enabled=True,
+        _pool={
+            AgentType.GENERAL: object(),
+            AgentType.TECHNICAL: object(),
+            AgentType.BILLING: object(),
+            AgentType.ESCALATION: object(),
+        },
+    )
+    req = Request(
+        message=str((packet.get("current_demand") or {}).get("text") or ""),
+        user_id="u",
+        conv_id="c",
+        turn=2,
+        retail_support=packet,
+        retail_support_enabled=True,
+    )
+    return AgentOrchestrator._support_routing(orchestrator, req)
+
+
+def test_return_flow_supplement_stays_billing_and_keeps_return_stage():
+    record = _active_return_record()
+    message = "退回原支付方式。请先展示完整退货申请详情。"
+    analysis = analyze_message(message, record, "raj_sanchez_2970", False)
+    assert analysis.scope_state == "active"
+    assert analysis.return_flow_action == "provide_info"
+    assert analysis.demand_kind == "none"
+
+    packet = build_support_packet(
+        record, analysis, message, 2, "raj_sanchez_2970", []
+    )
+    assert packet["return_flow"]["status"] == "active"
+    assert packet["return_flow"]["awaiting"] == "refund_destination"
+    decision = _support_decision(packet)
+    assert decision.primary_agent == AgentType.BILLING
+    assert decision.reason == "support_return_flow_continuation"
+
+    pending = [
+        {
+            "op_id": "OP-1",
+            "order_id": "#W1067251",
+            "items": {"item_ids": ["6452271382"]},
+            "payment_method_id": "credit_card_3362387",
+            "amount": "¥258.84",
+            "status": "displayed",
+        }
+    ]
+    updated = update_support_record(
+        record,
+        analysis,
+        message,
+        2,
+        "【退货申请详情（待确认）】\n订单号：#W1067251",
+        [],
+        pending_after=pending,
+    )
+    assert updated["stage"] == "return_requested"
+    assert updated["demand"]["kind"] == "return"
+    assert updated["return_flow"]["status"] == "awaiting_confirmation"
+    assert updated["return_flow"]["awaiting"] == "confirmation"
+
+
+@pytest.mark.parametrize("reply", [
+    "还差退款去向，请二选一：原支付方式或已有礼品卡。",
+    "退款去向可选（只能二选一）：\n1. 原支付方式\n2. 已有礼品卡\n请告知选择哪一项。",
+])
+def test_destination_question_keeps_stage_despite_order_summary(reply):
+    record = _active_return_record()
+    message = "我的邮箱是 raj.sanchez2046@example.com，订单 #W1067251。"
+    analysis = analyze_message(message, record, None, False)
+    updated = update_support_record(
+        record, analysis, message, 2,
+        "已核对订单和商品。" + reply + "需要您明确确认后才会提交。", [], [],
+    )
+    assert updated["return_flow"]["awaiting"] == "refund_destination"
+
+
+def test_confirmation_reminder_is_not_a_new_information_request():
+    record = _active_return_record()
+    message = "原支付方式。"
+    analysis = analyze_message(message, record, None, False)
+    updated = update_support_record(
+        record, analysis, message, 2,
+        "已核对订单和商品，随后会展示详情；需要您明确确认后才会提交。", [], [],
+    )
+    assert updated["return_flow"]["awaiting"] == "refund_destination"
+
+
+def test_return_flow_cancel_switch_and_human_are_not_permanent_lock():
+    record = _active_return_record()
+
+    cancel = analyze_message("取消退货，先不退了", record, None, False)
+    assert cancel.return_flow_action == "cancel"
+    cancelled = update_support_record(
+        record, cancel, "取消退货，先不退了", 2, "已取消待确认退货。", [], []
+    )
+    assert cancelled["return_flow"]["status"] == "cancelled"
+    assert cancelled["return_flow"]["awaiting"] == ""
+    assert cancelled["return_flow"]["closed_reason"] == "user_cancelled"
+    assert cancelled["stage"] == "troubleshooting"
+
+    switch = analyze_message("我不想退，先继续排查", record, None, False)
+    assert switch.return_flow_action == "switch_to_troubleshooting"
+    assert switch.demand_kind == "none"
+    switched = update_support_record(
+        record, switch, "我不想退，先继续排查", 2, "继续排查。", [], []
+    )
+    assert switched["return_flow"]["status"] == "switched"
+    assert switched["return_flow"]["closed_reason"] == "user_switched_to_troubleshooting"
+
+    human = analyze_message("还是不行，转人工", record, None, False)
+    assert human.return_flow_action == "human"
+    handed = update_support_record(
+        record, human, "还是不行，转人工", 2, "已记录人工交接。", [], []
+    )
+    assert handed["return_flow"]["status"] == "handed_off"
+    assert handed["return_flow"]["closed_reason"] == "user_requested_human"
+
+    # 取消不是永久锁死；用户之后仍可重新发起退货。
+    restarted = analyze_message("那还是退货吧", cancelled, None, False)
+    assert restarted.return_flow_action == "start"
+    reopened = update_support_record(
+        cancelled, restarted, "那还是退货吧", 3, "请提供退货所需信息。", [], []
+    )
+    assert reopened["return_flow"]["status"] == "active"
+    assert reopened["return_flow"]["awaiting"] in (
+        "return_information",
+        "refund_destination",
+    )
+
+
+def test_conditional_return_requires_real_conditional_connective():
+    conditional = analyze_message("如果还不行就退了吧", new_support_record(1), None, False)
+    assert conditional.demand_kind == "conditional_return"
+    assert conditional.return_flow_action == "conditional_return"
+
+    direct = analyze_message(
+        "退回原支付方式。请先展示完整退货申请详情。", new_support_record(1), None, False
+    )
+    assert direct.demand_kind == "return"
+    assert direct.return_flow_action == "start"
+
+    record = _active_return_record()
+    supplement = analyze_message(
+        "退回原支付方式。请先展示完整退货申请详情。", record, None, False
+    )
+    assert supplement.demand_kind == "none"
+    assert supplement.return_flow_action == "provide_info"
+
+    human = analyze_message("转人工", record, None, False)
+    packet = build_support_packet(record, human, "转人工", 2, None, [])
+    assert _support_decision(packet).primary_agent == AgentType.ESCALATION
+
+
+def test_cancel_and_switch_routing_leave_billing_without_business_write():
+    record = _active_return_record()
+    for message, expected_agent, expected_reason in (
+        (
+            "取消退货，先不退了",
+            AgentType.GENERAL,
+            "support_return_flow_cancelled",
+        ),
+        (
+            "我不想退，先继续排查",
+            AgentType.TECHNICAL,
+            "support_return_flow_switched_to_troubleshooting",
+        ),
+    ):
+        analysis = analyze_message(message, record, None, False)
+        packet = build_support_packet(record, analysis, message, 2, None, [])
+        decision = _support_decision(packet)
+        assert decision.primary_agent == expected_agent
+        assert decision.reason == expected_reason
+
+
+def test_return_flow_restart_recovery_reads_sqlite_state(tmp_path):
+    store = _store(tmp_path)
+    record = _active_return_record()
+    store.save_support_state("u1", "c1", record)
+
+    reloaded = store.load_support_state("u1", "c1")
+    assert reloaded["return_flow"]["status"] == "active"
+    analysis = analyze_message(
+        "退回原支付方式。请先展示完整退货申请详情。",
+        reloaded,
+        None,
+        False,
+    )
+    assert analysis.return_flow_action == "provide_info"
+    pending = [
+        {
+            "op_id": "OP-1",
+            "order_id": "#W1067251",
+            "items": {"item_ids": ["6452271382"]},
+            "status": "displayed",
+        }
+    ]
+    updated = update_support_record(
+        reloaded, analysis, "退回原支付方式。", 2, "已生成待确认详情。", [], pending
+    )
+    store.save_support_state("u1", "c1", updated)
+
+    again = store.load_support_state("u1", "c1")
+    assert again["return_flow"]["status"] == "awaiting_confirmation"
+    assert again["return_flow"]["awaiting"] == "confirmation"
+    assert again["stage"] == "return_requested"
+
+
+def test_cancel_pending_invalidates_displayed_details_without_writing_order(tmp_path):
+    store = _store(tmp_path)
+    assert store.find_user_by_email("u", "c", "raj.sanchez2046@example.com")["success"]
+    turn = store.begin_turn("u", "c")
+    prepared = store.prepare_return(
+        "u", "c", "#W1067251", ["6452271382"], "credit_card_3362387"
+    )
+    assert prepared["success"]
+    pending = store.active_pending("u", "c")[0]
+    assert store.mark_pending_displayed(
+        "u", "c", pending["op_id"], turn, False
+    )
+    cancelled = store.cancel_pending("u", "c", "user_cancelled_return")
+    assert cancelled == 1
+    assert store.active_pending("u", "c") == []
+    store.begin_turn("u", "c")
+    result = store.submit_return(
+        "u",
+        "c",
+        "#W1067251",
+        ["6452271382"],
+        "credit_card_3362387",
+        "确认，就按这些申请退货",
+    )
+    assert result["success"] is False
+    assert store.stats()["counts"]["return_operations"] == 0
+    events = store.list_events("u", "c")
+    assert any(item["event_type"] == "return_cancelled" for item in events)
+    assert not any(item["event_type"] == "return_requested" for item in events)
 
 
 def test_runtime_config_fails_explicitly_for_conflicting_support_settings(monkeypatch):

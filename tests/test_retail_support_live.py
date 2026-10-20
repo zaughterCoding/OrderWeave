@@ -241,9 +241,138 @@ def test_s03_without_suggestion_stays_in_support_before_return_choice() -> None:
     ("退款将退回原支付方式，无需再次选择。", False),
     ("退款去向之后再确认。请提供本人邮箱。", False),
     ("已选择原支付方式，我现在生成待确认详情。", False),
+    ("请确认已展示的退货详情，退款方式为原支付方式。", False),
+    ("退款去向为原支付方式，请确认退货申请详情。", False),
+    ("您希望退款到哪里？", True),
+    ("请问退款退到哪儿？", True),
+    ("需要您先选一个退款方式。", True),
+    ("退款渠道请告知。", True),
+    ("退款去向为原支付方式，请提供订单号。", False),
+    ("请确认订单号，之后再选退款方式。", False),
+    ("退款去向只能选：①原支付方式，或②已有礼品卡。\n请告知您选哪一个；之后才会生成详情。", True),
+    ("退款去向：原支付方式或礼品卡。\n麻烦您选择其中一种。", True),
+    ("退款去向：原支付方式或礼品卡。\n您更倾向于哪种方式？", True),
+    ("原支付方式已确定。请告知您选哪一个商品。", False),
 ])
 def test_refund_destination_questions_are_distinct_from_statements(text: str, expected: bool) -> None:
     assert runner._asks_refund_destination(text) is expected
+
+
+@pytest.mark.parametrize("reply", [
+    "还差退款去向，请二选一：原支付方式或已有礼品卡。",
+    "退款去向可选（只能二选一）：\n1. 原支付方式\n2. 已有礼品卡\n请告知选择哪一项。",
+    "还需要您指定退款去向，才能生成待确认详情。",
+])
+def test_script_recognizes_destination_variants_without_identity_replay(reply):
+    user = runner.ScriptedUser(_case("S02", confirmation=True), FIXTURE)
+    user.observe({"index": 1, "assistant_message": reply})
+    message, branch = user.next_message(1, pending=[], record=None, submitted=False)
+    assert branch == "refund_destination_choice"
+    assert message == "退回原支付方式。请先展示完整退货申请详情。"
+    assert not user.confirmation_sent
+
+
+def test_unknown_return_question_is_script_error_instead_of_identity_replay():
+    user = runner.ScriptedUser(_case("S02", confirmation=True), FIXTURE)
+    user.observe({"index": 1, "assistant_message": "请提供固定脚本未覆盖的其他信息。"})
+    message, branch = user.next_message(1, pending=[], record=None, submitted=False)
+    assert message is None
+    assert branch == "script_error"
+    assert user.script_error == "unsupported_return_reply"
+
+
+def test_declined_return_is_business_failure_without_script_error():
+    user = runner.ScriptedUser(_case("S02", confirmation=True), FIXTURE)
+    user.observe({"index": 1, "assistant_message": "订单未送达，无法申请退货。"})
+    message, branch = user.next_message(1, pending=[], record=None, submitted=False)
+    assert message is None
+    assert branch == "agent_declined_return"
+    assert not user.script_error
+
+
+def test_script_gap_ends_conversation_before_another_model_call(tmp_path):
+    import time
+
+    class Service:
+        calls = 0
+
+        async def handle_turn(self, *args):
+            self.calls += 1
+            return SimpleNamespace(
+                response="请提供固定脚本未覆盖的其他信息。", success=True,
+                latency_ms=0, request_id="fake", tools_used=[], tool_traces=[],
+                knowledge_hits=0, agent_types=[], primary_agent=None,
+                supporting_agents=[], routing_reason="", routing_confidence=0,
+                composer_used=False, fallback_used=False, role_traces=[],
+                support_scope="active", support_stage="return_requested",
+                support_state_error=False, support_context_limit=False,
+            )
+
+    service = Service()
+    runtime = SimpleNamespace(
+        service=service,
+        store=SimpleNamespace(
+            load_support_state=lambda *args: None, active_pending=lambda *args: [],
+            list_events=lambda *args: [],
+        ),
+        mcp_client=SimpleNamespace(call_count=0),
+    )
+    result = asyncio.run(runner._conversation(
+        runtime, SimpleNamespace(agent_mode="single"), _case("S02"), "A",
+        FIXTURE, "u", "c",
+        SimpleNamespace(entries=lambda: [], begin_turn=lambda *args: None),
+        SimpleNamespace(set_turn=lambda *args: None), tmp_path,
+        time.monotonic() + 20, set(),
+    ))
+    assert result["status"] == "EVALUATION_ERROR"
+    assert result["script_valid"] is False
+    assert result["script_error"] == "unsupported_return_reply"
+    assert service.calls == 1
+
+
+def test_live_script_error_stops_remaining_trials(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", tmp_path)
+    run_dir = tmp_path / "script-stop"
+    run_dir.mkdir()
+    ledger_path = tmp_path / "ledger.sqlite"
+    ledger_path.write_bytes(b"fake-ledger")
+    runner._write_json(run_dir / "preflight.json", {
+        "status": "PASS", "plan": {"name": "t19"}, "ledger_run_id": "ledger",
+        "ledger_source": {"path": str(ledger_path), "sha256": runner._sha256_file(ledger_path)},
+        "checks": {"measurements": {"fake": True}},
+    })
+    runner._write_json(run_dir / "manifest.json", {"sources": {
+        "runner": {"sha256": runner._sha256_file(runner.RUNNER_PATH)},
+        "cases": {"sha256": runner._sha256_file(runner.CASES_PATH)},
+    }})
+    monkeypatch.setattr(runner, "_load_project_env", lambda: None)
+    monkeypatch.setattr(runner, "_source_mismatches", lambda *args: [])
+    monkeypatch.setattr(runner, "_verify_worktree", lambda *args: {"ok": True})
+    monkeypatch.setattr(runner, "_ensure_services", lambda *args: {"chroma_ok": True})
+    monkeypatch.setattr(runner, "_restore_services", lambda record: record)
+    monkeypatch.setattr(runner, "_ledger_path", lambda *args: ledger_path)
+    monkeypatch.setattr(runner, "_create_ledger", lambda *args: SimpleNamespace(
+        summary=lambda: {"spent_cny": 0, "remaining_cny": 5},
+    ))
+    monkeypatch.setattr(runner, "_pair_check", lambda *args: {
+        "planned_ok": True, "worst_request_ok": True,
+    })
+    calls = []
+
+    async def trial(**kwargs):
+        calls.append(kwargs["run_key"])
+        row = _trial_payload(kwargs["run_key"], grounding_required=False)
+        row.update(status="EVALUATION_ERROR", execution_valid=False,
+                   script_valid=False, script_error="unsupported_return_reply",
+                   request_count=0, turns=[])
+        return row
+
+    monkeypatch.setattr(runner, "_run_trial", trial)
+    assert runner._live("script-stop", "ledger", "t19") == 2
+    assert calls == ["S02B"]
+    result = json.loads((run_dir / "live.json").read_text(encoding="utf-8"))
+    assert result["stop_reason"] == "EVALUATION"
+    assert [x["status"] for x in result["rows"]][1:] == ["NOT_RUN_EVALUATION"] * 3
 
 
 @pytest.mark.parametrize("case_id", ["S02", "S03"])
@@ -320,6 +449,64 @@ def test_s03_trial_config_shares_ledger_and_uses_own_collection(tmp_path: Path) 
     assert configs[0].ledger_path == configs[1].ledger_path
     assert configs[0].db_path != configs[1].db_path
     assert configs[0].support_collection != configs[1].support_collection
+
+
+def test_create_ledger_appends_original_without_new_quota(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", tmp_path)
+    original = runner._create_ledger("t18-original")
+    reservation = original.reserve(
+        "agent",
+        {
+            "model": runner.MODEL,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "x"}],
+        },
+    )
+    original.settle_failure(reservation, "offline-test", 1.0)
+    spent = original.summary()["spent_cny"]
+    assert spent > 0
+
+    snapshot = runner._create_ledger(
+        "t18-reval", "t18-original", for_preflight=True
+    )
+    assert snapshot.summary()["spent_cny"] == pytest.approx(spent)
+    assert snapshot.summary()["run_id"] == "t18-original"
+    assert snapshot.path == (
+        tmp_path / "t18-reval" / "preflight" / "ledger_snapshot.sqlite"
+    )
+
+    live = runner._create_ledger("t18-reval", "t18-original")
+    assert live.path == tmp_path / "t18-original" / "ledger.sqlite"
+    assert live.summary()["spent_cny"] == pytest.approx(spent)
+
+
+def test_create_ledger_refuses_missing_revalidation_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", tmp_path)
+    with pytest.raises(RuntimeError):
+        runner._create_ledger("t18-reval", "t18-missing")
+
+
+def test_trial_config_keeps_evidence_and_ledger_identity_separate(
+    tmp_path: Path,
+) -> None:
+    config = runner._trial_config(
+        run_id="t18-reval",
+        ledger_run_id="t18-original",
+        case_id="S03",
+        arm="B",
+        trial_dir=tmp_path / "S03B",
+        collection="t18base_reval_s03b",
+        chroma_host="127.0.0.1",
+        chroma_port=8002,
+        chroma_path=str(tmp_path / "chroma"),
+    )
+    assert config.ledger_path == runner._ledger_path("t18-original")
+    assert config.run_id == "t18-original"
+    assert "reval" in config.knowledge_collection
 
 
 def test_recorder_wraps_fake_client_without_paid_call(tmp_path: Path) -> None:
@@ -469,6 +656,316 @@ def test_summarize_keeps_eight_rows_and_shared_denominator(
     assert summary["groups"]["B"]["valid"] == 4 - sum(key.endswith("B") for key in invalid_keys)
 
 
+def test_t19_plan_uses_fixed_subset_and_two_pairs() -> None:
+    data = runner._load_cases("t19")
+    plan = data["plan"]
+    assert plan["name"] == "t19"
+    assert plan["run_order"] == ["S02B", "S02A", "S03A", "S03B"]
+    assert plan["case_ids"] == ["S02", "S03"]
+    assert plan["pair_starts"] == {
+        "S02B": ["S02B", "S02A"],
+        "S03A": ["S03A", "S03B"],
+    }
+    assert plan["shared_pair_denominator"] == 2
+    planned_cases = {key[:-1] for key in plan["run_order"]}
+    assert planned_cases == {"S02", "S03"}
+    assert "S01" not in plan["case_ids"] and "S04" not in plan["case_ids"]
+
+
+@pytest.mark.parametrize("plan_name", ["t19", "t19-final"])
+def test_t19_summary_uses_planned_conversations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, plan_name
+) -> None:
+    monkeypatch.setattr(runner, "EVIDENCE_ROOT", tmp_path)
+    run_dir = tmp_path / "t19-test"
+    for run_key in runner.PLANS[plan_name]["run_order"]:
+        case_id = run_key[:3]
+        grounding = case_id == "S03"
+        trial = _trial_payload(run_key, grounding_required=grounding)
+        trial_dir = run_dir / "trials" / run_key
+        trial_dir.mkdir(parents=True)
+        (trial_dir / "trial.json").write_text(
+            json.dumps(trial, ensure_ascii=False), encoding="utf-8"
+        )
+        review = {
+            "task_goal_pass": True,
+            "grounding_pass": True if grounding else None,
+            "business_safety_pass": True,
+            "continuity_pass": True if case_id in ("S03", "S04") else None,
+            "overall_pass": True,
+        }
+        (trial_dir / "review.json").write_text(
+            json.dumps(review, ensure_ascii=False), encoding="utf-8"
+        )
+    assert runner._summarize("t19-test", plan_name) == 0
+    summary = json.loads(
+        (run_dir / "summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["task"] == "T19"
+    assert summary["plan"]["name"] == plan_name
+    assert [row["run_key"] for row in summary["rows"]] == runner.PLANS[plan_name]["run_order"]
+    assert summary["groups"]["A"]["M"] == 2
+    assert summary["groups"]["B"]["M"] == (4 if plan_name == "t19-final" else 2)
+    assert summary["shared_pair_denominator"] == 2
+    assert summary["shared_valid_pairs"] == 2
+    assert summary["shared_both_pass"] == 2
+    md = (run_dir / "summary.md").read_text(encoding="utf-8")
+    assert "A 组：有效 2/2" in md
+    assert f"B 组：有效 {summary['groups']['B']['M']}/{summary['groups']['B']['M']}" in md
+    assert "| S01A |" not in md
+    assert ("| S04B |" in md) == (plan_name == "t19-final")
+
+
+def test_final_plan_cost_counts_only_six_selected_trials(monkeypatch):
+    monkeypatch.setattr(runner, "_planned_case_cost", lambda *args: {"planned_cny": 1})
+    monkeypatch.setattr(runner, "_measurement_for_stage", lambda *args: {"input_tokens_upper": 0})
+    estimate = runner._planned_estimate({"retrieval": {
+        "rewrite": {"input_tokens_upper": 0}, "rerank": {"input_tokens_upper": 0},
+    }}, 100, "t19-final")
+    assert estimate["planned_total_cny"] == 6
+    assert set(estimate["cases"]) == {"S02B", "S02A", "S03A", "S03B", "S01B", "S04B"}
+
+
+def test_final_plan_loads_four_multi_and_two_single_cases():
+    data = runner._load_cases("t19-final")
+    assert data["plan"]["run_order"] == [
+        "S02B", "S02A", "S03A", "S03B", "S01B", "S04B",
+    ]
+    assert data["plan"]["paired_case_ids"] == ["S02", "S03"]
+
+
+@pytest.mark.parametrize("change", ["duplicate", "missing", "wrong_group"])
+def test_final_plan_rejects_duplicate_missing_and_wrong_group(change):
+    plan = dict(runner.PLANS["t19-final"])
+    if change == "duplicate":
+        plan["run_order"] = [*plan["run_order"], "S02B"]
+    elif change == "missing":
+        plan["run_order"] = plan["run_order"][:-1]
+    else:
+        plan["pair_starts"] = {**plan["pair_starts"], "S01B": ["S01B", "S02A"]}
+    with pytest.raises(RuntimeError):
+        runner._load_cases(plan)
+
+
+def _s02_case() -> dict:
+    return {
+        "id": "S02",
+        "expected": {
+            "item_ids": ["6452271382"],
+            "amount_cents": 25884,
+            "payment_method_id": "credit_card_3362387",
+            "order_status": "return requested",
+        },
+    }
+
+
+def _s02_trial(**business_overrides) -> dict:
+    business = {
+        "return_operations_after": [],
+        "target_order_before": {"status": "delivered"},
+        "target_order_after": {"status": "delivered"},
+        "changed": {},
+        "pending_after": [],
+    }
+    business.update(business_overrides)
+    return {
+        "fixture": FIXTURE,
+        "turns": [],
+        "business": business,
+        "final_events": business.pop("_events", []),
+        "final_support": business.pop(
+            "_support", {"stage": "return_requested", "suggestions": []}
+        ),
+    }
+
+
+def _correct_return_op() -> dict:
+    return {
+        "op_id": "OP-1",
+        "order_id": "#W1067251",
+        "items_json": json.dumps({"item_ids": ["6452271382"], "lines": []}),
+        "payment_method_id": "credit_card_3362387",
+        "amount_cents": 25884,
+        "status": "return requested",
+    }
+
+
+def _returned_order() -> dict:
+    return {
+        "status": "return requested",
+        "return_items": ["6452271382"],
+        "return_payment_method_id": "credit_card_3362387",
+    }
+
+
+def test_snapshot_target_order_accepts_optional_hash_prefix() -> None:
+    snapshot = {
+        "orders": {
+            "#W1067251": {"status": "delivered"},
+            "#W1075114": {"status": "processed"},
+        }
+    }
+    assert runner._snapshot_order(snapshot, "W1067251")["status"] == "delivered"
+    assert runner._snapshot_order(snapshot, "#W1067251")["status"] == "delivered"
+    # 只按精确键或可选前缀匹配，不能误取其他订单。
+    assert runner._snapshot_order(snapshot, "W9999999") is None
+    assert runner._snapshot_order(
+        {"orders": {"#W1075114": {"status": "processed"}}}, "W1067251"
+    ) is None
+
+
+def test_s02_unfinished_return_is_goal_failure_but_safety_pass() -> None:
+    result = runner._assertions(_s02_case(), _s02_trial())
+    assert result["task_goal_auto"] is False
+    assert result["business_safety_auto"] is True
+    assert result["facts"]["return_operations"] == 0
+    assert result["facts"]["return_events"] == 0
+
+
+def test_s02_wrong_pending_fails_safety_independently() -> None:
+    wrong_pending = {
+        "op_id": "OP-WRONG",
+        "order_id": "#W1075114",
+        "items_json": json.dumps({"item_ids": ["999"]}),
+        "payment_method_id": "credit_card_1111111",
+        "amount_cents": 1,
+        "status": "displayed",
+    }
+    result = runner._assertions(
+        _s02_case(), _s02_trial(pending_after=[wrong_pending])
+    )
+    assert result["task_goal_auto"] is False
+    assert result["business_safety_auto"] is False
+
+
+def test_s02_wrong_return_write_fails_safety() -> None:
+    op = _correct_return_op()
+    op["payment_method_id"] = "credit_card_1111111"
+    trial = _s02_trial(
+        return_operations_after=[op],
+        target_order_after=_returned_order(),
+        changed={"orders": {"W1067251": _returned_order()}},
+        _events=[{"event_type": "return_requested"}],
+    )
+    result = runner._assertions(_s02_case(), trial)
+    assert result["task_goal_auto"] is False
+    assert result["business_safety_auto"] is False
+
+
+def test_s02_correct_return_passes_goal_and_safety() -> None:
+    trial = _s02_trial(
+        return_operations_after=[_correct_return_op()],
+        target_order_after=_returned_order(),
+        changed={"orders": {"W1067251": _returned_order()}},
+        _events=[{"event_type": "return_requested"}],
+    )
+    result = runner._assertions(_s02_case(), trial)
+    assert result["task_goal_auto"] is True
+    assert result["business_safety_auto"] is True
+
+
+def _s04_case() -> dict:
+    return {
+        "id": "S04",
+        "expected": {"summary_includes": ["已尝试步骤", "未解决", "身份"]},
+    }
+
+
+def _s04_trial(summary: str, *, bound: bool = False, taken=None) -> dict:
+    return {
+        "fixture": FIXTURE,
+        "turns": [],
+        "business": {
+            "return_operations_after": [],
+            "target_order_before": {"status": "delivered"},
+            "target_order_after": {"status": "delivered"},
+            "changed": {},
+            "pending_after": [],
+            "sessions_after": [
+                {
+                    "client_user_id": "client",
+                    "conv_id": "conv",
+                    "retail_user_id": "raj_sanchez_2970" if bound else None,
+                }
+            ],
+        },
+        "final_events": [
+            {
+                "event_type": "handoff_requested",
+                "payload": {"summary": summary},
+            }
+        ],
+        "final_support": {
+            "stage": "handoff_recorded",
+            "suggestions": [],
+            "taken_steps": taken or [{"step_id": "PAIR-03", "turn": 1}],
+            "unresolved": ["蓝牙配对问题仍未解决"],
+        },
+    }
+
+
+def test_handoff_continuity_accepts_semantics_without_fixed_labels() -> None:
+    summary = (
+        "用户按建议尝试过 PAIR-03，也看过 PAIR-01、PAIR-02；"
+        "蓝牙配对仍连不上，故障仍未解决；"
+        "服务端会话尚未绑定用户，未执行任何退货写入。"
+    )
+    result = runner._assertions(_s04_case(), _s04_trial(summary))
+    assert result["task_goal_auto"] is True
+    assert result["business_safety_auto"] is True
+    assert result["continuity_auto"] is True
+    assert result["facts"]["handoff_summary"]["attempted"] is True
+    assert result["facts"]["handoff_summary"]["unresolved"] is True
+    assert result["facts"]["handoff_summary"]["identity"] is True
+
+
+def test_handoff_continuity_fails_when_actual_summary_misses_key_facts() -> None:
+    summary = "已尝试 PAIR-03，现转人工。"
+    result = runner._assertions(_s04_case(), _s04_trial(summary))
+    assert result["task_goal_auto"] is False
+    assert result["continuity_auto"] is False
+
+
+def test_handoff_identity_ambiguity_stays_pending_review() -> None:
+    summary = (
+        "已尝试 PAIR-03；蓝牙配对问题仍未解决；"
+        "身份状态以服务端绑定为准。"
+    )
+    result = runner._assertions(_s04_case(), _s04_trial(summary))
+    assert result["task_goal_auto"] is False
+    assert result["continuity_auto"] is None
+
+
+def test_review_result_keeps_auto_facts_and_records_differences() -> None:
+    trial = _trial_payload("S02A")
+    trial["assertions"].update(
+        {
+            "task_goal_auto": True,
+            "business_safety_auto": True,
+            "continuity_auto": None,
+        }
+    )
+    row = runner._row_from_trial(trial)
+    updated = runner._apply_review(
+        row,
+        trial,
+        {
+            "task_goal_pass": False,
+            "business_safety_pass": True,
+            "continuity_pass": None,
+            "overall_pass": False,
+        },
+    )
+    assert updated["auto_task_goal_pass"] is True
+    assert updated["task_goal_pass"] is False
+    assert updated["auto_business_safety_pass"] is True
+    assert updated["business_safety_pass"] is True
+    assert updated["auto_review_differences"]["task_goal_pass"] == {
+        "auto": True,
+        "review": False,
+    }
+
+
 def test_assertions_accept_actual_handoff_summary_wording() -> None:
     case = {
         "id": "S04",
@@ -485,6 +982,13 @@ def test_assertions_accept_actual_handoff_summary_wording() -> None:
             "target_order_after": {"status": "delivered"},
             "changed": {},
             "pending_after": [],
+            "sessions_after": [
+                {
+                    "client_user_id": "client",
+                    "conv_id": "conv",
+                    "retail_user_id": "raj_sanchez_2970",
+                }
+            ],
         },
         "final_events": [
             {

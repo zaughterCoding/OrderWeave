@@ -1,8 +1,8 @@
-"""T18 有限支持真实小样本对照运行器。
+"""支持场景有限真实小样本对照运行器。
 
-只做四场景、两组各一次的对话，共用一份 5 元账本；预检不调用收费模型。
-脚本用户只根据真实可见回复、已展示待确认详情和 Host 事件推进，不读取
-测试端预期值，也不模拟模型。正式证据写入 data/evaluation/t18-support/。
+T18 四场景与 T19 两个退货场景共用同一套脚本、业务保护和 5 元账本；预检
+不调用收费模型。脚本用户只根据真实可见回复、已展示待确认详情和 Host 事件
+推进，不读取测试端预期值，也不模拟模型。正式证据按 run id 独立存放。
 """
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ CASES_PATH = ROOT / "evaluation" / "data" / "retail_support_live" / "cases.json"
 CASES_README = ROOT / "evaluation" / "data" / "retail_support_live" / "README.md"
 RUNNER_PATH = ROOT / "evaluation" / "run_retail_support_live.py"
 TEST_PATH = ROOT / "tests" / "test_retail_support_live.py"
-SPEC_PATH = ROOT / "docs" / "retail" / "T18-spec-sources.json"
 POLICY_PATH = ROOT / "evaluation" / "data" / "retail_sandbox" / "policy.md"
 SEED_PATH = ROOT / "evaluation" / "data" / "retail_sandbox" / "db.json"
 LEGACY_KNOWLEDGE_PATH = (
@@ -55,13 +54,90 @@ MAX_REQUESTS_PER_TRIAL = 80
 MAX_TOOL_CALLS_PER_TRIAL = 120
 MODEL_TIMEOUT_S = 180.0
 TRIAL_TIMEOUT_S = 900.0
-RUN_ORDER = ["S01A", "S01B", "S02B", "S02A", "S03A", "S03B", "S04B", "S04A"]
-PAIR_STARTS = {
-    "S01A": ["S01A", "S01B"],
-    "S02B": ["S02B", "S02A"],
-    "S03A": ["S03A", "S03B"],
-    "S04B": ["S04B", "S04A"],
+PLANS: Dict[str, Dict[str, Any]] = {
+    "t18": {
+        "name": "t18",
+        "task": "T18",
+        "title": "T18 有限支持小样本",
+        "run_order": [
+            "S01A", "S01B", "S02B", "S02A",
+            "S03A", "S03B", "S04B", "S04A",
+        ],
+        "pair_starts": {
+            "S01A": ["S01A", "S01B"],
+            "S02B": ["S02B", "S02A"],
+            "S03A": ["S03A", "S03B"],
+            "S04B": ["S04B", "S04A"],
+        },
+        "case_ids": ("S01", "S02", "S03", "S04"),
+        "layers": (
+            ("simple", "简单任务", ("S01", "S02")),
+            ("cross_stage", "跨阶段任务", ("S03", "S04")),
+        ),
+        "shared_pair_denominator": 4,
+        "spec_path": ROOT / "docs" / "retail" / "T18-revalidation-sources.json",
+        "notes": [
+            "8 条计划对话、4 个计划配对；只作初步观察，不声称统计显著、"
+            "盲测、完整覆盖或普遍提升。",
+            "A 为单 Agent，B 为规则路由＋确定性节点＋四个角色；差异不等于"
+            "纯多 Agent 因果增益。",
+            "本轮无 UserSimulator、Judge 或额外收费模型；语义复核为执行者复核。",
+        ],
+    },
+    "t19": {
+        "name": "t19",
+        "task": "T19",
+        "title": "T19 退货路由有限真实复验",
+        "run_order": ["S02B", "S02A", "S03A", "S03B"],
+        "pair_starts": {
+            "S02B": ["S02B", "S02A"],
+            "S03A": ["S03A", "S03B"],
+        },
+        "case_ids": ("S02", "S03"),
+        "layers": (
+            ("simple_transaction", "S02 直接退货", ("S02",)),
+            ("cross_stage_restart", "S03 重启后续接退货", ("S03",)),
+        ),
+        "shared_pair_denominator": 2,
+        "spec_path": ROOT / "docs" / "retail" / "T19-revalidation-sources.json",
+        "notes": [
+            "4 条计划对话、2 个计划配对；只判断 S02／S03 的已知退货路由缺陷"
+            "是否关闭，不把未计划的 S01／S04 算作缺失。",
+            "A 为单 Agent，B 为规则路由＋确定性节点＋四个角色；跨轮角色切换"
+            "按实际记录描述，不称为并行协作。",
+            "本轮无 UserSimulator、Judge 或额外收费模型；语义复核为执行者复核。",
+        ],
+    },
 }
+DEFAULT_PLAN = "t18"
+PLANS["t19-final"] = {
+    **PLANS["t19"],
+    "name": "t19-final",
+    "title": "T19 多Agent基线最终验收",
+    "run_order": ["S02B", "S02A", "S03A", "S03B", "S01B", "S04B"],
+    "pair_starts": {
+        "S02B": ["S02B", "S02A"],
+        "S03A": ["S03A", "S03B"],
+        "S01B": ["S01B"],
+        "S04B": ["S04B"],
+    },
+    "case_ids": ("S01", "S02", "S03", "S04"),
+    "paired_case_ids": ("S02", "S03"),
+    "unpaired_run_keys": ("S01B", "S04B"),
+    "layers": (
+        ("simple", "解决与直接退货", ("S01", "S02")),
+        ("cross_stage", "重启退货与人工", ("S03", "S04")),
+    ),
+    "spec_path": ROOT / "docs" / "retail" / "T19-final-freeze.json",
+    "notes": [
+        "6条计划对话：multi四场景，single两条退货兼容对照；只有S02／S03成对。",
+        "同一原5元账本；先冻结后运行，保留全部历史与失败，不宣称总体优势。",
+    ],
+}
+# 保留既有导入名；正式执行以显式 plan 为准。
+RUN_ORDER = list(PLANS["t18"]["run_order"])
+PAIR_STARTS = dict(PLANS["t18"]["pair_starts"])
+SPEC_PATH = PLANS["t18"]["spec_path"]
 GROWTH_INPUT_TOKENS = 3000
 SUPPORT_STEP_IDS = ("PAIR-01", "PAIR-02", "PAIR-03")
 SUPPORT_EVIDENCE_IDS = (
@@ -85,7 +161,7 @@ ALLOWED_NEW_STATUS = (
 )
 # 既有集成测试用相对路径 "unused" 建持久 Chroma，会在仓库根留下该目录。
 TRANSIENT_TEST_STATUS = "?? unused/"
-EXPECTED_HEAD = "aa95e69ea8a36bdfc746d06044a86bfb3c64695f"
+EXPECTED_HEAD = "ac05c71a8a4e0fbac273bbc029a56b084e538682"
 
 PLANNED_CALLS: Dict[str, Dict[str, Dict[str, int]]] = {
     # 计划口径按冻结脚本的最少对话轮估算；只为预检门槛，不是费用承诺。
@@ -130,6 +206,39 @@ STAGE_LIMITS = {
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _resolve_plan(plan: Any = None) -> Dict[str, Any]:
+    """只允许冻结计划；未显式指定时保持 T18 兼容。"""
+    if isinstance(plan, dict):
+        return plan
+    key = str(plan or DEFAULT_PLAN).strip().lower()
+    if key not in PLANS:
+        raise ValueError(f"未知计划: {key!r}")
+    return PLANS[key]
+
+
+def _plan_record(plan: Any = None) -> Dict[str, Any]:
+    item = _resolve_plan(plan)
+    return {
+        "name": item["name"],
+        "task": item["task"],
+        "title": item["title"],
+        "run_order": list(item["run_order"]),
+        "pair_starts": {
+            key: list(value) for key, value in item["pair_starts"].items()
+        },
+        "case_ids": list(item["case_ids"]),
+        "paired_case_ids": list(item.get("paired_case_ids", item["case_ids"])),
+        "unpaired_run_keys": list(item.get("unpaired_run_keys", ())),
+        "layers": [
+            {"key": key, "label": label, "cases": list(cases)}
+            for key, label, cases in item["layers"]
+        ],
+        "shared_pair_denominator": int(item["shared_pair_denominator"]),
+        "spec_path": str(item["spec_path"].relative_to(ROOT)),
+        "notes": list(item["notes"]),
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -205,6 +314,11 @@ def _run_dir(run_id: str) -> Path:
     return EVIDENCE_ROOT / run_id
 
 
+def _ledger_path(ledger_run_id: str) -> Path:
+    """账本仍按原 run 目录存放；复验证据使用独立目录。"""
+    return _run_dir(ledger_run_id) / "ledger.sqlite"
+
+
 def _git(args: List[str]) -> str:
     result = subprocess.run(
         ["git", *args],
@@ -253,8 +367,10 @@ def _is_transient_test_artifact(line: str) -> bool:
     )
 
 
-def _verify_worktree() -> Dict[str, Any]:
-    spec = _load_json(SPEC_PATH)
+def _verify_worktree(plan: Any = None) -> Dict[str, Any]:
+    frozen = _resolve_plan(plan)
+    spec_path = Path(frozen["spec_path"])
+    spec = _load_json(spec_path)
     head = _git(["rev-parse", "HEAD"]).strip()
     status_output = _git(["status", "--porcelain"]).splitlines()
     baseline = list(spec.get("public_worktree_status_before") or [])
@@ -289,6 +405,9 @@ def _verify_worktree() -> Dict[str, Any]:
             mismatches.append(row)
     tracked_count = len(_git(["ls-files"]).splitlines())
     checks = {
+        "plan": frozen["name"],
+        "spec_path": str(spec_path.relative_to(ROOT)),
+        "spec_sha256": _sha256_file(spec_path),
         "head": head,
         "head_matches": head == EXPECTED_HEAD,
         "baseline_missing": missing,
@@ -442,16 +561,52 @@ def _embedding_record() -> Dict[str, Any]:
     }
 
 
-def _load_cases() -> Dict[str, Any]:
+def _load_cases(plan: Any = None) -> Dict[str, Any]:
+    frozen = _resolve_plan(plan)
     data = _load_json(CASES_PATH)
-    if data.get("version") != "t18.2":
-        raise RuntimeError(f"T18 脚本版本不符: {data.get('version')!r}")
+    if data.get("version") != "t18.4":
+        raise RuntimeError(f"支持脚本版本不符: {data.get('version')!r}")
     if data.get("run_order") != RUN_ORDER:
-        raise RuntimeError("T18 固定顺序不符")
+        raise RuntimeError("冻结脚本的固定运行顺序不符")
     cases = {str(item["id"]): item for item in data.get("cases") or []}
     if set(cases) != {"S01", "S02", "S03", "S04"}:
-        raise RuntimeError("T18 必须有 S01—S04 四个案例")
+        raise RuntimeError("冻结脚本必须有 S01—S04 四个案例")
+    paired_cases = frozen.get("paired_case_ids", frozen["case_ids"])
+    unpaired = set(frozen.get("unpaired_run_keys", ()))
+    expected = {
+        f"{case_id}{arm}"
+        for case_id in paired_cases
+        for arm in ("A", "B")
+    } | unpaired
+    if (
+        set(frozen["run_order"]) != expected
+        or len(frozen["run_order"]) != len(expected)
+        or {key[:-1] for key in expected} != set(frozen["case_ids"])
+        or any(key[-1] not in ("A", "B") for key in unpaired)
+        or any(key[:-1] in paired_cases for key in unpaired)
+        or int(frozen["shared_pair_denominator"]) != len(paired_cases)
+    ):
+        raise RuntimeError(f"{frozen['task']} 计划与配对／单独验收范围不符")
+    if any(case_id not in cases for case_id in frozen["case_ids"]):
+        raise RuntimeError(f"{frozen['task']} 引用了冻结脚本中不存在的案例")
+    covered: set[str] = set()
+    for key, pair in frozen["pair_starts"].items():
+        valid_group = (
+            len(pair) == 1 and pair[0] in unpaired
+        ) or (
+            len(pair) == 2 and key[:-1] in paired_cases
+            and set(pair) == {key[:-1] + "A", key[:-1] + "B"}
+        )
+        if (
+            key not in frozen["run_order"] or not valid_group
+            or pair[0] != key or covered.intersection(pair)
+        ):
+            raise RuntimeError(f"{frozen['task']} 配对起点或长度不符: {key}")
+        covered.update(pair)
+    if covered != expected:
+        raise RuntimeError(f"{frozen['task']} 配对未完整覆盖计划案例")
     data["case_map"] = cases
+    data["plan"] = _plan_record(frozen)
     return data
 
 
@@ -478,10 +633,14 @@ def _pricing_snapshot() -> Dict[str, Any]:
     }
 
 
-def _source_manifest(run_id: str, worktree: Dict[str, Any]) -> Dict[str, Any]:
+def _source_manifest(
+    run_id: str, worktree: Dict[str, Any], plan: Any = None
+) -> Dict[str, Any]:
+    frozen = _resolve_plan(plan)
     support_manifest = _load_json(SUPPORT_MANIFEST_PATH)
     return {
-        "task": "T18",
+        "task": frozen["task"],
+        "plan": _plan_record(frozen),
         "run_id": run_id,
         "created_at": _now(),
         "head": worktree.get("head"),
@@ -850,7 +1009,9 @@ def _agent_messages(agent: Any, req: Any) -> List[Dict[str, Any]]:
     return messages
 
 
-def _preflight_measure(cases: Dict[str, Any]) -> Dict[str, Any]:
+def _preflight_measure(
+    cases: Dict[str, Any], plan: Any = None
+) -> Dict[str, Any]:
     import tempfile
 
     from agents.retail_agent import RetailAgent
@@ -870,7 +1031,8 @@ def _preflight_measure(cases: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     policy_text = POLICY_PATH.read_text(encoding="utf-8")
-    case = cases["case_map"]["S01"]
+    frozen = _resolve_plan(plan)
+    case = cases["case_map"][str(frozen["case_ids"][0])]
     message = str(case["script"]["initial"])
     probe = _build_probe_context(message)
     req = probe["request"]
@@ -1059,15 +1221,17 @@ def _planned_case_cost(
 
 
 def _planned_estimate(
-    measurements: Dict[str, Any], remaining_cny: float
+    measurements: Dict[str, Any],
+    remaining_cny: float,
+    plan: Any = None,
 ) -> Dict[str, Any]:
+    frozen = _resolve_plan(plan)
     cases: Dict[str, Any] = {}
     total = 0.0
-    for case_id in ("S01", "S02", "S03", "S04"):
-        for arm in ("A", "B"):
-            item = _planned_case_cost(case_id, arm, measurements)
-            cases[f"{case_id}{arm}"] = item
-            total += item["planned_cny"]
+    for run_key in frozen["run_order"]:
+        item = _planned_case_cost(run_key[:-1], run_key[-1], measurements)
+        cases[run_key] = item
+        total += item["planned_cny"]
     worst = 0.0
     for arm, stages in (
         ("A", ["agent"]),
@@ -1115,31 +1279,63 @@ def _planned_estimate(
     }
 
 
-def _create_ledger(run_id: str):
+def _create_ledger(
+    run_id: str,
+    ledger_run_id: Optional[str] = None,
+    *,
+    for_preflight: bool = False,
+):
+    """打开账本；复验只允许追加既有账本，不新建额度。
+
+    `run_id` 是本次证据目录，`ledger_run_id` 是原 T18 账本身份。两者不同
+    时先复制到预检目录做只读计量，正式执行仍写回原账本。
+    """
     from evaluation.retail_ledger import RetailLedger
 
-    return RetailLedger(
-        path=_run_dir(run_id) / "ledger.sqlite",
+    ledger_run_id = ledger_run_id or run_id
+    source = _ledger_path(ledger_run_id)
+    if ledger_run_id != run_id:
+        if not source.is_file():
+            raise RuntimeError(
+                f"复验账本不存在，拒绝新建额度: {source}"
+            )
+        if for_preflight:
+            snapshot = _run_dir(run_id) / "preflight" / "ledger_snapshot.sqlite"
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, snapshot)
+            path = snapshot
+        else:
+            path = source
+    else:
+        path = source
+    ledger = RetailLedger(
+        path=path,
         budget_cny=BUDGET_CNY,
         input_price_cny_per_mtok=INPUT_CNY_PER_MTOK,
         output_price_cny_per_mtok=OUTPUT_CNY_PER_MTOK,
-        run_id=run_id,
+        run_id=ledger_run_id,
         model=MODEL,
     )
+    return ledger
 
 
-def _preflight(run_id: str) -> int:
+def _preflight(
+    run_id: str,
+    ledger_run_id: Optional[str] = None,
+    plan: Any = None,
+) -> int:
     _load_project_env()
+    frozen = _resolve_plan(plan)
     run_dir = _run_dir(run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
     if (run_dir / "live_started.json").is_file():
         print("已存在 live_started.json；不覆盖正式证据，请用 summarize 读取。")
         return 2
 
-    cases = _load_cases()
+    cases = _load_cases(frozen)
     pricing = _pricing_snapshot()
-    worktree = _verify_worktree()
-    manifest = _source_manifest(run_id, worktree)
+    worktree = _verify_worktree(frozen)
+    manifest = _source_manifest(run_id, worktree, frozen)
     _write_json(run_dir / "manifest.json", manifest)
     _write_json(run_dir / "pricing.json", pricing)
 
@@ -1148,7 +1344,9 @@ def _preflight(run_id: str) -> int:
     blocked_reason = ""
     if not worktree.get("ok"):
         status = "BLOCKED_WORKTREE"
-        blocked_reason = "工作树或受保护文件哈希与 T18 冻结清单不一致"
+        blocked_reason = (
+            f"工作树或受保护文件哈希与 {frozen['task']} 冻结清单不一致"
+        )
     source_mismatches = _source_mismatches(manifest)
     checks["source_mismatches"] = source_mismatches
     if status == "PASS" and source_mismatches:
@@ -1223,7 +1421,7 @@ def _preflight(run_id: str) -> int:
                     blocked_reason = "MCP stdio 九个业务工具预检失败"
             if status == "PASS":
                 try:
-                    measurements = _preflight_measure(cases)
+                    measurements = _preflight_measure(cases, frozen)
                 except Exception as ex:
                     measurements = {"error": str(ex)}
                 checks["measurements"] = measurements
@@ -1231,17 +1429,46 @@ def _preflight(run_id: str) -> int:
                     status = "ENVIRONMENT_BLOCKED"
                     blocked_reason = "请求与 Prompt 测量失败"
 
-    ledger = _create_ledger(run_id)
-    ledger_summary = ledger.summary()
+    ledger_run_id = ledger_run_id or run_id
+    ledger_source = _ledger_path(ledger_run_id)
+    ledger_summary: Dict[str, Any] = {}
+    try:
+        ledger = _create_ledger(
+            run_id, ledger_run_id, for_preflight=True
+        )
+        ledger_summary = ledger.summary()
+        ledger_summary["ledger_path"] = str(ledger_source)
+        if ledger_run_id != run_id:
+            ledger_summary["snapshot_path"] = str(ledger.path)
+    except Exception as ex:
+        if status == "PASS":
+            status = "ENVIRONMENT_BLOCKED"
+            blocked_reason = f"账本衔接检查失败: {ex}"
+    ledger_source_record = {
+        "ledger_run_id": ledger_run_id,
+        "path": str(ledger_source),
+        "exists": ledger_source.is_file(),
+        "sha256": (
+            _sha256_file(ledger_source) if ledger_source.is_file() else ""
+        ),
+        "spent_cny": ledger_summary.get("spent_cny"),
+        "remaining_cny": ledger_summary.get("remaining_cny"),
+        "requests": ledger_summary.get("requests"),
+    }
     checks["ledger"] = ledger_summary
-    plan: Dict[str, Any] = {}
+    checks["ledger_source"] = ledger_source_record
+    estimate: Dict[str, Any] = {}
     if status == "PASS":
-        plan = _planned_estimate(measurements, float(ledger_summary["remaining_cny"]))
-        checks["plan"] = plan
-        if not plan.get("planned_ok"):
+        estimate = _planned_estimate(
+            measurements,
+            float(ledger_summary["remaining_cny"]),
+            frozen,
+        )
+        checks["plan"] = estimate
+        if not estimate.get("planned_ok"):
             status = "BLOCKED_BUDGET_PLAN"
             blocked_reason = "计划费用超过剩余预算的 90%"
-        elif not plan.get("worst_request_ok"):
+        elif not estimate.get("worst_request_ok"):
             status = "BLOCKED_BUDGET_PLAN"
             blocked_reason = "最坏单请求预留超过剩余预算的 50%"
 
@@ -1249,17 +1476,20 @@ def _preflight(run_id: str) -> int:
         "status": status,
         "blocked_reason": blocked_reason,
         "run_id": run_id,
+        "ledger_run_id": ledger_run_id,
+        "ledger_source": ledger_source_record,
         "checked_at": _now(),
         "head": worktree.get("head"),
         "model": MODEL,
         "endpoint": ENDPOINT,
+        "plan": _plan_record(frozen),
         "pricing": pricing,
         "checks": checks,
-        "plan": plan,
+        "estimate": estimate,
         "ledger": ledger_summary,
         "notes": [
             "预检不调用收费模型；UserSimulator 与 Judge 请求数为 0。",
-            "3 元/别或旧余额均未使用；唯一账本预算 5 元。",
+            "沿用唯一账本 5 元硬上限，不新建 run、额度或历史账目。",
         ],
     }
     _write_json(run_dir / "preflight.json", result)
@@ -1268,7 +1498,8 @@ def _preflight(run_id: str) -> int:
         checks["services_after_preflight"] = restored
         _write_json(run_dir / "preflight.json", result)
     print(
-        f"preflight {status}: planned={plan.get('planned_total_cny', '-')} "
+        f"preflight {status}: plan={frozen['name']} "
+        f"planned={estimate.get('planned_total_cny', '-')} "
         f"remaining={ledger_summary.get('remaining_cny')} "
         f"reason={blocked_reason or '-'}",
         flush=True,
@@ -1500,6 +1731,7 @@ def _apply_runtime_adaptations(
 def _trial_config(
     *,
     run_id: str,
+    ledger_run_id: Optional[str] = None,
     case_id: str,
     arm: str,
     trial_dir: Path,
@@ -1513,6 +1745,7 @@ def _trial_config(
     redis_url = os.getenv(
         "REDIS_URL", "redis://:agentecommerce123@127.0.0.1:6380/0"
     )
+    ledger_run_id = ledger_run_id or run_id
     return RetailRuntimeConfig(
         db_path=trial_dir / "retail.sqlite",
         seed_path=SEED_PATH,
@@ -1521,7 +1754,7 @@ def _trial_config(
         knowledge_collection=_collection_name(
             f"t18base_{_run_slug(run_id)}", f"{case_id}{arm}"
         ),
-        ledger_path=_run_dir(run_id) / "ledger.sqlite",
+        ledger_path=_ledger_path(ledger_run_id),
         event_log_path=trial_dir / "events.jsonl",
         budget_cny=BUDGET_CNY,
         input_price_cny_per_mtok=INPUT_CNY_PER_MTOK,
@@ -1533,7 +1766,7 @@ def _trial_config(
         chroma_port=chroma_port,
         chroma_path=Path(chroma_path),
         case_id=f"{case_id}{arm}",
-        run_id=run_id,
+        run_id=ledger_run_id,
         profile_enabled=False,
         memory_key_prefix=f"retail:t18:{_run_slug(run_id)}:{case_id}{arm}:",
         memory_collection_suffix="_t18",
@@ -1603,6 +1836,22 @@ def _read_db_rows(path: Path, table: str) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def _snapshot_order(snapshot: Dict[str, Any], order_id: str = "W1067251") -> Any:
+    """按快照实际键读取目标订单；只接受精确键或可选“#”前缀。"""
+    orders = snapshot.get("orders") if isinstance(snapshot, dict) else None
+    if not isinstance(orders, dict):
+        return None
+    raw = str(order_id or "").strip()
+    if not raw:
+        return None
+    candidates = [raw]
+    candidates.append(raw[1:] if raw.startswith("#") else f"#{raw}")
+    for key in candidates:
+        if key in orders:
+            return orders[key]
+    return None
+
+
 def _business_state(store: Any, client_user: str, conv_id: str) -> Dict[str, Any]:
     snapshot = store.business_snapshot()
     db_path = Path(store.db_path)
@@ -1612,7 +1861,7 @@ def _business_state(store: Any, client_user: str, conv_id: str) -> Dict[str, Any
             json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
         ),
         "target_user": snapshot.get("users", {}).get("raj_sanchez_2970"),
-        "target_order": snapshot.get("orders", {}).get("W1067251"),
+        "target_order": _snapshot_order(snapshot),
         "return_operations": _read_db_rows(db_path, "return_operations"),
         "pending_returns": _read_db_rows(db_path, "pending_returns"),
         "sessions": _read_db_rows(db_path, "sessions"),
@@ -1664,6 +1913,26 @@ def _pending_matches(pending: Dict[str, Any], fixture: Dict[str, Any]) -> bool:
         and int(pending.get("amount_cents") or 0)
         == int(fixture.get("amount_cents") or 0)
         and str(pending.get("payment_method_id") or "")
+        == str(fixture.get("payment_method_id") or "")
+    )
+
+
+def _pending_row_matches(row: Dict[str, Any], fixture: Dict[str, Any]) -> bool:
+    """核对数据库原始 pending 行；不改变业务 ID 合同。"""
+    items = row.get("items")
+    if not isinstance(items, dict):
+        try:
+            items = json.loads(row.get("items_json") or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            items = {}
+    item_ids = [str(item) for item in (items.get("item_ids") or [])]
+    return (
+        _normalize_order_id(row.get("order_id"))
+        == _normalize_order_id(fixture.get("order_id"))
+        and item_ids == [str(fixture.get("item_id"))]
+        and int(row.get("amount_cents") or 0)
+        == int(fixture.get("amount_cents") or 0)
+        and str(row.get("payment_method_id") or "")
         == str(fixture.get("payment_method_id") or "")
     )
 
@@ -1734,17 +2003,9 @@ def _support_search_facts(turns: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _asks_refund_destination(text: str) -> bool:
-    """只识别固定脚本支持的退款去向问法，不把一般核对当选择。"""
-    pattern = (
-        r"请.*(?:选择|告知|告诉|确认|选).*(?:去向|退款方式|退回|原支付|原付款|礼品卡)"
-        r"|(?:希望|想).*(?:退款去向|退回|退到|原支付|原付款|原路|礼品卡)"
-        r"|(?:退款去向|退款方式|退回|退到|原支付方式|原付款方式).*(?:还是|哪|请选择|请确认)"
-    )
-    return any(
-        re.search(pattern, clause)
-        for clause in re.split(r"[。！？?\n]", text)
-        if not re.search(r"无需|不用|不需要|稍后|之后|以后", clause)
-    )
+    from agents.retail_support import asks_refund_destination
+
+    return asks_refund_destination(text)
 
 
 class ScriptedUser:
@@ -1761,6 +2022,7 @@ class ScriptedUser:
         self.return_sent = False
         self.refund_destination_sent = False
         self.support_clarification_used = False
+        self.script_error = ""
         self.restarted = False
         self.turn_assistant: Dict[int, str] = {}
         self.turn_record: Dict[int, Optional[Dict[str, Any]]] = {}
@@ -1848,13 +2110,21 @@ class ScriptedUser:
             self.support_clarification_used = True
             return self._branch("ask_non_repeated_step"), "ask_non_repeated_step"
         if self.case["id"] in ("S02", "S03"):
-            if _asks_refund_destination(self.turn_assistant.get(turn_index, "")):
+            visible = self.turn_assistant.get(turn_index, "")
+            if _asks_refund_destination(visible):
                 if self.refund_destination_sent:
                     return None, "refund_destination_repeated"
                 self.refund_destination_sent = True
                 return self._branch("refund_destination_choice"), "refund_destination_choice"
             if self.refund_destination_sent:
                 return None, "no_pending_after_refund_choice"
+            from agents.retail_support import asks_return_information
+
+            if not asks_return_information(visible):
+                if re.search(r"无法|不能|不支持|不符合|不可|未找到|不属于|没有.{0,12}(?:权限|工具)", visible):
+                    return None, "agent_declined_return"
+                self.script_error = "unsupported_return_reply"
+                return None, "script_error"
             if self.clarification_used:
                 return None, "no_pending"
             self.clarification_used = True
@@ -1955,6 +2225,7 @@ async def _restart_runtime(
 
     before_business = _business_state(runtime.store, client_user, conv_id)
     before_support = runtime.store.load_support_state(client_user, conv_id)
+    before_pending = runtime.store.active_pending(client_user, conv_id)
     last_event_id = 0
     for event in runtime.store.list_events(client_user, conv_id):
         last_event_id = max(last_event_id, int(event["event_id"]))
@@ -1971,9 +2242,11 @@ async def _restart_runtime(
     new_runtime.service._last_event_id[(client_user, conv_id)] = last_event_id
     after_support = new_runtime.store.load_support_state(client_user, conv_id)
     after_business = _business_state(new_runtime.store, client_user, conv_id)
+    after_pending = new_runtime.store.active_pending(client_user, conv_id)
     preserved = {}
     for key in ("taken_steps", "suggestions", "feedback", "unresolved", "demand"):
         preserved[key] = (before_support or {}).get(key) == (after_support or {}).get(key)
+    pending_preserved = before_pending == after_pending
     record = {
         "trigger_turn": turn_index,
         "timings": {
@@ -1985,6 +2258,13 @@ async def _restart_runtime(
         "after_support": after_support,
         "preserved": preserved,
         "preserved_ok": all(preserved.values()),
+        "return_flow_before": (before_support or {}).get("return_flow"),
+        "return_flow_after": (after_support or {}).get("return_flow"),
+        "stage_before": (before_support or {}).get("stage"),
+        "stage_after": (after_support or {}).get("stage"),
+        "pending_before": before_pending,
+        "pending_after": after_pending,
+        "pending_preserved": pending_preserved,
         "before_business": before_business,
         "after_business": after_business,
         "conditional_stage_return_operations": len(
@@ -2082,6 +2362,9 @@ async def _conversation(
         )
         if message is None:
             script_stop_reason = branch
+            if script.script_error:
+                status = "EVALUATION_ERROR"
+                stop_reason = script.script_error
             break
         if len(turns) >= int(case["max_user_turns"]):
             status = "LOOP_LIMIT"
@@ -2208,6 +2491,8 @@ async def _conversation(
         "status": status,
         "stop_reason": stop_reason,
         "script_stop_reason": script_stop_reason,
+        "script_valid": not bool(script.script_error),
+        "script_error": script.script_error,
         "turns": turns,
         "restart": restart,
         "runtime": current,
@@ -2244,6 +2529,97 @@ def _return_op_matches(
 
 def _event_count(events: List[Dict[str, Any]], event_type: str) -> int:
     return sum(1 for item in events if str(item.get("event_type")) == event_type)
+
+
+def _expected_order_matches(order: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    return (
+        bool(order)
+        and str(order.get("status") or "") == str(expected.get("order_status") or "")
+        and sorted(str(item) for item in order.get("return_items") or [])
+        == sorted(str(item) for item in expected.get("item_ids") or [])
+        and str(order.get("return_payment_method_id") or "")
+        == str(expected.get("payment_method_id") or "")
+    )
+
+
+def _changed_order_ids(changed: Dict[str, Any]) -> set[str]:
+    return {
+        _normalize_order_id(key)
+        for key in ((changed or {}).get("orders") or {})
+    }
+
+
+def _handoff_summary_facts(
+    summary: str,
+    record: Dict[str, Any],
+    business: Dict[str, Any],
+) -> Dict[str, Optional[bool]]:
+    """从实际摘要文本核对关键事实；结构化记录只作参照，不替代摘要。"""
+    text = str(summary or "")
+    taken = [
+        str(item.get("step_id") or "")
+        for item in (record.get("taken_steps") or [])
+        if str(item.get("step_id") or "")
+    ]
+    attempted = _contains_text_token(
+        text, ("已尝试", "尝试过", "试过", "已做", "已操作", "试了")
+    )
+    if not attempted:
+        attempted = any(
+            step_id in line
+            and _contains_text_token(line, ("尝试", "试", "已做", "已操作", "用户报告"))
+            for line in text.splitlines()
+            for step_id in taken
+        )
+    unresolved = _contains_text_token(
+        text,
+        (
+            "未解决", "仍未", "仍不", "仍连不上", "问题仍在", "未定位",
+            "没有解决", "未修复", "还没解决", "尚未解决",
+        ),
+    )
+    if not unresolved:
+        for item in record.get("unresolved") or []:
+            value = str(item or "")
+            if value.startswith("已记录模拟人工交接"):
+                continue
+            token = value[:12]
+            if len(token) >= 6 and token in text:
+                unresolved = True
+                break
+
+    rows = business.get("sessions_after") or []
+    bound = bool(rows and rows[0].get("retail_user_id"))
+    mention = _contains_text_token(text, ("身份", "绑定", "关联"))
+    positive = _contains_text_token(
+        text, ("已绑定", "已关联", "绑定为", "已核对身份")
+    )
+    negative = _contains_text_token(
+        text,
+        ("未绑定", "尚未绑定", "未关联", "尚未关联", "未完成身份绑定", "没有绑定"),
+    )
+    if not mention:
+        identity: Optional[bool] = False
+    elif positive and negative:
+        identity = None
+    elif positive:
+        # 摘要称已绑定但服务端无绑定，语义矛盾，留待复核。
+        identity = True if bound else None
+    elif negative:
+        # 摘要称未绑定但服务端已有绑定，同样不自动判通过。
+        identity = True if not bound else None
+    else:
+        identity = None
+    return {
+        "attempted": bool(attempted),
+        "unresolved": bool(unresolved),
+        "identity": identity,
+        "identity_bound": bound,
+    }
+
+
+def _contains_text_token(text: str, tokens: tuple[str, ...]) -> bool:
+    return any(token in text for token in tokens)
 
 
 def _assertions(
@@ -2286,11 +2662,14 @@ def _assertions(
     no_unauthorized_user_product = not any(
         table in changed for table in ("users", "products")
     )
+    target_order_key = _normalize_order_id(fixture.get("order_id"))
+    other_order_changes = _changed_order_ids(changed) - {target_order_key}
     active_pending_after = [
         item
         for item in (business.get("pending_after") or [])
         if str(item.get("status") or "") in ("prepared", "displayed")
     ]
+    handoff_summary: Dict[str, Optional[bool]] = {}
     if case_id == "S01":
         goal = (
             str(final_support.get("stage") or "") == "resolved"
@@ -2309,74 +2688,74 @@ def _assertions(
             and not rejected_events
             and no_unauthorized_user_product
             and not active_pending_after
+            and not other_order_changes
         )
         continuity = None
         grounding_required = True
-    elif case_id == "S02":
+    elif case_id in ("S02", "S03"):
         op_ok = len(ops) == 1 and _return_op_matches(ops[0], expected, fixture)
-        order_ok = (
-            str(order_after.get("status") or "") == expected.get("order_status")
-            and sorted(order_after.get("return_items") or [])
-            == sorted(expected.get("item_ids") or [])
-            and str(order_after.get("return_payment_method_id") or "")
-            == str(expected.get("payment_method_id") or "")
+        order_ok = _expected_order_matches(order_after, expected)
+        pending_mismatch = any(
+            not _pending_row_matches(row, fixture)
+            for row in active_pending_after
         )
-        goal = op_ok and order_ok and return_events == 1 and rejected_events == 0
+        goal_completed = op_ok and order_ok and return_events == 1
+        if goal_completed and active_pending_after:
+            # 已提交后仍有可确认详情，存在重复提交风险。
+            pending_mismatch = True
+        has_return_write = bool(ops) or return_events > 0
+        if has_return_write:
+            order_consistent = (
+                len(ops) == 1
+                and op_ok
+                and return_events == 1
+                and order_changed
+                and order_ok
+                and not other_order_changes
+            )
+        else:
+            order_consistent = not order_changed and not other_order_changes
         safety = (
-            op_ok
-            and order_ok
-            and return_events == 1
+            len(ops) <= 1
+            and (not ops or op_ok)
+            and return_events <= 1
+            and (return_events == 0 or (len(ops) == 1 and op_ok))
+            and order_consistent
+            and not pending_mismatch
             and not rejected_events
             and handoff_events == 0
             and no_unauthorized_user_product
-            and not active_pending_after
         )
-        continuity = None
-        grounding_required = False
-    elif case_id == "S03":
-        op_ok = len(ops) == 1 and _return_op_matches(ops[0], expected, fixture)
-        order_ok = (
-            str(order_after.get("status") or "") == expected.get("order_status")
-            and sorted(order_after.get("return_items") or [])
-            == sorted(expected.get("item_ids") or [])
-            and str(order_after.get("return_payment_method_id") or "")
-            == str(expected.get("payment_method_id") or "")
-        )
-        restart = trial.get("restart") or {}
-        goal = (
-            bool(restart)
-            and bool(restart.get("preserved_ok"))
-            and bool(restart.get("conditional_stage_clean"))
-            and op_ok
-            and order_ok
-            and return_events == 1
-            and rejected_events == 0
-        )
-        safety = (
-            op_ok
-            and order_ok
-            and return_events == 1
-            and not rejected_events
-            and handoff_events == 0
-            and no_unauthorized_user_product
-            and not active_pending_after
-        )
-        continuity = bool(restart) and all(
-            (restart.get("preserved") or {}).values()
-        )
-        grounding_required = True
+        goal = goal_completed
+        if case_id == "S03":
+            restart = trial.get("restart") or {}
+            pending_preserved = bool(restart.get("pending_preserved", True))
+            goal = (
+                goal
+                and bool(restart)
+                and bool(restart.get("preserved_ok"))
+                and bool(restart.get("conditional_stage_clean"))
+                and pending_preserved
+            )
+            continuity = (
+                bool(restart)
+                and all((restart.get("preserved") or {}).values())
+                and pending_preserved
+            )
+            grounding_required = True
+        else:
+            continuity = None
+            grounding_required = False
     else:  # S04
-        summary = str(handoff_payload.get("summary") or "")
-
-        def summary_token_present(token: str) -> bool:
-            # 冻结脚本写作“已尝试步骤”，实际摘要行是“已尝试（用户报告）”。
-            if token == "已尝试步骤":
-                return "已尝试" in summary
-            return token in summary
-
+        handoff_summary = _handoff_summary_facts(
+            str(handoff_payload.get("summary") or ""),
+            final_support,
+            business,
+        )
+        # identity_bound 只是服务端参照事实，不要求摘要复述。
         summary_ok = all(
-            summary_token_present(str(token))
-            for token in (expected.get("summary_includes") or [])
+            handoff_summary.get(key) is True
+            for key in ("attempted", "unresolved", "identity")
         )
         goal = (
             handoff_events == 1
@@ -2386,15 +2765,22 @@ def _assertions(
             and return_events == 0
         )
         safety = (
-            handoff_events == 1
+            handoff_events <= 1
             and not ops
             and not order_changed
             and return_events == 0
+            and not prepared_events
+            and not displayed_events
             and not rejected_events
             and no_unauthorized_user_product
             and not active_pending_after
+            and not other_order_changes
         )
-        continuity = bool(summary_ok)
+        continuity = (
+            None
+            if handoff_summary.get("identity") is None
+            else bool(summary_ok)
+        )
         grounding_required = True
     grounding_auto = True
     if grounding_required:
@@ -2414,7 +2800,9 @@ def _assertions(
             "displayed_events": displayed_events,
             "rejected_events": rejected_events,
             "handoff_events": handoff_events,
+            "handoff_summary": handoff_summary,
             "order_changed": order_changed,
+            "other_order_changes": sorted(other_order_changes),
             "changed_tables": sorted(changed),
             "active_pending_after": len(active_pending_after),
             "search": search_facts,
@@ -2429,6 +2817,7 @@ def _assertions(
 async def _run_trial(
     *,
     run_id: str,
+    ledger_run_id: str,
     run_key: str,
     case: Dict[str, Any],
     arm: str,
@@ -2451,6 +2840,7 @@ async def _run_trial(
     _assert_collection_absent(chroma_client, collection)
     config = _trial_config(
         run_id=run_id,
+        ledger_run_id=ledger_run_id,
         case_id=str(case["id"]),
         arm=arm,
         trial_dir=trial_dir,
@@ -2465,6 +2855,7 @@ async def _run_trial(
     deadline = time.monotonic() + TRIAL_TIMEOUT_S
     result: Dict[str, Any] = {
         "run_id": run_id,
+        "ledger_run_id": ledger_run_id,
         "run_key": run_key,
         "case_id": case["id"],
         "arm": arm,
@@ -2533,6 +2924,8 @@ async def _run_trial(
             result["status"] = conversation["status"]
             result["stop_reason"] = conversation["stop_reason"]
             result["script_stop_reason"] = conversation["script_stop_reason"]
+            result["script_valid"] = conversation["script_valid"]
+            result["script_error"] = conversation["script_error"]
             result["turns"] = conversation["turns"]
             result["restart"] = conversation["restart"]
             result["final_support"] = conversation["final_support"]
@@ -2630,6 +3023,11 @@ def _not_run_row(run_key: str, reason: str) -> Dict[str, Any]:
         "business_safety_pass": None,
         "continuity_pass": None,
         "overall_pass": None,
+        "auto_task_goal_pass": None,
+        "auto_grounding_pass": None,
+        "auto_business_safety_pass": None,
+        "auto_continuity_pass": None,
+        "auto_facts": {},
         "cost_cny": 0.0,
         "requests": 0,
         "input_tokens": 0,
@@ -2651,11 +3049,25 @@ def _row_from_trial(trial: Dict[str, Any]) -> Dict[str, Any]:
         "arm": trial.get("arm"),
         "status": trial.get("status"),
         "execution_valid": bool(trial.get("execution_valid")),
+        "script_valid": trial.get("script_valid", True),
+        "script_error": trial.get("script_error", ""),
         "task_goal_pass": bool(assertions.get("task_goal_auto")),
         "grounding_pass": None,
         "business_safety_pass": bool(assertions.get("business_safety_auto")),
         "continuity_pass": assertions.get("continuity_auto"),
         "overall_pass": None,
+        # 自动判定与人工复核分开留痕，后续复核不覆盖首次自动结果。
+        "auto_task_goal_pass": bool(assertions.get("task_goal_auto")),
+        "auto_grounding_pass": (
+            bool(assertions.get("grounding_auto"))
+            if assertions.get("grounding_required")
+            else None
+        ),
+        "auto_business_safety_pass": bool(
+            assertions.get("business_safety_auto")
+        ),
+        "auto_continuity_pass": assertions.get("continuity_auto"),
+        "auto_facts": assertions.get("facts") or {},
         "cost_cny": round(float((trial.get("cost") or {}).get("total_cny") or 0.0), 6),
         "requests": int(trial.get("request_count") or 0),
         "input_tokens": int(trial.get("input_tokens") or 0),
@@ -2716,8 +3128,13 @@ def _pair_check(
     return check
 
 
-def _live(run_id: str) -> int:
+def _live(
+    run_id: str,
+    ledger_run_id: Optional[str] = None,
+    plan: Any = None,
+) -> int:
     _load_project_env()
+    frozen = _resolve_plan(plan)
     run_dir = _run_dir(run_id)
     preflight_path = run_dir / "preflight.json"
     if not preflight_path.is_file():
@@ -2726,6 +3143,40 @@ def _live(run_id: str) -> int:
     preflight = _load_json(preflight_path)
     if preflight.get("status") != "PASS":
         print(f"preflight 状态不是 PASS: {preflight.get('status')}")
+        return 2
+    preflight_plan = preflight.get("plan") or {}
+    if preflight_plan.get("name") != frozen["name"]:
+        print(
+            "预检计划与 live 请求不一致，拒绝执行: "
+            f"{preflight_plan.get('name')!r} != {frozen['name']!r}"
+        )
+        return 2
+    ledger_run_id = ledger_run_id or run_id
+    if preflight.get("ledger_run_id") != ledger_run_id:
+        print(
+            "账本身份与预检不一致，拒绝执行: "
+            f"{ledger_run_id} != {preflight.get('ledger_run_id')}"
+        )
+        return 2
+    ledger_source = (preflight.get("ledger_source") or {}).get("path") or ""
+    if not ledger_source or not Path(ledger_source).is_file():
+        print("预检记录的账本不存在；拒绝执行。")
+        return 2
+    if _sha256_file(Path(ledger_source)) != (
+        preflight.get("ledger_source") or {}
+    ).get("sha256"):
+        print("预检后原账本已变化；停止，不自动重置额度。")
+        _write_json(
+            run_dir / "live_blocked.json",
+            {
+                "reason": "ledger_changed",
+                "path": ledger_source,
+                "expected_sha256": (
+                    preflight.get("ledger_source") or {}
+                ).get("sha256"),
+                "actual_sha256": _sha256_file(Path(ledger_source)),
+            },
+        )
         return 2
     if (run_dir / "live_started.json").is_file():
         print("已存在 live_started.json；不自动补跑或重置账本。")
@@ -2744,12 +3195,12 @@ def _live(run_id: str) -> int:
         print(f"预检源码清单在 live 前变化: {source_mismatches}")
         _write_json(run_dir / "live_blocked.json", {"source_mismatches": source_mismatches})
         return 2
-    worktree = _verify_worktree()
+    worktree = _verify_worktree(frozen)
     if not worktree.get("ok"):
         print("工作树或受保护文件哈希不一致；停止。")
         _write_json(run_dir / "live_blocked.json", worktree)
         return 2
-    cases = _load_cases()
+    cases = _load_cases(frozen)
     fixture = cases["fixtures"]["main"]
     chroma_host = os.getenv("CHROMA_HOST", "127.0.0.1").strip()
     chroma_port = int(os.getenv("CHROMA_PORT", "8002").strip() or 8002)
@@ -2759,7 +3210,7 @@ def _live(run_id: str) -> int:
     )
     service_record = _ensure_services(chroma_host, chroma_port)
     _write_json(run_dir / "services_live.json", service_record)
-    ledger = _create_ledger(run_id)
+    ledger = _create_ledger(run_id, ledger_run_id)
     ledger_summary = ledger.summary()
     _write_json(run_dir / "ledger_at_start.json", ledger_summary)
     if not service_record.get("chroma_ok"):
@@ -2775,6 +3226,11 @@ def _live(run_id: str) -> int:
         run_dir / "live_started.json",
         {
             "run_id": run_id,
+            "ledger_run_id": ledger_run_id,
+            "plan": _plan_record(frozen),
+            "ledger_source_sha256_before": (
+                preflight.get("ledger_source") or {}
+            ).get("sha256"),
             "started_at": _now(),
             "preflight_sha256": _sha256_file(preflight_path),
             "manifest_runner_sha256": manifest["sources"]["runner"]["sha256"],
@@ -2788,7 +3244,7 @@ def _live(run_id: str) -> int:
         f"t18_{_run_slug(run_id)}", "case"
     )
     try:
-        for run_key in RUN_ORDER:
+        for run_key in frozen["run_order"]:
             case_id = run_key[:-1]
             arm = run_key[-1]
             if stop_reason:
@@ -2799,9 +3255,9 @@ def _live(run_id: str) -> int:
                 stop_reason = "BUDGET"
                 rows.append(_not_run_row(run_key, "NOT_RUN_BUDGET"))
                 continue
-            if run_key in PAIR_STARTS:
+            if run_key in frozen["pair_starts"]:
                 check = _pair_check(
-                    run_id, PAIR_STARTS[run_key], ledger, measurements
+                    run_id, frozen["pair_starts"][run_key], ledger, measurements
                 )
                 if not check["planned_ok"] or not check["worst_request_ok"]:
                     stop_reason = "BUDGET"
@@ -2810,6 +3266,7 @@ def _live(run_id: str) -> int:
             trial = asyncio.run(
                 _run_trial(
                     run_id=run_id,
+                    ledger_run_id=ledger_run_id,
                     run_key=run_key,
                     case=cases["case_map"][case_id],
                     arm=arm,
@@ -2837,15 +3294,28 @@ def _live(run_id: str) -> int:
                 stop_reason = "ENVIRONMENT"
             elif trial["status"] == "ERROR":
                 stop_reason = "ENVIRONMENT"
+            elif trial["status"] == "EVALUATION_ERROR":
+                stop_reason = "EVALUATION"
     finally:
         service_record = _restore_services(service_record)
         _write_json(run_dir / "services_after_live.json", service_record)
         final_ledger = ledger.summary()
         _write_json(run_dir / "ledger_final.json", final_ledger)
+        ledger_after = _ledger_path(ledger_run_id)
         _write_json(
             run_dir / "live.json",
             {
                 "run_id": run_id,
+                "ledger_run_id": ledger_run_id,
+                "plan": _plan_record(frozen),
+                "ledger_source_sha256_before": (
+                    preflight.get("ledger_source") or {}
+                ).get("sha256"),
+                "ledger_source_sha256_after": (
+                    _sha256_file(ledger_after)
+                    if ledger_after.is_file()
+                    else ""
+                ),
                 "status": "PARTIAL" if stop_reason else "COMPLETED",
                 "stop_reason": stop_reason,
                 "rows": rows,
@@ -2855,7 +3325,7 @@ def _live(run_id: str) -> int:
         )
         all_rows = rows + [
             _not_run_row(key, "NOT_RUN_NOT_STARTED")
-            for key in RUN_ORDER[len(rows):]
+            for key in frozen["run_order"][len(rows):]
         ]
         _write_json(
             run_dir / "auto_summary.json",
@@ -2903,6 +3373,22 @@ def _apply_review(
     updated["evaluation_valid"] = (
         bool(updated.get("execution_valid")) and updated["script_valid"] is True
     )
+    updated.setdefault(
+        "auto_task_goal_pass", bool(assertions.get("task_goal_auto"))
+    )
+    updated.setdefault(
+        "auto_grounding_pass",
+        bool(assertions.get("grounding_auto"))
+        if assertions.get("grounding_required")
+        else None,
+    )
+    updated.setdefault(
+        "auto_business_safety_pass",
+        bool(assertions.get("business_safety_auto")),
+    )
+    updated.setdefault("auto_continuity_pass", assertions.get("continuity_auto"))
+    updated.setdefault("auto_facts", assertions.get("facts") or {})
+    differences: Dict[str, Dict[str, Any]] = {}
     if review:
         for key in (
             "task_goal_pass",
@@ -2913,10 +3399,19 @@ def _apply_review(
         ):
             if key in review:
                 updated[key] = review[key]
+                auto_key = f"auto_{key}"
+                if key != "overall_pass" and auto_key in updated:
+                    auto_value = updated.get(auto_key)
+                    if auto_value != review[key]:
+                        differences[key] = {
+                            "auto": auto_value,
+                            "review": review[key],
+                        }
         updated["review_notes"] = review.get("notes", "")
         updated["reviewed_at"] = review.get("reviewed_at", "")
         updated["reviewer"] = review.get("reviewer", "")
         updated["script_error"] = review.get("script_error", "")
+    updated["auto_review_differences"] = differences
     if updated["script_valid"] is not True:
         updated["overall_pass"] = None
         return updated
@@ -2938,13 +3433,14 @@ def _apply_review(
     return updated
 
 
-def _summarize(run_id: str) -> int:
+def _summarize(run_id: str, plan: Any = None) -> int:
+    frozen = _resolve_plan(plan)
     run_dir = _run_dir(run_id)
     if not run_dir.is_dir():
         print(f"证据目录不存在: {run_dir}")
         return 2
     rows: List[Dict[str, Any]] = []
-    for run_key in RUN_ORDER:
+    for run_key in frozen["run_order"]:
         trial_dir = run_dir / "trials" / run_key
         if not (trial_dir / "trial.json").is_file():
             rows.append(_not_run_row(run_key, "NOT_RUN_MISSING"))
@@ -2959,7 +3455,7 @@ def _summarize(run_id: str) -> int:
         arm_rows = [item for item in rows if item["arm"] == arm]
         valid = [item for item in arm_rows if item.get("evaluation_valid")]
         groups[arm] = {
-            "M": 4,
+            "M": len(arm_rows),
             "valid": len(valid),
             "task_goal_pass": sum(
                 1 for item in valid if item.get("task_goal_pass") is True
@@ -2971,10 +3467,9 @@ def _summarize(run_id: str) -> int:
             "rows": len(arm_rows),
         }
     layers: Dict[str, Dict[str, Any]] = {}
-    for layer, case_ids in (
-        ("simple", ("S01", "S02")),
-        ("cross_stage", ("S03", "S04")),
-    ):
+    layer_order: List[str] = []
+    for layer, label, case_ids in frozen["layers"]:
+        layer_order.append(layer)
         for arm in ("A", "B"):
             selected = [
                 item
@@ -2983,6 +3478,7 @@ def _summarize(run_id: str) -> int:
             ]
             valid = [item for item in selected if item.get("evaluation_valid")]
             layers[f"{layer}_{arm}"] = {
+                "label": label,
                 "cases": list(case_ids),
                 "valid": len(valid),
                 "overall_pass": sum(
@@ -2991,7 +3487,7 @@ def _summarize(run_id: str) -> int:
                 "overall_denominator": len(valid),
             }
     pairs = []
-    for case_id in ("S01", "S02", "S03", "S04"):
+    for case_id in frozen.get("paired_case_ids", frozen["case_ids"]):
         a = next(item for item in rows if item["case_id"] == case_id and item["arm"] == "A")
         b = next(item for item in rows if item["case_id"] == case_id and item["arm"] == "B")
         both_valid = bool(a.get("evaluation_valid")) and bool(b.get("evaluation_valid"))
@@ -3021,8 +3517,10 @@ def _summarize(run_id: str) -> int:
             reasons.append(f"{item['run_key']}: 脚本无效 {item.get('script_error') or ''}")
         elif item.get("overall_pass") is None:
             reasons.append(f"{item['run_key']}: 语义复核未完成或字段缺失")
+    denominator = int(frozen["shared_pair_denominator"])
     summary = {
-        "task": "T18",
+        "task": frozen["task"],
+        "plan": _plan_record(frozen),
         "run_id": run_id,
         "generated_at": _now(),
         "status": status,
@@ -3030,22 +3528,19 @@ def _summarize(run_id: str) -> int:
         "rows": rows,
         "groups": groups,
         "layers": layers,
+        "layer_order": layer_order,
         "pairs": pairs,
         "shared_valid_pairs": valid_pairs,
         "shared_both_pass": both_pass,
-        "shared_pair_denominator": 4,
+        "shared_pair_denominator": denominator,
         "total_cost_cny": total_cost,
-        "notes": [
-            "4 个样本只作初步观察；不声称统计显著、盲测、完整覆盖或普遍提升。",
-            "A 为单 Agent，B 为规则路由＋确定性节点＋四个角色；差异不等于纯多 Agent 因果增益。",
-            "本轮无 UserSimulator、Judge 或额外收费模型；语义复核为执行者复核。",
-        ],
+        "notes": list(frozen["notes"]),
     }
     _write_json(run_dir / "summary.json", summary)
     _write_summary_md(run_dir / "summary.md", summary)
     print(
-        f"summarize {status}: valid_pairs={valid_pairs}/4 both_pass={both_pass}/4 "
-        f"cost={total_cost}",
+        f"summarize {status}: valid_pairs={valid_pairs}/{denominator} "
+        f"both_pass={both_pass}/{denominator} cost={total_cost}",
         flush=True,
     )
     return 0 if status == "EXPLORATORY_COMPLETE" else 2
@@ -3053,8 +3548,10 @@ def _summarize(run_id: str) -> int:
 
 def _write_summary_md(path: Path, summary: Dict[str, Any]) -> None:
     rows = summary.get("rows") or []
+    plan = summary.get("plan") or {}
+    denominator = int(summary["shared_pair_denominator"])
     lines = [
-        f"# T18 有限支持小样本（{summary['run_id']}）",
+        f"# {plan.get('title') or summary.get('task')}（{summary['run_id']}）",
         "",
         f"状态：`{summary['status']}`",
         "",
@@ -3087,22 +3584,24 @@ def _write_summary_md(path: Path, summary: Dict[str, Any]) -> None:
         "",
         "## 分组与分层",
         "",
-        f"- A 组：有效 {summary['groups']['A']['valid']}/4，目标通过 "
-        f"{summary['groups']['A']['task_goal_pass']}，总体通过 "
+        f"- A 组：有效 {summary['groups']['A']['valid']}/{summary['groups']['A']['M']}，"
+        f"目标通过 {summary['groups']['A']['task_goal_pass']}，总体通过 "
         f"{summary['groups']['A']['overall_pass']}/{summary['groups']['A']['overall_denominator']}。",
-        f"- B 组：有效 {summary['groups']['B']['valid']}/4，目标通过 "
-        f"{summary['groups']['B']['task_goal_pass']}，总体通过 "
+        f"- B 组：有效 {summary['groups']['B']['valid']}/{summary['groups']['B']['M']}，"
+        f"目标通过 {summary['groups']['B']['task_goal_pass']}，总体通过 "
         f"{summary['groups']['B']['overall_pass']}/{summary['groups']['B']['overall_denominator']}。",
-        f"- 简单任务：A {summary['layers']['simple_A']['overall_pass']}/"
-        f"{summary['layers']['simple_A']['overall_denominator']}，B "
-        f"{summary['layers']['simple_B']['overall_pass']}/"
-        f"{summary['layers']['simple_B']['overall_denominator']}。",
-        f"- 跨阶段任务：A {summary['layers']['cross_stage_A']['overall_pass']}/"
-        f"{summary['layers']['cross_stage_A']['overall_denominator']}，B "
-        f"{summary['layers']['cross_stage_B']['overall_pass']}/"
-        f"{summary['layers']['cross_stage_B']['overall_denominator']}。",
-        f"- 四格配对：有效 {summary['shared_valid_pairs']}/4，两边总体均通过 "
-        f"{summary['shared_both_pass']}/4。",
+    ]
+    for layer in summary.get("layer_order") or []:
+        a = summary["layers"][f"{layer}_A"]
+        b = summary["layers"][f"{layer}_B"]
+        lines.append(
+            f"- {a.get('label') or layer}：A {a['overall_pass']}/"
+            f"{a['overall_denominator']}，B {b['overall_pass']}/"
+            f"{b['overall_denominator']}。"
+        )
+    lines += [
+        f"- 配对：有效 {summary['shared_valid_pairs']}/{denominator}，"
+        f"两边总体均通过 {summary['shared_both_pass']}/{denominator}。",
         "",
         "## 口径",
         "",
@@ -3110,7 +3609,7 @@ def _write_summary_md(path: Path, summary: Dict[str, Any]) -> None:
         "业务安全由执行者按真实对话、工具结果、SQLite 与事件复核。",
         "- 有效分母同时要求正常结束及脚本未被复核判为无效；validity.json中的"
         "脚本缺口优先于正常结束和其他通过字段。",
-        "- 4 个样本不用于统计显著、稳定性 P95、盲测或普遍提升结论。",
+        "- 计划范围只覆盖上方列出的案例与配对；未计划案例不计入分母。",
         "- 本轮未调用 UserSimulator、Judge 或额外收费模型。",
         "",
     ]
@@ -3118,9 +3617,20 @@ def _write_summary_md(path: Path, summary: Dict[str, Any]) -> None:
 
 
 def _parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="T18 有限支持真实小样本")
+    parser = argparse.ArgumentParser(description="支持场景有限真实小样本")
     parser.add_argument("command", choices=("preflight", "live", "summarize"))
     parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--plan",
+        choices=tuple(PLANS),
+        default=DEFAULT_PLAN,
+        help="冻结运行计划；T19 复验必须显式使用 t19",
+    )
+    parser.add_argument(
+        "--ledger-run-id",
+        default="",
+        help="复用既有 T18 账本的 run id；复验必须显式指定且不得新建额度",
+    )
     return parser.parse_args(argv)
 
 
@@ -3132,11 +3642,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         pass
     args = _parse_args(argv)
     run_id = _run_id(args.run_id)
+    ledger_run_id = _run_id(args.ledger_run_id) if args.ledger_run_id else None
     if args.command == "preflight":
-        return _preflight(run_id)
+        return _preflight(run_id, ledger_run_id, args.plan)
     if args.command == "live":
-        return _live(run_id)
-    return _summarize(run_id)
+        return _live(run_id, ledger_run_id, args.plan)
+    return _summarize(run_id, args.plan)
 
 
 if __name__ == "__main__":

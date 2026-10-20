@@ -1263,7 +1263,13 @@ class AgentOrchestrator:
 
         # 复杂请求可能涉及多个 Agent，例如同一条消息里既有登录失败
         # 又有重复扣款。
-        decision = self._support_routing(req) or self._route_decision(req)
+        support_decision = self._support_routing(req)
+        decision = support_decision or self._route_decision(req)
+        flow_exit_reasons = {
+            "support_return_flow_cancelled",
+            "support_return_flow_switched_to_troubleshooting",
+            "support_user_requested_human_handoff",
+        }
         if (
             retail_mode
             and req.retail_pending
@@ -1271,6 +1277,11 @@ class AgentOrchestrator:
                 IntentCategory.ESCALATION,
                 IntentCategory.HUMAN_HANDOFF,
             )
+            and not (
+                support_decision is not None
+                and support_decision.reason in flow_exit_reasons
+            )
+            and decision.primary_agent != AgentType.ESCALATION
             and self._pool.get(AgentType.BILLING)
         ):
             # 已展示待确认详情时，只允许账单角色处理，且不再并行辅助角色。
@@ -1505,18 +1516,57 @@ class AgentOrchestrator:
         demand_kind = str(demand.get("kind") or "none")
         record = packet.get("work_record") or {}
         stage = str(record.get("stage") or "")
-        if demand_kind == "human":
+        flow = packet.get("return_flow") or {}
+        flow_status = str(flow.get("status") or "idle")
+        flow_action = str(flow.get("action") or "none")
+        flow_active = flow_status in ("active", "awaiting_confirmation")
+        if demand_kind == "human" or flow_action == "human":
             return RoutingDecision(
                 primary_agent=AgentType.ESCALATION,
                 supporting_agents=[],
                 reason="support_user_requested_human_handoff",
                 confidence=1.0,
             )
+        if flow_action == "switch_to_troubleshooting":
+            return RoutingDecision(
+                primary_agent=AgentType.TECHNICAL,
+                supporting_agents=[],
+                reason="support_return_flow_switched_to_troubleshooting",
+                confidence=0.95,
+            )
+        if flow_action == "cancel":
+            return RoutingDecision(
+                primary_agent=AgentType.GENERAL,
+                supporting_agents=[],
+                reason="support_return_flow_cancelled",
+                confidence=0.95,
+            )
         if demand_kind == "return":
             return RoutingDecision(
                 primary_agent=AgentType.BILLING,
                 supporting_agents=[],
                 reason="support_user_currently_chose_return",
+                confidence=0.95,
+            )
+        if (
+            flow_active
+            and flow_action == "related_question"
+            and self._pool.get(AgentType.TECHNICAL)
+        ):
+            # 暂时询问相关排查问题不结束退货流程；状态仍保留在支持记录中。
+            return RoutingDecision(
+                primary_agent=AgentType.TECHNICAL,
+                supporting_agents=[],
+                reason="support_return_flow_related_question",
+                confidence=0.85,
+            )
+        if flow_active and flow_action != "conditional_return":
+            # 退货流程已开始且未明确退出时，补充信息、确认或追问都继续由
+            # 账单角色处理；本轮的“当前诉求”不能覆盖进行中的任务。
+            return RoutingDecision(
+                primary_agent=AgentType.BILLING,
+                supporting_agents=[],
+                reason="support_return_flow_continuation",
                 confidence=0.95,
             )
         if demand_kind == "conditional_return":

@@ -326,9 +326,76 @@ class SupportFakeMessages:
         return _text("已收到。请补充无线耳机蓝牙问题的实际现象或退货所需身份信息。")
 
 
+class ReturnFlowFakeMessages(SupportFakeMessages):
+    """T19 用 Fake：先询问退款去向，补充后再准备，不把去向选择当提交。"""
+
+    destination_question = "已核对本人订单。请确认退款去向：退回原支付方式，还是退到当前账户已有的礼品卡？"
+
+    def _agent_response(self, messages):
+        result = _last_tool_result(messages)
+        if result is not None:
+            if result.get("success") and result.get("handoff_id"):
+                return super()._agent_response(messages)
+            if result.get("success") and "order" in result:
+                return _text(self.destination_question)
+            if result.get("success") and "display_text" in result:
+                self.pending_args = {
+                    "order_id": ORDER,
+                    "item_ids": [ITEM],
+                    "payment_method_id": result.get("payment_method_id", ""),
+                }
+                self.displayed_text = result["display_text"]
+                return _text(
+                    "请核对以下退货详情，确认后我再提交。\n\n"
+                    + result["display_text"]
+                )
+            if result.get("success") and result.get("status") == "return requested":
+                self.pending_args = None
+                return _text(
+                    "已提交退货申请，订单状态为 return requested。"
+                    "这不代表退款已到账、邮件已发送或仓库已收货。"
+                )
+            if result.get("success") and "user_id" in result:
+                return _tool_use(
+                    "get_order_details",
+                    {"order_id": ORDER},
+                    self._next_id(),
+                )
+            return super()._agent_response(messages)
+
+        message = str(_current_user_message(messages) or "")
+        if self.pending_args and "确认" in message and "取消" not in message:
+            return _tool_use(
+                "return_delivered_order_items",
+                dict(self.pending_args),
+                self._next_id(),
+            )
+        if (
+            any(word in message for word in ("原支付", "原路", "礼品卡"))
+            and "@" not in message
+            and "#W" not in message
+        ):
+            return _tool_use(
+                "prepare_return",
+                {
+                    "order_id": ORDER,
+                    "item_ids": [ITEM],
+                    "payment_method_id": "credit_card_3362387",
+                },
+                self._next_id(),
+            )
+        return super()._agent_response(messages)
+
+
 class SupportFakeAnthropic:
     def __init__(self, **kwargs):
         self.messages = SupportFakeMessages(**kwargs)
+
+
+def _return_flow_anthropic() -> SupportFakeAnthropic:
+    holder = SupportFakeAnthropic()
+    holder.messages = ReturnFlowFakeMessages()
+    return holder
 
 
 def _configure(monkeypatch, tmp_path, name: str, mode: str) -> tuple[str, str]:
@@ -853,6 +920,314 @@ def test_c08_conditional_negative_and_forged_confirmation(
     try:
         asyncio.run(scenario())
         log_text = (tmp_path / "mcp_stderr.log").read_text(encoding="utf-8")
+        assert "call tool=return_delivered_order_items" in log_text
+        _started, pids = _mcp_pids(log_text)
+        for pid in pids:
+            _assert_process_stopped(pid)
+    finally:
+        _cleanup(support_collection, legacy_collection)
+
+
+@pytest.mark.parametrize("mode", ["single", "multi"])
+@pytest.mark.parametrize("question", [
+    ReturnFlowFakeMessages.destination_question,
+    "已核对订单和商品。还差退款去向，请二选一：原支付方式或已有礼品卡。需要您明确确认后才会提交。",
+    "已核对本人订单。退款去向只能选：①原支付方式，或②已有礼品卡。请告知您选哪一个；确认后才会生成详情。",
+])
+def test_t19_direct_return_destination_supplement_continues_billing(
+    monkeypatch, tmp_path, mode, question
+):
+    name = f"t19direct{mode}{uuid.uuid4().hex[:6]}"
+    support_collection, legacy_collection = _configure(
+        monkeypatch, tmp_path, name, mode
+    )
+    fake = _return_flow_anthropic()
+    fake.messages.destination_question = question
+    _patch_fake(monkeypatch, fake)
+    client_user = f"client-t19-direct-{name}"
+    conv = f"conv-t19-direct-{name}"
+
+    async def scenario():
+        async with _runtime() as runtime:
+            first = await runtime.service.handle_turn(
+                f"我要退无线耳机，不想排查。我的邮箱是 {EMAIL}，"
+                f"订单 {ORDER}，直接退货。",
+                client_user,
+                conv,
+            )
+            assert "退款去向" in first.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            assert runtime.store.active_pending(client_user, conv) == []
+            state = _support_state(tmp_path, client_user, conv)
+            assert state["stage"] == "return_requested"
+            assert state["return_flow"]["status"] == "active"
+            assert state["return_flow"]["awaiting"] == "refund_destination"
+            if mode == "multi":
+                assert first.primary_agent == "billing"
+
+            supplemented = await runtime.service.handle_turn(
+                "退回原支付方式，就按这个退。", client_user, conv
+            )
+            assert "【退货申请详情（待确认）】" in supplemented.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            pending = runtime.store.active_pending(client_user, conv)
+            assert len(pending) == 1 and pending[0]["status"] == "displayed"
+            state = _support_state(tmp_path, client_user, conv)
+            assert state["return_flow"]["status"] == "awaiting_confirmation"
+            assert state["return_flow"]["awaiting"] == "confirmation"
+            if mode == "multi":
+                assert supplemented.primary_agent == "billing"
+                assert (
+                    supplemented.routing_reason
+                    == "support_return_flow_continuation"
+                )
+
+            confirmed = await runtime.service.handle_turn(
+                "确认，就按这些申请退货", client_user, conv
+            )
+            assert "return requested" in confirmed.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 1
+            events = runtime.store.list_events(client_user, conv)
+            assert sum(
+                item["event_type"] == "return_requested" for item in events
+            ) == 1
+            assert runtime.store.active_pending(client_user, conv) == []
+            assert (
+                _support_state(tmp_path, client_user, conv)["return_flow"]["status"]
+                == "submitted"
+            )
+
+    try:
+        asyncio.run(scenario())
+        log_text = (tmp_path / "mcp_stderr.log").read_text(encoding="utf-8")
+        assert log_text.count("call tool=prepare_return ") == 1
+        assert log_text.count("call tool=return_delivered_order_items ") == 1
+        _started, pids = _mcp_pids(log_text)
+        for pid in pids:
+            _assert_process_stopped(pid)
+    finally:
+        _cleanup(support_collection, legacy_collection)
+
+
+@pytest.mark.parametrize("mode", ["single", "multi"])
+def test_t19_troubleshooting_then_return_keeps_billing_across_turns(
+    monkeypatch, tmp_path, mode
+):
+    name = f"t19debug{mode}{uuid.uuid4().hex[:6]}"
+    support_collection, legacy_collection = _configure(
+        monkeypatch, tmp_path, name, mode
+    )
+    _patch_fake(monkeypatch, _return_flow_anthropic())
+    client_user = f"client-t19-debug-{name}"
+    conv = f"conv-t19-debug-{name}"
+
+    async def scenario():
+        async with _runtime() as runtime:
+            first = await runtime.service.handle_turn(
+                "无线耳机蓝牙连不上，怎么配对？", client_user, conv
+            )
+            assert first.support_scope == "active"
+            assert _support_state(tmp_path, client_user, conv)["suggestions"]
+            if mode == "multi":
+                assert first.primary_agent == "technical"
+
+            chosen = await runtime.service.handle_turn(
+                f"还是不行，我要退货。我的邮箱是 {EMAIL}，"
+                f"订单 {ORDER}，退无线耳机。",
+                client_user,
+                conv,
+            )
+            assert "退款去向" in chosen.response
+            state = _support_state(tmp_path, client_user, conv)
+            assert state["return_flow"]["awaiting"] == "refund_destination"
+            assert state["suggestions"]
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            if mode == "multi":
+                assert chosen.primary_agent == "billing"
+
+            prepared = await runtime.service.handle_turn(
+                "退回原支付方式", client_user, conv
+            )
+            assert "【退货申请详情（待确认）】" in prepared.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            if mode == "multi":
+                assert prepared.primary_agent == "billing"
+                assert prepared.routing_reason == "support_return_flow_continuation"
+
+            confirmed = await runtime.service.handle_turn(
+                "确认，就按这些申请退货", client_user, conv
+            )
+            assert "return requested" in confirmed.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 1
+            state = _support_state(tmp_path, client_user, conv)
+            assert state["stage"] == "return_requested"
+            assert state["return_flow"]["status"] == "submitted"
+
+    try:
+        asyncio.run(scenario())
+        log_text = (tmp_path / "mcp_stderr.log").read_text(encoding="utf-8")
+        assert log_text.count("call tool=prepare_return ") == 1
+        assert log_text.count("call tool=return_delivered_order_items ") == 1
+        _started, pids = _mcp_pids(log_text)
+        for pid in pids:
+            _assert_process_stopped(pid)
+    finally:
+        _cleanup(support_collection, legacy_collection)
+
+
+@pytest.mark.parametrize("mode", ["multi"])
+def test_t19_restart_preserves_return_phase_and_pending(
+    monkeypatch, tmp_path, mode
+):
+    name = f"t19restart{mode}{uuid.uuid4().hex[:6]}"
+    support_collection, legacy_collection = _configure(
+        monkeypatch, tmp_path, name, mode
+    )
+    _patch_fake(monkeypatch, _return_flow_anthropic())
+    client_user = f"client-t19-restart-{name}"
+    conv = f"conv-t19-restart-{name}"
+
+    async def first_runtime():
+        async with _runtime() as runtime:
+            await runtime.service.handle_turn(
+                f"我要退无线耳机，不想排查。我的邮箱是 {EMAIL}，"
+                f"订单 {ORDER}，直接退货。",
+                client_user,
+                conv,
+            )
+            prepared = await runtime.service.handle_turn(
+                "退回原支付方式", client_user, conv
+            )
+            assert "【退货申请详情（待确认）】" in prepared.response
+            assert runtime.store.active_pending(client_user, conv)[0][
+                "status"
+            ] == "displayed"
+            return _support_state(tmp_path, client_user, conv)
+
+    async def second_runtime(before):
+        # 新 Fake 没有上一进程的待确认参数，只能依赖 SQLite 中的 pending。
+        _patch_fake(monkeypatch, _return_flow_anthropic())
+        async with _runtime() as runtime:
+            resumed = _support_state(tmp_path, client_user, conv)
+            assert resumed["return_flow"] == before["return_flow"]
+            assert resumed["stage"] == "return_requested"
+            pending = runtime.store.active_pending(client_user, conv)
+            assert len(pending) == 1 and pending[0]["status"] == "displayed"
+
+            confirmed = await runtime.service.handle_turn(
+                "确认，就按这些申请退货", client_user, conv
+            )
+            assert "return requested" in confirmed.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 1
+            assert runtime.store.active_pending(client_user, conv) == []
+
+    try:
+        before = asyncio.run(first_runtime())
+        asyncio.run(second_runtime(before))
+        log_text = (tmp_path / "mcp_stderr.log").read_text(encoding="utf-8")
+        started, pids = _mcp_pids(log_text)
+        assert len(started) == 2
+        assert log_text.count("call tool=return_delivered_order_items ") == 1
+        for pid in pids:
+            _assert_process_stopped(pid)
+    finally:
+        _cleanup(support_collection, legacy_collection)
+
+
+@pytest.mark.parametrize("mode", ["single", "multi"])
+def test_t19_cancel_switch_and_human_close_return_without_writes(
+    monkeypatch, tmp_path, mode
+):
+    name = f"t19exit{mode}{uuid.uuid4().hex[:6]}"
+    support_collection, legacy_collection = _configure(
+        monkeypatch, tmp_path, name, mode
+    )
+    _patch_fake(monkeypatch, _return_flow_anthropic())
+    client_user = f"client-t19-exit-{name}"
+
+    async def start_return(runtime, conv):
+        await runtime.service.handle_turn(
+            f"我要退无线耳机，不想排查。我的邮箱是 {EMAIL}，"
+            f"订单 {ORDER}，直接退货。",
+            client_user,
+            conv,
+        )
+        assert (
+            _support_state(tmp_path, client_user, conv)["return_flow"]["status"]
+            == "active"
+        )
+
+    async def scenario():
+        async with _runtime() as runtime:
+            cancel_conv = f"conv-t19-cancel-{name}"
+            await start_return(runtime, cancel_conv)
+            cancelled = await runtime.service.handle_turn(
+                "取消退货", client_user, cancel_conv
+            )
+            state = _support_state(tmp_path, client_user, cancel_conv)
+            assert state["return_flow"]["status"] == "cancelled"
+            assert state["return_flow"]["awaiting"] == ""
+            assert state["stage"] != "return_requested"
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            if mode == "multi":
+                assert cancelled.primary_agent == "general"
+                assert (
+                    cancelled.routing_reason == "support_return_flow_cancelled"
+                )
+
+            switch_conv = f"conv-t19-switch-{name}"
+            await start_return(runtime, switch_conv)
+            switched = await runtime.service.handle_turn(
+                "先继续排查吧", client_user, switch_conv
+            )
+            state = _support_state(tmp_path, client_user, switch_conv)
+            assert state["return_flow"]["status"] == "switched"
+            assert state["stage"] == "troubleshooting"
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            if mode == "multi":
+                assert switched.primary_agent == "technical"
+                assert (
+                    switched.routing_reason
+                    == "support_return_flow_switched_to_troubleshooting"
+                )
+
+            human_conv = f"conv-t19-human-{name}"
+            await start_return(runtime, human_conv)
+            human = await runtime.service.handle_turn(
+                "请转人工", client_user, human_conv
+            )
+            state = _support_state(tmp_path, client_user, human_conv)
+            assert human.escalated is True
+            assert state["return_flow"]["status"] == "handed_off"
+            assert state["stage"] == "handoff_recorded"
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            if mode == "multi":
+                assert human.primary_agent == "escalation"
+
+            stale_conv = f"conv-t19-stale-{name}"
+            await start_return(runtime, stale_conv)
+            await runtime.service.handle_turn(
+                "退回原支付方式", client_user, stale_conv
+            )
+            assert runtime.store.active_pending(client_user, stale_conv)
+            await runtime.service.handle_turn(
+                "取消退货", client_user, stale_conv
+            )
+            assert runtime.store.active_pending(client_user, stale_conv) == []
+            replay = await runtime.service.handle_turn(
+                "确认，就按这些申请退货", client_user, stale_conv
+            )
+            assert "return requested" not in replay.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            events = runtime.store.list_events(client_user, stale_conv)
+            assert not any(
+                item["event_type"] == "return_requested" for item in events
+            )
+
+    try:
+        asyncio.run(scenario())
+        log_text = (tmp_path / "mcp_stderr.log").read_text(encoding="utf-8")
+        assert "call tool=prepare_return " in log_text
         assert "call tool=return_delivered_order_items" in log_text
         _started, pids = _mcp_pids(log_text)
         for pid in pids:

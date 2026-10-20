@@ -1344,6 +1344,50 @@ class RetailStore:
             for row in rows
         ]
 
+    def cancel_pending(
+        self,
+        client_user_id: str,
+        conv_id: str,
+        reason: str = "user_cancelled",
+    ) -> int:
+        """取消本会话尚未提交的待确认详情；不修改订单或退货申请。"""
+        now = _now()
+        try:
+            with self._tx() as connection:
+                rows = connection.execute(
+                    "SELECT op_id, retail_user_id, order_id FROM pending_returns"
+                    " WHERE client_user_id=? AND conv_id=?"
+                    " AND status IN ('prepared', 'displayed')",
+                    (client_user_id, conv_id),
+                ).fetchall()
+                if not rows:
+                    return 0
+                connection.execute(
+                    "UPDATE pending_returns SET status='cancelled', updated_at=?,"
+                    " note=? WHERE client_user_id=? AND conv_id=?"
+                    " AND status IN ('prepared', 'displayed')",
+                    (
+                        now,
+                        f"cancelled: {str(reason or 'user_cancelled')[:120]}",
+                        client_user_id,
+                        conv_id,
+                    ),
+                )
+                for row in rows:
+                    self._event(
+                        connection,
+                        client_user_id,
+                        conv_id,
+                        row["retail_user_id"],
+                        "return_cancelled",
+                        {"reason": str(reason or "user_cancelled")[:120]},
+                        order_id=row["order_id"],
+                        op_id=row["op_id"],
+                    )
+                return len(rows)
+        except sqlite3.Error as ex:
+            raise SupportStateError(f"取消待确认退货失败: {ex}") from ex
+
     def _validate_item_request(
         self,
         order: Dict[str, Any],
