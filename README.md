@@ -122,7 +122,7 @@ uv run --locked --offline python -m evaluation.run_retail_baseline --mode live -
 
 ## 零售沙箱运行
 
-设置 `RETAIL_MODE=true` 后，HTTP API 与 CLI 切换到单 Agent 零售沙箱：支持订单查询、退货申请和知识咨询。默认客服模式不受影响；两种入口共用同一套零售逻辑。
+设置 `RETAIL_MODE=true` 后，HTTP API 与 CLI 切换到零售沙箱：支持订单查询、退货申请和知识咨询。默认由单 Agent 处理；设置 `RETAIL_AGENT_MODE=multi` 后改用现有 general／technical／billing／escalation 四角色的零售适配版。两种模式共用同一套服务端展示、确认与业务存储逻辑，默认客服模式不受影响。
 
 零售模式下，九个订单／用户／退货相关业务工具由主程序启动的本地 stdio MCP 子进程提供，主程序通过官方 `mcp` SDK（锁定 `1.12.4`）完成初始化、工具发现与 `tools/call`，不提供外部客户端或 HTTP MCP 入口。`search_knowledge_base` 仍在主程序内走原有 RAG 链路。子进程与主程序使用同一个 SQLite 绝对路径，不复制业务状态；工具调用失败不会自动改走进程内直调。
 
@@ -148,6 +148,7 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/chat -ContentType 'applicat
 uv run --locked --offline python -m api.main --cli
 ```
 
+- `RETAIL_AGENT_MODE`：`single`（默认）或 `multi`；`multi` 使用四角色编排，身份绑定与退货提交等状态工具只对每轮主执行者开放，辅助角色只读，Composer 无工具。
 - `RETAIL_DB_PATH`：SQLite 路径，默认 `data/retail/retail.db`。首次启动从固定种子初始化；已有非空业务库不会自动重置，需要新数据时请显式指定新的空路径。
 - `RETAIL_SEED_PATH`、`RETAIL_POLICY_PATH`、`RETAIL_KNOWLEDGE_PATH`：默认指向上述固定资料，通常无需设置。
 - `RETAIL_COLLECTION`：知识集合名，默认 `retail_knowledge_v1`；只导入冻结的 29 段知识，旧演示政策不参与。
@@ -188,6 +189,22 @@ DB 分量使用每案实际完整 SQLite 业务快照，经官方 `RetailDB` 模
 
 结果只代表“τ³-bench v1.0.1 retail 固定 8 任务／项目适配环境／DeepSeek 用户与评分配置”，不是全量排行榜、原生官方运行环境成绩、独立盲测或生产可用性证明；模型失败是有效实验结果，不通过反复重跑刷分。公开复现不依赖被忽略的 `docs/`。
 
+## 单 Agent 与多 Agent 零售对照
+
+`evaluation/run_t16_retail.py` 在同一批固定英文任务上比较单 Agent（A）与现有编排的零售适配版（B）：11、12、48、51、83、92、108 各运行 1 次，固定交替顺序共 14 个 trial；46 只做离线参考核验，不进入付费分母，也不修改 gold。两组都使用固定英文政策、同源独立 SQLite、真实本地 MCP 九工具和官方 UserSimulator／DB／NL 评分；不含中文 RAG、长期画像或跨案例记忆。
+
+```powershell
+# 预检：核对 .venv-tau、上游提交、任务集、价格、端点、MCP 九工具、46 缺失订单与费用计划，不发送模型请求
+uv run --locked --offline python -m evaluation.run_t16_retail preflight --run-id <run-id>
+
+# 正式付费运行：A/B 全部角色、意图、Composer、User 与 Judge 共用同一累计账本，硬上限 ¥10
+uv run --locked --offline python -m evaluation.run_t16_retail run --run-id <run-id>
+```
+
+运行产物写入 `data/evaluation/t16-retail/<run-id>/`（已忽略）：按 arm／task／trial 保存对话、事件、完整前后快照、SQLite、MCP 与 worker 日志、原评分分量、项目检查、请求 usage／费用和共享账本；`summary.json` 保留 14 行正式结果与共同有效配对。预检通过后才允许付费，源码或资产变化会使冻结校验拒绝继续；预算不足或环境异常时保留 PARTIAL，不另开账本清零。单个用户轮的识别、角色、回退与 Composer 合计不超过 32 次请求，业务角色温度 0.1、`max_tokens=2048`，User 与 Judge 温度 0.0、`max_tokens=1024`；`seed=300` 未证明传给模型 SDK。
+
+该入口只产生固定 7 任务小样本观察，不构成统计显著性、排行榜或生产模式选择依据；默认零售模式仍是 `single`。价格、密钥与端点从项目配置读取，不写入产物。
+
 ## 测试
 
 ```powershell
@@ -215,6 +232,9 @@ uv run --locked --offline pytest tests/integration/test_retail_sandbox.py -q
 # τ-retail 运行器、桥接与评分适配测试：需先建 .venv-tau，不访问网络
 uv run --locked --offline pytest tests/test_run_tau_retail.py tests/test_tau_retail.py -q
 uv run --locked --offline pytest tests/test_tau_eval.py -q
+
+# 单／多 Agent 零售对照的权限、记账、配对汇总与真实 MCP 生命周期（Fake 传输层）
+uv run --locked --offline pytest tests/test_t16_retail_runner.py -q
 
 # 当前全部测试
 uv run --locked --offline pytest tests -q
@@ -257,6 +277,7 @@ uv run --locked --offline pytest tests -q
 - `mcp/tool_manager.py`：工具注册、查询改写、并行召回、去重、LLM 重排、TTL 缓存、熔断与降级。降级结果标记 `degraded=True` 且不计为成功命中。
 - `mcp/knowledge_base.py`：ChromaDB 文档切片、幂等导入与语义检索；返回文档 ID、标题、内容、相似度与片段序号。
 - `agents/retail_agent.py`、`agents/retail_runtime.py`、`agents/retail_tools.py`：单 Agent 零售沙箱的决策循环、运行时装配，以及订单查询、退货申请与知识工具。
+- `agents/retail_multi_agent.py`：四角色零售适配与 Host 侧工具权限、共享确认状态和确定性交接。
 - `mcp/retail_server.py`、`mcp/retail_client.py`、`mcp/retail_protocol.py`：本地 stdio MCP 工具服务、受信任主程序客户端与请求上下文 `_meta` 校验；项目内 `mcp/` 仍是原工具与存储包，与官方 `mcp` SDK 同名共存。
 - `mcp/retail_store.py`：零售沙箱 SQLite 存储、身份绑定、退货确认状态机与事务写入。
 - `skills/retail_support/SKILL.md`：零售沙箱每轮生效的业务指引；不与其他模式的审计规则混用。

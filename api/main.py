@@ -413,10 +413,12 @@ def _require_orchestrator() -> None:
 @app.get("/health")
 async def health():
     if _retail_runtime is not None:
+        summary = _retail_runtime.service.summary()
         return {
             "status": "ok",
             "mode": "retail",
-            "agents": _retail_runtime.service.summary()["agent"],
+            "agent_mode": summary.get("agent_mode", "single"),
+            "agents": summary["agent"],
             "store": _retail_runtime.store.stats(),
             "budget": _retail_runtime.ledger.summary(),
         }
@@ -458,9 +460,9 @@ async def chat(req: ChatRequest):
             intent="retail_support",
             intent_group="retail",
             agent_type=result.agent_type.value,
-            agent_types=[result.agent_type.value],
-            primary_agent=result.agent_type.value,
-            supporting_agents=[],
+            agent_types=result.agent_types or [result.agent_type.value],
+            primary_agent=result.primary_agent or result.agent_type.value,
+            supporting_agents=result.supporting_agents,
             tools_used=result.tools_used,
             escalated=result.escalated,
             latency_ms=result.latency_ms,
@@ -749,7 +751,7 @@ async def _retail_cli() -> None:
     conv_id = os.getenv("RETAIL_CONV_ID", "").strip() or str(uuid.uuid4())
     print(
         f"零售模式：会话 {conv_id}，客户端用户 {user_id}；"
-        f"数据库 {runtime.config.db_path}"
+        f"Agent 模式 {runtime.config.agent_mode}；数据库 {runtime.config.db_path}"
     )
     try:
         await runtime.start()
@@ -769,7 +771,8 @@ async def _retail_cli() -> None:
             except ValueError as ex:
                 print(f"\n系统: {ex}\n")
                 continue
-            print(f"\nAgentEcommerce [retail]: {result.response}\n")
+            roles = ",".join(result.agent_types) or "retail"
+            print(f"\nAgentEcommerce [retail:{roles}]: {result.response}\n")
     finally:
         await runtime.close()
 

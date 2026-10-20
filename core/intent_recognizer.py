@@ -112,25 +112,41 @@ _PROMPT_EXAMPLES = (
     (IntentCategory.OTHER, _TEMPLATES[IntentCategory.OTHER][0]),
 )
 
+# 英文零售对照只替换语言和示例，不改变意图集合与判定口径。
+_EN_PROMPT_EXAMPLES = (
+    (IntentCategory.GREETING, "hello"),
+    (IntentCategory.ORDER_STATUS, "What is the status of my order?"),
+    (IntentCategory.QUERY, "What is the return policy?"),
+    (IntentCategory.REFUND, "I want to return an item for a refund."),
+    (IntentCategory.HUMAN_HANDOFF, "Please transfer me to a human agent."),
+    (IntentCategory.OTHER, "Write me a poem."),
+)
+
+
+def _is_english(language: Optional[str]) -> bool:
+    return str(language or "").strip().lower().startswith("en")
+
 
 def build_intent_prompt(
     message: str,
     history: Optional[List[Dict[str, str]]] = None,
+    language: Optional[str] = None,
 ) -> str:
     """构造与实际意图请求完全一致的 Prompt，供预算预检复用。"""
     message = _sanitize_text(message)
-    examples = "\n".join(
-        f'  消息: "{_sanitize_text(t)}" → 意图: {cat.value}'
-        for cat, t in _PROMPT_EXAMPLES
-    )
-    ctx = ""
-    if history:
-        ctx = "\n最近对话:\n" + "\n".join(
-            f"  {_sanitize_text(m.get('role', 'user'))}: {_sanitize_text(m.get('content', ''))}"
-            for m in history[-3:]
+    if not _is_english(language):
+        examples = "\n".join(
+            f'  消息: "{_sanitize_text(t)}" → 意图: {cat.value}'
+            for cat, t in _PROMPT_EXAMPLES
         )
+        ctx = ""
+        if history:
+            ctx = "\n最近对话:\n" + "\n".join(
+                f"  {_sanitize_text(m.get('role', 'user'))}: {_sanitize_text(m.get('content', ''))}"
+                for m in history[-3:]
+            )
 
-    prompt = f"""你是客服意图分析专家。根据示例和最近对话判断用户当前消息的主要意图，返回 JSON。
+        prompt = f"""你是客服意图分析专家。根据示例和最近对话判断用户当前消息的主要意图，返回 JSON。
 如果用户问题能匹配本场景的细粒度业务意图，请优先返回 order_status、refund、query、human_handoff、greeting、other，而不是 complaint、request、billing 等宽泛大类。
 退货办理相关优先返回 refund，不要返回 billing 或 request；查询本人订单事实优先返回 order_status，不要返回 logistics；政策与准备咨询返回 query；明确要求真人接手返回 human_handoff。
 只判断当前消息的主要目标；历史只用于消歧，用户明确否定或改口时以当前消息为准。
@@ -144,6 +160,33 @@ def build_intent_prompt(
 {{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
 
 可选意图: {", ".join(c.value for c in IntentCategory)}"""
+        return _sanitize_text(prompt)
+
+    examples = "\n".join(
+        f'  Message: "{_sanitize_text(t)}" -> intent: {cat.value}'
+        for cat, t in _EN_PROMPT_EXAMPLES
+    )
+    ctx = ""
+    if history:
+        ctx = "\nRecent conversation:\n" + "\n".join(
+            f"  {_sanitize_text(m.get('role', 'user'))}: {_sanitize_text(m.get('content', ''))}"
+            for m in history[-3:]
+        )
+
+    prompt = f"""You are a customer-service intent analyst. Infer the main intent of the user's current message from the examples and recent conversation, and return JSON.
+If the message matches a specific business intent in this scenario, prefer order_status, refund, query, human_handoff, greeting or other over broad categories such as complaint, request, billing or account.
+Return requests should be refund, not billing or request. Questions about the user's own order facts should be order_status, not logistics. Policy and preparation questions are query. An explicit request for a human is human_handoff.
+Judge only the main goal of the current message; history is only for disambiguation, and the current message wins when the user contradicts or corrects it.
+
+Examples:
+{examples}
+{ctx}
+User message: "{message}"
+
+Return format (JSON only, no other text):
+{{"intent": "<intent value>", "confidence": <0-1>, "reasoning": "<one sentence>"}}
+
+Available intents: {", ".join(c.value for c in IntentCategory)}"""
     return _sanitize_text(prompt)
 
 _SPECIFIC_INTENTS = {
@@ -257,19 +300,27 @@ class IntentRecognizer:
 
     def __init__(
         self,
-        api_key: str,
+        api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         confidence_threshold: float = 0.5,
+        client: Any = None,
+        language: Optional[str] = None,
     ):
         if not model:
             raise ValueError("model is required")
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        self.client    = AsyncAnthropic(**kwargs)
+        if client is None:
+            if not api_key:
+                raise ValueError("api_key or client is required")
+            kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = AsyncAnthropic(**kwargs)
+        # 评测入口注入带独立阶段计费的客户端；普通调用仍自行创建。
+        self.client    = client
         self.model     = model
         self.threshold = confidence_threshold
+        self.language  = language
         # 本地字符 n-gram 向量始终可用。若客户端暴露 embeddings 资源，
         # _embed_text 会优先使用它，否则退回本地向量。
         self._embedding_enabled = True
@@ -383,7 +434,9 @@ class IntentRecognizer:
     ) -> Dict[str, Any]:
         """信号 1：结合少样本示例和上下文的 LLM 语义理解。"""
         message = self._clean_text(message)
-        prompt = build_intent_prompt(message, history)
+        prompt = build_intent_prompt(
+            message, history, language=getattr(self, "language", None)
+        )
 
         last_error: Optional[Exception] = None
         last_kind = "request_error"
@@ -420,6 +473,14 @@ class IntentRecognizer:
                     data["unknown_label"] = True
                 return data
             except Exception as ex:
+                # 预算停止与单轮请求上限必须向上抛出，不能被降级为 OTHER。
+                from evaluation.retail_budget import (
+                    BudgetStopExceeded,
+                    TurnRequestLimitExceeded,
+                )
+
+                if isinstance(ex, (BudgetStopExceeded, TurnRequestLimitExceeded)):
+                    raise
                 last_error = ex
                 last_kind = (
                     "parse_error"
@@ -466,25 +527,64 @@ class IntentRecognizer:
         """信号 3：同步的关键词兜底。"""
         msg = message.lower()
         specific_patterns = {
-            IntentCategory.HUMAN_HANDOFF: ["转人工", "人工客服", "找人工"],
-            IntentCategory.ORDER_STATUS: ["订单状态", "发货了吗", "处理到哪", "order status"],
-            IntentCategory.LOGISTICS: ["物流", "快递", "配送", "运单", "delivery", "shipping"],
+            IntentCategory.HUMAN_HANDOFF: [
+                "转人工", "人工客服", "找人工",
+                "human agent", "real person", "transfer to a human",
+                "speak to a human", "representative",
+            ],
+            IntentCategory.ORDER_STATUS: [
+                "订单状态", "发货了吗", "处理到哪", "order status",
+                "where is my order", "status of my order",
+            ],
+            IntentCategory.LOGISTICS: [
+                "物流", "快递", "配送", "运单",
+                "delivery", "shipping", "tracking",
+            ],
             IntentCategory.REFUND: ["退款", "退货", "refund", "return"],
             IntentCategory.INVOICE: ["发票", "抬头", "税号", "invoice"],
-            IntentCategory.PAYMENT_ISSUE: ["重复扣款", "多扣", "支付失败", "扣费", "payment failed"],
-            IntentCategory.ACCOUNT_SECURITY: ["被盗", "异常登录", "重置密码", "两步验证", "安全"],
-            IntentCategory.TECHNICAL_LOGIN: ["无法登录", "登录失败", "401", "验证码"],
-            IntentCategory.TECHNICAL_CRASH: ["崩溃", "闪退", "500", "报错", "crash"],
+            IntentCategory.PAYMENT_ISSUE: [
+                "重复扣款", "多扣", "支付失败", "扣费",
+                "charged twice", "double charged", "payment failed",
+            ],
+            IntentCategory.ACCOUNT_SECURITY: [
+                "被盗", "异常登录", "重置密码", "两步验证", "安全",
+                "hacked", "unauthorized", "reset password", "two-factor",
+            ],
+            IntentCategory.TECHNICAL_LOGIN: [
+                "无法登录", "登录失败", "401", "验证码",
+                "can't log in", "cannot log in", "login failed",
+                "verification code",
+            ],
+            IntentCategory.TECHNICAL_CRASH: [
+                "崩溃", "闪退", "500", "报错",
+                "crash", "error 500", "500 error", "bug",
+            ],
         }
         generic_patterns = {
-            IntentCategory.ESCALATION: ["投诉", "经理", "supervisor"],
-            IntentCategory.COMPLAINT:  ["太差", "糟糕", "horrible", "等了很久"],
-            IntentCategory.QUERY:      ["?", "？", "怎么", "什么", "status"],
-            IntentCategory.REQUEST:    ["帮我", "需要", "please", "help"],
-            IntentCategory.GREETING:   ["你好", "嗨", "hello", "hi"],
-            IntentCategory.BILLING:    ["退款", "扣款", "发票", "refund"],
-            IntentCategory.TECHNICAL:  ["崩溃", "报错", "error", "crash"],
-            IntentCategory.ACCOUNT:    ["密码", "邮箱", "账户", "password"],
+            IntentCategory.ESCALATION: [
+                "投诉", "经理", "supervisor", "complaint", "manager",
+            ],
+            IntentCategory.COMPLAINT: [
+                "太差", "糟糕", "horrible", "等了很久",
+                "terrible", "awful", "waited",
+            ],
+            IntentCategory.QUERY: [
+                "?", "？", "怎么", "什么", "status",
+                "what", "how", "policy",
+            ],
+            IntentCategory.REQUEST: [
+                "帮我", "需要", "please", "help", "need",
+            ],
+            IntentCategory.GREETING: ["你好", "嗨", "hello", "hi", "hey"],
+            IntentCategory.BILLING: [
+                "退款", "扣款", "发票", "refund", "charge", "invoice",
+            ],
+            IntentCategory.TECHNICAL: [
+                "崩溃", "报错", "error", "crash", "bug",
+            ],
+            IntentCategory.ACCOUNT: [
+                "密码", "邮箱", "账户", "password", "email", "account",
+            ],
         }
 
         best_cat, best_score = self._best_pattern_match(msg, specific_patterns)

@@ -38,6 +38,21 @@ from core.llm_utils import extract_text_content
 logger = logging.getLogger(__name__)
 
 
+def _stop_exception(ex: BaseException) -> bool:
+    """预算停止与单轮请求上限必须向上传播，不能被包装成普通业务失败。"""
+    from evaluation.retail_budget import (
+        BudgetExceeded,
+        TurnRequestLimitExceeded,
+    )
+
+    return isinstance(ex, (BudgetExceeded, TurnRequestLimitExceeded))
+
+
+def _request_stop(req: "Request", ex: BaseException) -> bool:
+    """只有零售编排请求才穿透业务层；单 Agent 评测保留原有失败语义。"""
+    return getattr(req, "retail_guard", None) is not None and _stop_exception(ex)
+
+
 # ── 数据结构 ──────────────────────────────────────────────────────────────────
 
 class AgentType(Enum):
@@ -115,6 +130,9 @@ class AgentResponse:
     tools_used:  List[str] = field(default_factory=list)
     tool_traces: List[Dict[str, Any]] = field(default_factory=list)
     knowledge_hits: int = 0
+    # 零售编排需要如实保留实际执行路径；旧模式保持默认值。
+    fallback_used: bool = False
+    meta: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -159,6 +177,9 @@ class Request:
     turn: int = 0
     retail_user_id: Optional[str] = None
     retail_pending: List[Dict[str, Any]] = field(default_factory=list)
+    # 零售编排在同一真实请求内共享的写操作状态；由 RetailMultiAgent 创建。
+    retail_primary: Optional[str] = None
+    retail_guard: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -177,6 +198,13 @@ class OrchestratorResult:
     knowledge_hits: int = 0
     routing_reason: str = ""
     routing_confidence: float = 0.0
+    # 零售对照需要的真实结果与协作轨迹；旧调用方不依赖这些字段。
+    success: bool = True
+    fallback_used: bool = False
+    composer_used: bool = False
+    role_traces: List[Dict[str, Any]] = field(default_factory=list)
+    composer_inputs: List[Dict[str, Any]] = field(default_factory=list)
+    composer_output: str = ""
 
 
 @dataclass
@@ -254,6 +282,8 @@ class BaseAgent:
                 knowledge_hits=call_result.knowledge_hits,
             )
         except Exception as ex:
+            if _request_stop(req, ex):
+                raise
             ms = (time.monotonic() - t0) * 1000
             self.stats.total_ms += ms
             logger.error(f"{self.agent_type.value} 处理失败: {ex}")
@@ -314,12 +344,14 @@ class BaseAgent:
             messages.append({"role": "assistant", "content": ack})
         messages.append({"role": "user", "content": _clean(req.message)})
 
-        tools = self.get_tools()
+        tools = self._tools_for_request(req)
         tools_used: List[str] = []
         tool_traces: List[Dict[str, Any]] = []
         knowledge_hits = 0
-        # 仅在本次请求内保存 prepare 等业务状态，不跨请求共享。
-        guard_state: Dict[str, Any] = {}
+        # 普通请求只在本次调用内保存状态；零售编排由 Request 提供同一请求共享状态。
+        guard_state: Dict[str, Any] = (
+            req.retail_guard if req.retail_guard is not None else {}
+        )
         try:
             for _ in range(max(1, int(self.max_tool_rounds or 3))):
                 request_kwargs: Dict[str, Any] = {
@@ -414,10 +446,16 @@ class BaseAgent:
                                     req, name, args, result, guard_state
                                 )
                             except Exception as ex:
+                                if _request_stop(req, ex):
+                                    raise
                                 call_success = False
                                 logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
                                 error_text = str(ex)
                                 result = {"success": False, "error": error_text}
+                                # 结果不明的工具调用交由业务角色登记，避免重放。
+                                self._on_tool_error(
+                                    req, name, args, ex, guard_state
+                                )
                     tool_latency_ms = (time.monotonic() - tool_t0) * 1000
                     if not error_text and isinstance(result, dict):
                         error_text = str(result.get("error", "") or "")
@@ -457,6 +495,8 @@ class BaseAgent:
         except AgentCallError:
             raise
         except Exception as ex:
+            if _request_stop(req, ex):
+                raise
             raise AgentCallError(
                 str(ex), tools_used, tool_traces, knowledge_hits
             ) from ex
@@ -499,6 +539,10 @@ class BaseAgent:
         """保留原入口；校验实现已提取到 agents.tools 供 MCP 工具端共用。"""
         validate_tool_input(spec, args, language=language)
 
+    def _tools_for_request(self, req: Request) -> Dict[str, AgentToolSpec]:
+        """按真实请求返回工具白名单；零售角色据此区分主执行与只读辅助。"""
+        return self.get_tools()
+
     def _guard_tool_call(
         self,
         req: Request,
@@ -518,6 +562,17 @@ class BaseAgent:
         state: Dict[str, Any],
     ) -> None:
         """工具实际执行后的钩子；默认不保存状态。"""
+        return None
+
+    def _on_tool_error(
+        self,
+        req: Request,
+        name: str,
+        args: Dict[str, Any],
+        error: BaseException,
+        state: Dict[str, Any],
+    ) -> None:
+        """工具抛出异常、结果不明时的钩子；默认不记录。"""
         return None
 
     def _build_system_prompt(self, req: Request) -> str:
@@ -733,55 +788,187 @@ class EscalationAgent(BaseAgent):
         )
 
 
+@dataclass
+class ComposerResult:
+    content: str
+    used_llm: bool
+    inputs: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# 出现这些工具的轮次已经改动或即将改动业务状态，Composer 不得重写回复。
+_COMPOSER_STATE_TOOLS = {
+    "find_user_id_by_email",
+    "find_user_id_by_name_zip",
+    "prepare_return",
+    "return_delivered_order_items",
+    "transfer_to_human_agents",
+}
+
+
 class ResponseComposer:
     """把多个 Agent 的响应合并为一条主次分明的回复。"""
 
-    def __init__(self, client: AsyncAnthropic, model: str, skill_manager: Optional[Any] = None):
+    def __init__(
+        self,
+        client: AsyncAnthropic,
+        model: str,
+        skill_manager: Optional[Any] = None,
+        language: Optional[str] = None,
+        retail_mode: bool = False,
+    ):
         self._client = client
         self._model = model
         self._skill_manager = skill_manager
+        self.language = str(language or "zh").lower()
+        self.retail_mode = bool(retail_mode)
 
     async def compose(self, req: Request, responses: List[AgentResponse]) -> str:
-        successful = [response for response in responses if response.success and response.content.strip()]
-        if not successful:
-            return "抱歉，所有 Agent 均处理失败。"
-        if len(successful) == 1:
-            return successful[0].content
+        """保留原有字符串返回入口。"""
+        return (await self.compose_result(req, responses)).content
 
-        evidence = "\n\n".join(
-            f"[{response.agent_type.value} Agent 输出]\n{response.content}"
+    async def compose_result(
+        self,
+        req: Request,
+        responses: List[AgentResponse],
+    ) -> ComposerResult:
+        successful = [
+            response
+            for response in responses
+            if response.success and response.content.strip()
+        ]
+        if not successful:
+            return ComposerResult(
+                content=(
+                    "Sorry, all agents failed to handle the request."
+                    if self.language == "en"
+                    else "抱歉，所有 Agent 均处理失败。"
+                ),
+                used_llm=False,
+            )
+        inputs = [
+            {
+                "agent_type": response.agent_type.value,
+                "content": response.content,
+                "success": response.success,
+                "tools_used": list(response.tools_used),
+            }
             for response in successful
-        )
-        prompt = (
-            "你是客服 Response Composer，负责把多个专业 Agent 的结果合并成一条最终回复。\n"
-            "要求：以主 Agent 的结论为主，按用户问题优先级组织内容；去掉重复和冲突表述；"
-            "不能补造订单、退款、后台查询结果；如果结论冲突，明确说明需要核验；"
-            "保留必要的排查步骤、核验字段和升级边界。只输出给用户看的中文回复，不要提及 Agent。\n\n"
-            f"主 Agent：{successful[0].agent_type.value}\n"
-            f"用户问题：{req.message}\n"
-            f"候选结果：\n{evidence}"
-        )
+        ]
+        if len(successful) == 1:
+            return ComposerResult(
+                content=successful[0].content, used_llm=False, inputs=inputs
+            )
+        # 零售模式下，涉及身份、退货准备／提交或交接的轮次不做二次改写，
+        # 直接按主次拼接，避免订单事实、确认内容和交接事实被改述。
+        if self.retail_mode and self._retail_must_skip(req, successful):
+            return ComposerResult(
+                content=self._deterministic_merge(successful),
+                used_llm=False,
+                inputs=inputs,
+            )
+
+        if self.language == "en":
+            evidence = "\n\n".join(
+                f"[{response.agent_type.value} Agent output]\n{response.content}"
+                for response in successful
+            )
+            prompt = (
+                "You are the customer-service Response Composer. Merge the "
+                "specialist agents' results into one final reply for the user.\n"
+                "Requirements: lead with the primary agent's conclusion and "
+                "organise the rest by the user's priorities; remove duplicate "
+                "or conflicting wording; do not invent orders, returns, backend "
+                "lookups, refunds, or handoffs; if conclusions conflict, say "
+                "that verification is needed; preserve needed troubleshooting "
+                "steps, verification fields, and escalation boundaries. Do not "
+                "add, alter, or omit any order number, item id, quantity, "
+                "amount, payment method, return status, or handoff fact. "
+                "Output only the English reply for the user and do not mention "
+                "agents.\n\n"
+                f"Primary agent: {successful[0].agent_type.value}\n"
+                f"User message: {req.message}\n"
+                f"Candidate results:\n{evidence}"
+            )
+        else:
+            evidence = "\n\n".join(
+                f"[{response.agent_type.value} Agent 输出]\n{response.content}"
+                for response in successful
+            )
+            prompt = (
+                "你是客服 Response Composer，负责把多个专业 Agent 的结果合并成一条最终回复。\n"
+                "要求：以主 Agent 的结论为主，按用户问题优先级组织内容；去掉重复和冲突表述；"
+                "不能补造订单、退款、后台查询结果；如果结论冲突，明确说明需要核验；"
+                "保留必要的排查步骤、核验字段和升级边界。只输出给用户看的中文回复，不要提及 Agent。\n\n"
+                f"主 Agent：{successful[0].agent_type.value}\n"
+                f"用户问题：{req.message}\n"
+                f"候选结果：\n{evidence}"
+            )
         if self._skill_manager is not None:
             skill = self._skill_manager.prompt_for(req.message, "general")
             if skill:
                 prompt += f"\n\n[通用客服输出边界]\n{skill}"
         try:
-            response = await self._client.messages.create(
-                model=self._model,
-                # 两个完整 Agent 答复较长时，模型会先输出推理，3000 仍可能只产生 reasoning。
-                max_tokens=_env_int("ECHOMIND_COMPOSER_MAX_TOKENS", 8192),
-                temperature=_env_float("ECHOMIND_COMPOSER_TEMPERATURE", 0.1),
-                messages=[{"role": "user", "content": prompt}],
-            )
+            if self.retail_mode:
+                # 零售对照冻结温度与输出预算，不使用环境变量覆盖。
+                response = await self._client.messages.create(
+                    model=self._model,
+                    max_tokens=8192,
+                    temperature=0.1,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+            else:
+                response = await self._client.messages.create(
+                    model=self._model,
+                    # 两个完整 Agent 答复较长时，模型会先输出推理，3000 仍可能只产生 reasoning。
+                    max_tokens=_env_int("ECHOMIND_COMPOSER_MAX_TOKENS", 8192),
+                    temperature=_env_float("ECHOMIND_COMPOSER_TEMPERATURE", 0.1),
+                    messages=[{"role": "user", "content": prompt}],
+                )
             content = extract_text_content(response.content).strip()
             if content:
-                return content
+                return ComposerResult(
+                    content=content, used_llm=True, inputs=inputs
+                )
         except Exception as ex:
+            if _stop_exception(ex):
+                raise
             logger.warning("Response Composer 失败，使用确定性合并: %s", ex)
 
-        # Composer 不可用时，保留主 Agent 与补充 Agent 的标注。
+        return ComposerResult(
+            content=self._deterministic_merge(successful),
+            used_llm=False,
+            inputs=inputs,
+        )
+
+    @staticmethod
+    def _retail_must_skip(
+        req: Request,
+        successful: List[AgentResponse],
+    ) -> bool:
+        """状态操作或待确认详情存在时，禁止 Composer 改述。"""
+        guard = req.retail_guard or {}
+        if guard.get("state_op_entered") or guard.get("unknown_result"):
+            return True
+        for response in successful:
+            for trace in response.tool_traces:
+                if str(trace.get("tool_name") or "") in _COMPOSER_STATE_TOOLS:
+                    return True
+            content = response.content
+            if "PENDING CONFIRMATION" in content or "待确认" in content:
+                return True
+        return False
+
+    def _deterministic_merge(self, successful: List[AgentResponse]) -> str:
+        """Composer 不可用时保留主 Agent 与补充 Agent 的标注。"""
+        extra = (
+            "Additional information:"
+            if self.language == "en"
+            else "补充说明："
+        )
         return "\n\n".join(
-            f"{response.content}" if index == 0 else f"补充说明：\n{response.content}"
+            f"{response.content}"
+            if index == 0
+            else f"{extra}\n{response.content}"
             for index, response in enumerate(successful)
         )
 
@@ -819,24 +1006,101 @@ class AgentOrchestrator:
 
     def __init__(
         self,
-        api_key:  str,
+        api_key:  Optional[str] = None,
         base_url: Optional[str] = None,
         model:    Optional[str] = None,
         skill_manager: Optional[Any] = None,
         rag_tool_manager: Optional[Any] = None,
+        *,
+        client: Optional[Any] = None,
+        intent_recognizer: Optional[IntentRecognizer] = None,
+        composer: Optional[ResponseComposer] = None,
+        language: Optional[str] = None,
+        retail_mode: bool = False,
+        policy_text: str = "",
+        retail_role_classes: Optional[Dict[str, type]] = None,
+        retail_role_clients: Optional[Dict[str, Any]] = None,
     ):
         if not model:
             raise ValueError("model is required")
-        kwargs: Dict[str, Any] = {"api_key": api_key}
-        if base_url:
-            kwargs["base_url"] = base_url
-        client = AsyncAnthropic(**kwargs)
+        owns_client = client is None
+        if client is None:
+            if not api_key:
+                raise ValueError("api_key or client is required")
+            kwargs: Dict[str, Any] = {"api_key": api_key}
+            if base_url:
+                kwargs["base_url"] = base_url
+            client = AsyncAnthropic(**kwargs)
 
-        self._intent_recognizer = IntentRecognizer(api_key=api_key, base_url=base_url, model=model)
-        self._skill_manager = skill_manager
-        self._composer = ResponseComposer(client, model, skill_manager)
+        self._client = client
+        self._owns_client = owns_client
+        self._model = model
+        self.language = str(language or "zh").lower()
+        self.retail_mode = bool(retail_mode)
+        self.policy_text = policy_text
+
+        if intent_recognizer is not None:
+            self._intent_recognizer = intent_recognizer
+        elif self.retail_mode:
+            # 零售对照注入同一预算客户端与语言，避免自建未受控连接。
+            self._intent_recognizer = IntentRecognizer(
+                model=model, client=client, language=self.language
+            )
+        else:
+            self._intent_recognizer = IntentRecognizer(
+                api_key=api_key, base_url=base_url, model=model
+            )
+        self._skill_manager = None if self.retail_mode else skill_manager
+        if composer is not None:
+            self._composer = composer
+        elif self.retail_mode:
+            self._composer = ResponseComposer(
+                client,
+                model,
+                None,
+                language=self.language,
+                retail_mode=True,
+            )
+        else:
+            self._composer = ResponseComposer(client, model, skill_manager)
         self._shared_tools: Dict[str, AgentToolSpec] = {}
         self._recent_tool_traces = deque(maxlen=_env_int("ECHOMIND_TOOL_TRACE_MAX", 200))
+
+        if self.retail_mode:
+            classes = dict(retail_role_classes or {})
+            required = ("general", "technical", "billing", "escalation")
+            missing = [name for name in required if name not in classes]
+            if missing:
+                raise ValueError(
+                    "零售多 Agent 模式缺少角色类: " + ", ".join(missing)
+                )
+            self._pool = {}
+            for name, agent_type in (
+                ("general", AgentType.GENERAL),
+                ("technical", AgentType.TECHNICAL),
+                ("billing", AgentType.BILLING),
+                ("escalation", AgentType.ESCALATION),
+            ):
+                agent_cls = classes[name]
+                profile = replace(
+                    agent_cls.profile,
+                    model=None,
+                    temperature=0.1,
+                    max_tokens=2048,
+                )
+                role_client = (retail_role_clients or {}).get(name, client)
+                self._pool[agent_type] = [
+                    agent_cls(
+                        role_client,
+                        model,
+                        profile=profile,
+                        language=self.language,
+                        policy_text=self.policy_text,
+                    )
+                ]
+            # 零售模式的工具由运行时经 MCP 发现后统一注入。
+            self.set_shared_tools({})
+            return
 
         # Agent 池：每种类型可包含多个实例以支持横向扩展。
         self._pool: Dict[AgentType, List[BaseAgent]] = {
@@ -880,6 +1144,22 @@ class AgentOrchestrator:
             for agent in agents:
                 agent.set_shared_tools(self._shared_tools)
 
+    @property
+    def shared_tools(self) -> Dict[str, AgentToolSpec]:
+        """返回当前共享工具的快照，供外层包装器报告能力范围。"""
+        return dict(self._shared_tools)
+
+    async def aclose(self) -> None:
+        """只关闭编排器自己创建的客户端；注入连接由调用方负责。"""
+        if not self._owns_client:
+            return
+        closer = getattr(self._client, "close", None)
+        if closer is None:
+            return
+        result = closer()
+        if hasattr(result, "__await__"):
+            await result
+
     async def recognize_intent(
         self,
         message: str,
@@ -898,6 +1178,9 @@ class AgentOrchestrator:
             "tools_used": list(result.tools_used),
             "tool_calls": list(result.tool_traces),
             "escalated": result.escalated,
+            "success": bool(result.success),
+            "fallback_used": bool(result.fallback_used),
+            "composer_used": bool(result.composer_used),
             "latency_ms": round(result.latency_ms, 1),
         }
         self._recent_tool_traces.append(trace)
@@ -919,24 +1202,41 @@ class AgentOrchestrator:
     async def run(self, req: Request) -> OrchestratorResult:
         """处理单个请求：识别意图、路由、执行、检查升级。"""
         t0 = time.monotonic()
+        retail_mode = bool(getattr(self, "retail_mode", False))
+        language = str(getattr(self, "language", "zh"))
 
         # 1. 调用方未识别过意图时，这里识别。
         if req.intent is None:
-            intent_result = await self._intent_recognizer.recognize(req.message, history=req.history)
-            req.intent  = intent_result.intent
-            req.intent_group = intent_result.intent_group
-            req.urgency = intent_result.urgency
-            req.intent_confidence = intent_result.confidence
-            # 调用方显式传入的实体可信度更高，识别出的字段只用于补缺。
-            recognized_entities = dict(intent_result.entities or {})
-            if req.entities:
-                recognized_entities.update(req.entities)
-            req.entities = recognized_entities
+            if retail_mode and req.retail_pending:
+                # 待确认详情后的回复固定交给账单角色；是否授权仍由服务端
+                # 根据真实用户消息判断，模型不能自行确认。
+                req.intent = IntentCategory.REFUND
+                req.intent_group = "billing"
+                req.intent_confidence = 1.0
+            else:
+                intent_result = await self._intent_recognizer.recognize(
+                    req.message, history=req.history
+                )
+                req.intent  = intent_result.intent
+                req.intent_group = intent_result.intent_group
+                req.urgency = intent_result.urgency
+                req.intent_confidence = intent_result.confidence
+                # 调用方显式传入的实体可信度更高，识别出的字段只用于补缺。
+                recognized_entities = dict(intent_result.entities or {})
+                if req.entities:
+                    recognized_entities.update(req.entities)
+                req.entities = recognized_entities
 
         if self._needs_clarification(req):
             result = OrchestratorResult(
                 request_id=req.request_id,
-                response="我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？",
+                response=(
+                    "I cannot tell which issue you want to handle yet. Please "
+                    "clarify whether it is about an order or delivery, a return "
+                    "or billing issue, account details, or a technical problem."
+                    if retail_mode and language == "en"
+                    else "我还不能确定您要处理的是哪类问题。请补充一下是订单物流、退款账单、账户资料，还是技术故障？"
+                ),
                 agent_type=AgentType.GENERAL,
                 intent=req.intent,
                 escalated=False,
@@ -952,21 +1252,42 @@ class AgentOrchestrator:
         # 复杂请求可能涉及多个 Agent，例如同一条消息里既有登录失败
         # 又有重复扣款。
         decision = self._route_decision(req)
+        if (
+            retail_mode
+            and req.retail_pending
+            and req.intent not in (
+                IntentCategory.ESCALATION,
+                IntentCategory.HUMAN_HANDOFF,
+            )
+            and self._pool.get(AgentType.BILLING)
+        ):
+            # 已展示待确认详情时，只允许账单角色处理，且不再并行辅助角色。
+            decision = RoutingDecision(
+                primary_agent=AgentType.BILLING,
+                supporting_agents=[],
+                reason="pending_confirmation_routed_to_billing",
+                confidence=1.0,
+            )
+        if retail_mode:
+            req.retail_primary = decision.primary_agent.value
         if decision.multi_agent:
             return await self.run_parallel(req, decision)
 
         # 2. 执行主 Agent（含降级）。
         response = await self._execute(req, decision.primary_agent)
 
-        # 3. 检查升级。
-        escalated = False
-        if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent in (
-            IntentCategory.ESCALATION,
-            IntentCategory.HUMAN_HANDOFF,
-        ):
-            escalated = True
-            logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
-            # 生产环境：在此创建工单并通知人工客服。
+        # 3. 检查升级。零售模式只认实际记录成功的 MCP 交接。
+        if retail_mode:
+            escalated = self._escalation_recorded([response])
+        else:
+            escalated = False
+            if response.escalate or req.urgency == UrgencyLevel.CRITICAL or req.intent in (
+                IntentCategory.ESCALATION,
+                IntentCategory.HUMAN_HANDOFF,
+            ):
+                escalated = True
+                logger.warning(f"请求 {req.request_id} 触发升级: urgency={req.urgency}")
+                # 生产环境：在此创建工单并通知人工客服。
 
         result = OrchestratorResult(
             request_id=req.request_id,
@@ -983,6 +1304,9 @@ class AgentOrchestrator:
             knowledge_hits=response.knowledge_hits if response.success else 0,
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
+            success=bool(response.success),
+            fallback_used=bool(response.fallback_used),
+            role_traces=[self._role_trace(response)],
         )
         self._record_tool_trace(result)
         return result
@@ -991,12 +1315,43 @@ class AgentOrchestrator:
         """分派给多个 Agent 并合并响应。"""
         t0 = time.monotonic()
         agent_types = decision.agent_types
-        tasks = [self._execute(req, at) for at in agent_types]
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+        retail_mode = bool(getattr(self, "retail_mode", False))
+        if retail_mode:
+            # 零售模式串行执行：辅助角色只读并先完成，主执行者最后执行，
+            # 避免同一请求内的写入与辅助读取并行交互。
+            supporting = [
+                at for at in decision.supporting_agents if at != decision.primary_agent
+            ][:2]
+            req.retail_primary = decision.primary_agent.value
+            supporting_responses = [
+                await self._execute(req, at) for at in supporting
+            ]
+            primary_response = await self._execute(req, decision.primary_agent)
+            valid_responses = supporting_responses + [primary_response]
+            # Composer 以主角色结论为主，辅助内容附后。
+            ordered_responses = [primary_response] + supporting_responses
+        else:
+            tasks = [self._execute(req, at) for at in agent_types]
+            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            valid_responses = [r for r in responses if isinstance(r, AgentResponse)]
+            ordered_responses = valid_responses
+            primary_response = next(
+                (
+                    r for r in valid_responses
+                    if r.agent_type == decision.primary_agent
+                ),
+                None,
+            )
 
-        valid_responses = [r for r in responses if isinstance(r, AgentResponse)]
-        combined = await self._composer.compose(req, valid_responses)
-        escalated = any(isinstance(r, AgentResponse) and r.escalate for r in responses)
+        composer_result = await self._compose(req, ordered_responses)
+        combined = composer_result.content
+        if retail_mode:
+            escalated = self._escalation_recorded(valid_responses)
+        else:
+            escalated = any(
+                isinstance(r, AgentResponse) and r.escalate
+                for r in valid_responses
+            )
         tools_used = list(dict.fromkeys(
             tool_name
             for response in valid_responses
@@ -1013,6 +1368,9 @@ class AgentOrchestrator:
             for response in valid_responses
             if response.success
         )
+        actual_agent_types = [
+            r.agent_type for r in valid_responses if r.success
+        ] or agent_types
         result = OrchestratorResult(
             request_id=req.request_id,
             response=combined,
@@ -1020,10 +1378,7 @@ class AgentOrchestrator:
             intent=req.intent,
             escalated=escalated,
             latency_ms=(time.monotonic() - t0) * 1000,
-            agent_types=[
-                r.agent_type for r in responses
-                if isinstance(r, AgentResponse) and r.success
-            ] or agent_types,
+            agent_types=actual_agent_types,
             primary_agent=decision.primary_agent,
             supporting_agents=decision.supporting_agents,
             tools_used=tools_used,
@@ -1031,9 +1386,58 @@ class AgentOrchestrator:
             knowledge_hits=knowledge_hits,
             routing_reason=decision.reason,
             routing_confidence=decision.confidence,
+            success=(
+                bool(primary_response.success)
+                if retail_mode and primary_response is not None
+                else True
+            ),
+            fallback_used=any(r.fallback_used for r in valid_responses),
+            composer_used=bool(composer_result.used_llm),
+            role_traces=[self._role_trace(r) for r in valid_responses],
+            composer_inputs=list(composer_result.inputs),
+            composer_output=(
+                composer_result.content if composer_result.used_llm else ""
+            ),
         )
         self._record_tool_trace(result)
         return result
+
+    async def _compose(
+        self,
+        req: Request,
+        responses: List[AgentResponse],
+    ) -> ComposerResult:
+        """兼容只实现 compose() 的旧 Composer 和测试替身。"""
+        compose_result = getattr(self._composer, "compose_result", None)
+        if compose_result is not None:
+            return await compose_result(req, responses)
+        content = await self._composer.compose(req, responses)
+        return ComposerResult(content=content, used_llm=False)
+
+    @staticmethod
+    def _escalation_recorded(responses: List[AgentResponse]) -> bool:
+        """只有实际成功调用 transfer_to_human_agents 才算升级交接。"""
+        return any(
+            trace.get("tool_name") == "transfer_to_human_agents"
+            and trace.get("result_success") is True
+            for response in responses
+            for trace in response.tool_traces
+        )
+
+    @staticmethod
+    def _role_trace(response: AgentResponse) -> Dict[str, Any]:
+        """记录每个实际参与角色的成功、工具与降级情况。"""
+        return {
+            "agent_type": response.agent_type.value,
+            "success": bool(response.success),
+            "fallback_used": bool(response.fallback_used),
+            "latency_ms": round(float(response.latency_ms or 0.0), 1),
+            "tools_used": list(response.tools_used),
+            "tool_traces": list(response.tool_traces),
+            "knowledge_hits": int(response.knowledge_hits or 0),
+            "escalate": bool(response.escalate),
+            "meta": dict(response.meta or {}),
+        }
 
     # ── 路由 ──────────────────────────────────────────────────────────────────
 
@@ -1109,6 +1513,9 @@ class AgentOrchestrator:
                 and score >= primary_score * 0.55
             ]
 
+        if getattr(self, "retail_mode", False):
+            # 零售对照固定主 Agent 加至多两个只读辅助。
+            supporting_agents = supporting_agents[:2]
         reason = self._routing_reason(req, available_scores, primary_agent, supporting_agents)
         if degraded_agents:
             degraded_text = ", ".join(sorted(agent.value for agent in degraded_agents))
@@ -1158,9 +1565,20 @@ class AgentOrchestrator:
         ):
             scores[AgentType.BILLING] += 0.75
 
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401", "验证码"]
-        billing_kws = ["退款", "退货", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice", "多扣"]
-        general_kws = ["订单", "物流", "快递", "配送", "会员", "积分", "咨询", "帮助"]
+        technical_kws = [
+            "崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500",
+            "401", "验证码", "bug", "technical", "login",
+        ]
+        billing_kws = [
+            "退款", "退货", "扣款", "发票", "账单", "支付", "订阅", "refund",
+            "invoice", "多扣", "return", "charged", "payment", "billing",
+            "price", "amount", "gift card",
+        ]
+        general_kws = [
+            "订单", "物流", "快递", "配送", "会员", "积分", "咨询", "帮助",
+            "order", "delivery", "shipping", "tracking", "product", "policy",
+            "help",
+        ]
 
         technical_hits = sum(1 for kw in technical_kws if kw in msg)
         billing_hits = sum(1 for kw in billing_kws if kw in msg)
@@ -1207,8 +1625,14 @@ class AgentOrchestrator:
         msg = req.message.lower()
         targets: List[AgentType] = []
 
-        technical_kws = ["崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500", "401"]
-        billing_kws = ["退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice"]
+        technical_kws = [
+            "崩溃", "报错", "error", "crash", "无法登录", "登录失败", "500",
+            "401", "bug", "technical", "login",
+        ]
+        billing_kws = [
+            "退款", "扣款", "发票", "账单", "支付", "订阅", "refund", "invoice",
+            "return", "charged", "payment", "billing", "gift card",
+        ]
 
         if req.intent in (
             IntentCategory.TECHNICAL,
@@ -1281,12 +1705,46 @@ class AgentOrchestrator:
 
         # 专属 Agent 失败时回退到 GeneralAgent。
         if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
+            if (
+                getattr(self, "retail_mode", False)
+                and self._retail_fallback_blocked(req, response)
+            ):
+                logger.warning(
+                    "%s 失败，但本轮已进入状态操作，禁止跨角色重放",
+                    agent_type.value,
+                )
+                return response
             logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
             fallback = self._best_agent(AgentType.GENERAL)
             if fallback:
+                failed = response
                 response = await fallback.handle(req)
+                response.fallback_used = True
+                # 保留失败前的真实工具轨迹，避免降级掩盖已发生的调用。
+                response.tools_used = list(dict.fromkeys(
+                    list(failed.tools_used) + list(response.tools_used)
+                ))
+                response.tool_traces = (
+                    list(failed.tool_traces) + list(response.tool_traces)
+                )
+                response.knowledge_hits = int(
+                    failed.knowledge_hits or 0
+                ) + int(response.knowledge_hits or 0)
 
         return response
+
+    @staticmethod
+    def _retail_fallback_blocked(
+        req: Request, response: AgentResponse
+    ) -> bool:
+        """零售模式下，出现任何工具调用或待确认状态都不再跨角色重放。"""
+        guard = req.retail_guard or {}
+        return bool(
+            guard.get("state_op_entered")
+            or guard.get("unknown_result")
+            or req.retail_pending
+            or response.tool_traces
+        )
 
     # ── 统计（供监控读取） ────────────────────────────────────────────────────
 

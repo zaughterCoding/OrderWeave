@@ -21,7 +21,8 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 from evaluation.retail_budget import (
     INPUT_COUNT_BASIS,
     REQUEST_FORMAT_OVERHEAD_TOKENS,
-    BudgetExceeded,
+    BudgetStopExceeded,
+    TurnRequestLimitExceeded,
     _json_default,
     request_input_upper_tokens,
 )
@@ -68,6 +69,10 @@ class RetailLedger:
         self._lock = threading.Lock()
         # 最近一次在发送前被拒绝的原因；调用方据此区分预算停止与普通模型失败。
         self._last_rejection_reason = ""
+        # 单轮请求上限只在当前进程内计数，由评测入口在每个外部用户轮次开始时重置。
+        self._turn_label = ""
+        self._turn_requests = 0
+        self._turn_max_requests = 0
         self._initialize(
             float(budget_cny),
             float(input_price_cny_per_mtok),
@@ -209,6 +214,41 @@ class RetailLedger:
         """最近一次发送前被预算拒绝的原因；空字符串表示尚未拒绝。"""
         return self._last_rejection_reason
 
+    def begin_turn(
+        self, label: str = "", max_requests: Optional[int] = None
+    ) -> None:
+        """开始一个外部用户轮次；该轮的角色、识别与 Composer 请求共用上限。
+
+        User／Judge 等评测侧调用通过 count_turn=False 不进入该计数。
+        """
+        with self._lock:
+            self._turn_label = str(label or "")
+            self._turn_requests = 0
+            if max_requests is not None:
+                self._turn_max_requests = max(0, int(max_requests))
+
+    def consume_turn_request(self, stage: str) -> int:
+        """发送前计入当前轮请求数；达到冻结上限时抛出 TurnRequestLimitExceeded。"""
+        with self._lock:
+            limit = self._turn_max_requests
+            current = self._turn_requests
+            if limit > 0 and current >= limit:
+                raise TurnRequestLimitExceeded(
+                    "单个外部用户轮次的模型请求数达到上限: "
+                    f"limit={limit}, turn={self._turn_label or '-'}, stage={stage}"
+                )
+            self._turn_requests = current + 1
+            return self._turn_requests
+
+    def turn_state(self) -> Dict[str, Any]:
+        """返回当前轮计数，供轨迹与汇总记录。"""
+        with self._lock:
+            return {
+                "label": self._turn_label,
+                "requests": self._turn_requests,
+                "max_requests": self._turn_max_requests,
+            }
+
     def estimate(
         self, input_tokens_upper: int, max_tokens: int
     ) -> float:
@@ -251,7 +291,7 @@ class RetailLedger:
                 self._last_rejection_reason = (
                     "账本已因超出预留上界永久停止: " + overrun
                 )
-                raise BudgetExceeded(self._last_rejection_reason)
+                raise BudgetStopExceeded(self._last_rejection_reason)
             totals = connection.execute(
                 "SELECT"
                 " COALESCE(SUM(CASE WHEN status IN ('success','failed','crashed')"
@@ -269,7 +309,7 @@ class RetailLedger:
                     f"已花 {spent:.6f} + 在途 {reserved:.6f} "
                     f"+ 本次上界 {upper:.6f} > 预算 {budget:.6f} 元"
                 )
-                raise BudgetExceeded(self._last_rejection_reason)
+                raise BudgetStopExceeded(self._last_rejection_reason)
             request_id = f"req-{uuid.uuid4().hex[:12]}"
             connection.execute(
                 "INSERT INTO entries"
@@ -512,6 +552,7 @@ class RetailLedger:
                 "output_cny_per_mtok": self._pricing["output_cny_per_mtok"],
             },
             "model": meta.get("model", ""),
+            "turn": self.turn_state(),
         }
 
     def entries(self) -> List[Dict[str, Any]]:
@@ -528,12 +569,17 @@ class _BudgetedMessages:
         inner: Any,
         ledger: RetailLedger,
         stage: str,
+        count_turn: bool = False,
     ):
         self._inner = inner
         self._ledger = ledger
         self._stage = stage
+        self._count_turn = count_turn
 
     async def create(self, **kwargs: Any) -> Any:
+        # 先检查单轮请求上限，再预留费用；被拒绝时不发出请求。
+        if self._count_turn:
+            self._ledger.consume_turn_request(self._stage)
         reservation = self._ledger.reserve(self._stage, kwargs)
         started = time.monotonic()
         try:
@@ -561,14 +607,26 @@ class BudgetedClient:
         inner: Any,
         ledger: RetailLedger,
         stage: str,
+        count_turn: bool = False,
     ):
         self._inner = inner
         self._ledger = ledger
         self.stage = stage
-        self.messages = _BudgetedMessages(inner.messages, ledger, stage)
+        self.count_turn = count_turn
+        self.messages = _BudgetedMessages(
+            inner.messages, ledger, stage, count_turn=count_turn
+        )
 
-    def for_stage(self, stage: str) -> "BudgetedClient":
-        return BudgetedClient(self._inner, self._ledger, stage)
+    def for_stage(
+        self, stage: str, count_turn: Optional[bool] = None
+    ) -> "BudgetedClient":
+        """派生阶段包装器；未指定时沿用当前包装器的单轮计数设置。"""
+        return BudgetedClient(
+            self._inner,
+            self._ledger,
+            stage,
+            count_turn=self.count_turn if count_turn is None else count_turn,
+        )
 
     async def aclose(self) -> None:
         """关闭共享的底层异步客户端；各阶段包装器不重复关闭。"""
@@ -585,6 +643,7 @@ def build_budgeted_client(
     base_url: Optional[str],
     ledger: RetailLedger,
     stage: str,
+    count_turn: bool = False,
 ) -> BudgetedClient:
     """创建禁用 SDK 隐式重试的真实客户端。"""
     from anthropic import AsyncAnthropic
@@ -592,4 +651,6 @@ def build_budgeted_client(
     kwargs: Dict[str, Any] = {"api_key": api_key, "max_retries": 0}
     if base_url:
         kwargs["base_url"] = base_url
-    return BudgetedClient(AsyncAnthropic(**kwargs), ledger, stage)
+    return BudgetedClient(
+        AsyncAnthropic(**kwargs), ledger, stage, count_turn=count_turn
+    )

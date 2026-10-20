@@ -16,12 +16,21 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agents.agent_orchestrator import AgentOrchestrator, ResponseComposer
 from agents.retail_agent import RetailAgent, RetailService
+from agents.retail_multi_agent import (
+    RetailBillingAgent,
+    RetailEscalationAgent,
+    RetailGeneralAgent,
+    RetailMultiAgent,
+    RetailTechnicalAgent,
+)
 from agents.retail_tools import (
     retail_knowledge_tool,
     retail_tool_scope,
     retail_tools,
 )
+from core.intent_recognizer import IntentRecognizer
 from core.skill_loader import SkillManager
 from evaluation.retail_ledger import (
     BudgetedClient,
@@ -227,6 +236,10 @@ class RetailRuntimeConfig:
     max_context_chars: int
     mcp_timeout_seconds: float
     mcp_stderr_log: Optional[Path]
+    # 正式英文对照关闭旧中文记忆与 RAG，保证两组可见信息一致。
+    agent_mode: str = "single"
+    enable_memory: bool = True
+    enable_knowledge: bool = True
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -246,6 +259,11 @@ class RetailRuntimeConfig:
         suffix = _memory_suffix(
             _env_text("RETAIL_MEMORY_COLLECTION_SUFFIX", "_retail")
         )
+        agent_mode = _env_text("RETAIL_AGENT_MODE", "single").lower()
+        if agent_mode not in {"single", "multi"}:
+            raise RuntimeError(
+                "RETAIL_AGENT_MODE 只能是 single 或 multi: " + agent_mode
+            )
         return cls(
             db_path=_env_path(
                 "RETAIL_DB_PATH", _PROJECT_ROOT / "data" / "retail" / "retail.db"
@@ -313,6 +331,9 @@ class RetailRuntimeConfig:
                 _env_optional_path("RETAIL_MCP_STDERR_LOG")
                 or _PROJECT_ROOT / "data" / "retail" / "mcp_stderr.log"
             ),
+            agent_mode=agent_mode,
+            enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
+            enable_knowledge=_env_bool("RETAIL_ENABLE_KNOWLEDGE", True),
         )
 
 
@@ -322,11 +343,11 @@ class RetailRuntime:
     ledger: RetailLedger
     client: BudgetedClient
     store: RetailStore
-    memory: MemoryManager
-    tool_manager: MCPToolManager
-    knowledge_base: KnowledgeBase
-    skill_manager: SkillManager
-    agent: RetailAgent
+    memory: Optional[MemoryManager]
+    tool_manager: Optional[MCPToolManager]
+    knowledge_base: Optional[KnowledgeBase]
+    skill_manager: Optional[SkillManager]
+    agent: Any
     service: RetailService
     mcp_client: RetailMCPClient
     _started: bool = False
@@ -351,10 +372,14 @@ class RetailRuntime:
                     f"{sorted(discovered)} != {sorted(expected)}"
                 )
             # RAG 仍在主程序原链路执行，其余九个业务工具只通过 MCP 调用。
+            # 正式英文对照关闭 RAG，两组都只保留同样的九个业务工具。
             tools = dict(discovered)
-            tools["search_knowledge_base"] = retail_knowledge_tool(
-                self.tool_manager
-            )
+            if self.config.enable_knowledge:
+                if self.tool_manager is None:
+                    raise RuntimeError("启用知识检索但未构建工具管理器")
+                tools["search_knowledge_base"] = retail_knowledge_tool(
+                    self.tool_manager
+                )
             self.agent.set_shared_tools(tools)
         except Exception:
             await self.close()
@@ -371,10 +396,11 @@ class RetailRuntime:
             await self.mcp_client.close()
         except Exception:
             logger.exception("关闭 MCP 工具服务失败")
-        try:
-            await self.memory.close()
-        except Exception:
-            logger.exception("关闭记忆服务失败")
+        if self.memory is not None:
+            try:
+                await self.memory.close()
+            except Exception:
+                logger.exception("关闭记忆服务失败")
         try:
             await self.client.aclose()
         except Exception:
@@ -438,74 +464,113 @@ def build_retail_runtime(
         call_timeout=config.mcp_timeout_seconds,
         stderr_log_path=config.mcp_stderr_log,
     )
-    memory = MemoryManager(
-        redis_url=config.redis_url,
-        chroma_host=config.chroma_host,
-        chroma_port=config.chroma_port,
-        chroma_path=str(config.chroma_path),
-        client=client.for_stage("memory"),
-        model=config.model,
-        key_prefix=config.memory_key_prefix,
-        collection_suffix=config.memory_collection_suffix,
-        cross_conv_history=False,
-        profile_enabled=config.profile_enabled,
-    )
-
-    knowledge_base = KnowledgeBase(
-        chroma_host=config.chroma_host,
-        chroma_port=config.chroma_port,
-        chroma_path=str(config.chroma_path),
-        collection_name=config.knowledge_collection,
-        load_demo_documents=False,
-    )
-    added = knowledge_base.upsert_evidence(knowledge_rows)
-    total = knowledge_base.doc_count
-    if total != EXPECTED_KNOWLEDGE_SEGMENTS:
-        raise RuntimeError(
-            "零售知识集合必须只包含冻结片段，当前数量不符: "
-            f"{total} != {EXPECTED_KNOWLEDGE_SEGMENTS}；"
-            f"请为新运行使用独立 RETAIL_COLLECTION，不自动清理旧集合。"
+    memory = None
+    if config.enable_memory:
+        memory = MemoryManager(
+            redis_url=config.redis_url,
+            chroma_host=config.chroma_host,
+            chroma_port=config.chroma_port,
+            chroma_path=str(config.chroma_path),
+            client=client.for_stage("memory"),
+            model=config.model,
+            key_prefix=config.memory_key_prefix,
+            collection_suffix=config.memory_collection_suffix,
+            cross_conv_history=False,
+            profile_enabled=config.profile_enabled,
         )
-    logger.info(
-        "零售知识集合 %s: %s 个片段，本次写入 %s 个",
-        config.knowledge_collection,
-        total,
-        added,
-    )
 
-    tool_manager = MCPToolManager(
-        api_key=api_key,
-        base_url=config.base_url or None,
-        model=config.model,
-        client=client.for_stage("retrieval"),
-    )
-    _register_knowledge_tool(tool_manager, knowledge_base)
-
-    skills_dir = _env_text(
-        "ECHOMIND_SKILLS_DIR", str(_PROJECT_ROOT / "skills")
-    )
-    skill_manager = SkillManager(
-        root_dir=skills_dir,
-        max_prompt_chars=int(
-            _env_text("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")
-        ),
-    )
-    skill_manager.load()
+    knowledge_base = None
+    tool_manager = None
+    if config.enable_knowledge:
+        knowledge_base = KnowledgeBase(
+            chroma_host=config.chroma_host,
+            chroma_port=config.chroma_port,
+            chroma_path=str(config.chroma_path),
+            collection_name=config.knowledge_collection,
+            load_demo_documents=False,
+        )
+        added = knowledge_base.upsert_evidence(knowledge_rows)
+        total = knowledge_base.doc_count
+        if total != EXPECTED_KNOWLEDGE_SEGMENTS:
+            raise RuntimeError(
+                "零售知识集合必须只包含冻结片段，当前数量不符: "
+                f"{total} != {EXPECTED_KNOWLEDGE_SEGMENTS}；"
+                f"请为新运行使用独立 RETAIL_COLLECTION，不自动清理旧集合。"
+            )
+        logger.info(
+            "零售知识集合 %s: %s 个片段，本次写入 %s 个",
+            config.knowledge_collection,
+            total,
+            added,
+        )
+        tool_manager = MCPToolManager(
+            api_key=api_key,
+            base_url=config.base_url or None,
+            model=config.model,
+            client=client.for_stage("retrieval"),
+        )
+        _register_knowledge_tool(tool_manager, knowledge_base)
 
     policy_text = config.policy_path.read_text(encoding="utf-8")
-    agent = RetailAgent(
-        client=client.for_stage("agent"),
-        model=config.model,
-        store=store,
-        tool_manager=tool_manager,
-        skill_manager=skill_manager,
-        policy_text=policy_text,
-        policy_source=(
-            "evaluation/data/retail_sandbox/policy.md "
-            f"sha256={EXPECTED_POLICY_SHA256}"
-        ),
-        max_tokens=config.max_tokens,
-    )
+    skill_manager = None
+    if config.agent_mode == "multi":
+        # 四个角色、识别与 Composer 共用同一预算客户端，并按阶段计数。
+        orchestrator = AgentOrchestrator(
+            client=client.for_stage("roles", count_turn=True),
+            model=config.model,
+            intent_recognizer=IntentRecognizer(
+                model=config.model,
+                client=client.for_stage("intent", count_turn=True),
+                language=language,
+            ),
+            composer=ResponseComposer(
+                client.for_stage("composer", count_turn=True),
+                config.model,
+                None,
+                language=language,
+                retail_mode=True,
+            ),
+            language=language,
+            retail_mode=True,
+            policy_text=policy_text,
+            retail_role_classes={
+                "general": RetailGeneralAgent,
+                "technical": RetailTechnicalAgent,
+                "billing": RetailBillingAgent,
+                "escalation": RetailEscalationAgent,
+            },
+        )
+        agent = RetailMultiAgent(
+            orchestrator,
+            ledger=ledger,
+            turn_label=config.case_id or ledger.run_id or "B",
+            max_requests_per_turn=32,
+            language=language,
+        )
+    else:
+        skills_dir = _env_text(
+            "ECHOMIND_SKILLS_DIR", str(_PROJECT_ROOT / "skills")
+        )
+        skill_manager = SkillManager(
+            root_dir=skills_dir,
+            max_prompt_chars=int(
+                _env_text("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")
+            ),
+        )
+        skill_manager.load()
+        agent = RetailAgent(
+            client=client.for_stage("agent"),
+            model=config.model,
+            store=store,
+            tool_manager=tool_manager,
+            skill_manager=skill_manager,
+            policy_text=policy_text,
+            policy_source=(
+                "evaluation/data/retail_sandbox/policy.md "
+                f"sha256={EXPECTED_POLICY_SHA256}"
+            ),
+            max_tokens=config.max_tokens,
+        )
 
     service = RetailService(
         store=store,

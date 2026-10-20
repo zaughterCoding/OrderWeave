@@ -19,6 +19,23 @@ _RETAIL_KNOWLEDGE_DESCRIPTION = (
     "只用于解释固定政策和准备注意事项，不构成退货资格、期限、运费或到账承诺。"
 )
 
+# 零售多角色权限：只有主执行者可以绑定身份、准备／提交退货和记录交接；
+# 辅助角色的工具白名单只保留只读查询。
+RETAIL_READ_ONLY_TOOLS = (
+    "get_user_details",
+    "get_order_details",
+    "get_product_details",
+    "calculate",
+)
+RETAIL_STATE_TOOLS = (
+    "find_user_id_by_email",
+    "find_user_id_by_name_zip",
+    "prepare_return",
+    "return_delivered_order_items",
+    "transfer_to_human_agents",
+)
+RETAIL_ALL_TOOLS = RETAIL_STATE_TOOLS + RETAIL_READ_ONLY_TOOLS
+
 
 def retail_knowledge_tool(tool_manager: Any) -> AgentToolSpec:
     """复用既有 RAG 处理函数，只替换为零售模式可见的描述。

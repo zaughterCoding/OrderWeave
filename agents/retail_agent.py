@@ -241,6 +241,16 @@ class RetailTurnResult:
     prepared_op_ids: List[str] = field(default_factory=list)
     display_appended: List[str] = field(default_factory=list)
     memory_error: str = ""
+    # 多 Agent 模式下保留实际参与角色、路由与 Composer 事实；
+    # 单 Agent 模式保持空值。
+    agent_types: List[str] = field(default_factory=list)
+    primary_agent: str = ""
+    supporting_agents: List[str] = field(default_factory=list)
+    routing_reason: str = ""
+    routing_confidence: float = 0.0
+    composer_used: bool = False
+    fallback_used: bool = False
+    role_traces: List[Dict[str, Any]] = field(default_factory=list)
 
 
 class RetailService:
@@ -367,6 +377,7 @@ class RetailService:
 
         response: AgentResponse = await self.agent.handle(request)
         text = str(response.content or "").strip()
+        meta = dict(response.meta or {})
         prepared = [
             item
             for item in self.store.active_pending(client_user_id, conv_id)
@@ -483,6 +494,14 @@ class RetailService:
             prepared_op_ids=[str(item["op_id"]) for item in prepared],
             display_appended=appended,
             memory_error=memory_error,
+            agent_types=list(meta.get("agent_types") or []),
+            primary_agent=str(meta.get("primary_agent") or ""),
+            supporting_agents=list(meta.get("supporting_agents") or []),
+            routing_reason=str(meta.get("routing_reason") or ""),
+            routing_confidence=float(meta.get("routing_confidence") or 0.0),
+            composer_used=bool(meta.get("composer_used")),
+            fallback_used=bool(meta.get("fallback_used")),
+            role_traces=list(meta.get("role_traces") or []),
         )
         self._record_turn_event(
             result=result,
@@ -516,6 +535,14 @@ class RetailService:
             "knowledge_hits": result.knowledge_hits,
             "escalated": result.escalated,
             "latency_ms": result.latency_ms,
+            "agent_types": list(result.agent_types),
+            "primary_agent": result.primary_agent,
+            "supporting_agents": list(result.supporting_agents),
+            "routing_reason": result.routing_reason,
+            "routing_confidence": result.routing_confidence,
+            "composer_used": result.composer_used,
+            "fallback_used": result.fallback_used,
+            "role_traces": list(result.role_traces),
         }
         with self._log_lock:
             self._traces[result.request_id] = trace
@@ -567,6 +594,14 @@ class RetailService:
             "knowledge_hits": result.knowledge_hits,
             "escalated": result.escalated,
             "latency_ms": result.latency_ms,
+            "agent_types": result.agent_types,
+            "primary_agent": result.primary_agent,
+            "supporting_agents": result.supporting_agents,
+            "routing_reason": result.routing_reason,
+            "routing_confidence": result.routing_confidence,
+            "composer_used": result.composer_used,
+            "fallback_used": result.fallback_used,
+            "role_traces": result.role_traces,
             "prepared_op_ids": result.prepared_op_ids,
             "display_appended": result.display_appended,
             "display_failed": display_failed,
@@ -593,6 +628,9 @@ class RetailService:
         stats = self.store.stats()
         return {
             "mode": "retail",
+            "agent_mode": (
+                "multi" if hasattr(self.agent, "orchestrator") else "single"
+            ),
             "agent": {
                 "type": self.agent.agent_type.value,
                 "requests": self.agent.stats.total,

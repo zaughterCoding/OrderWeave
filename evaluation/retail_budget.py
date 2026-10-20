@@ -49,6 +49,14 @@ class BudgetExceeded(RuntimeError):
     """在请求发出前预算已不足，或费用上界已经失效。"""
 
 
+class BudgetStopExceeded(BudgetExceeded):
+    """持久化账本的硬停止；业务层不得把它降级为普通识别失败。"""
+
+
+class TurnRequestLimitExceeded(RuntimeError):
+    """单个外部用户轮次的模型请求数达到冻结上限。"""
+
+
 @dataclass
 class Reservation:
     request_id: str
