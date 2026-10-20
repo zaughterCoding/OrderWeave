@@ -66,6 +66,8 @@ class RetailLedger:
         self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        # 最近一次在发送前被拒绝的原因；调用方据此区分预算停止与普通模型失败。
+        self._last_rejection_reason = ""
         self._initialize(
             float(budget_cny),
             float(input_price_cny_per_mtok),
@@ -202,6 +204,11 @@ class RetailLedger:
     def run_id(self) -> str:
         return self._run_id
 
+    @property
+    def last_rejection_reason(self) -> str:
+        """最近一次发送前被预算拒绝的原因；空字符串表示尚未拒绝。"""
+        return self._last_rejection_reason
+
     def estimate(
         self, input_tokens_upper: int, max_tokens: int
     ) -> float:
@@ -241,9 +248,10 @@ class RetailLedger:
             }
             overrun = meta.get("overrun_reason", "")
             if overrun:
-                raise BudgetExceeded(
+                self._last_rejection_reason = (
                     "账本已因超出预留上界永久停止: " + overrun
                 )
+                raise BudgetExceeded(self._last_rejection_reason)
             totals = connection.execute(
                 "SELECT"
                 " COALESCE(SUM(CASE WHEN status IN ('success','failed','crashed')"
@@ -256,11 +264,12 @@ class RetailLedger:
             reserved = float(totals["reserved"] or 0.0)
             budget = self._pricing["budget_cny"]
             if spent + reserved + upper > budget + 1e-12:
-                raise BudgetExceeded(
+                self._last_rejection_reason = (
                     "预算不足，已在请求前停止: "
                     f"已花 {spent:.6f} + 在途 {reserved:.6f} "
                     f"+ 本次上界 {upper:.6f} > 预算 {budget:.6f} 元"
                 )
+                raise BudgetExceeded(self._last_rejection_reason)
             request_id = f"req-{uuid.uuid4().hex[:12]}"
             connection.execute(
                 "INSERT INTO entries"
