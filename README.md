@@ -210,9 +210,11 @@ uv run --locked --offline python -m pytest tests/integration/test_retail_support
 
 ## 中文混合检索与范围过滤
 
-零售知识已具备Dense、BM25和等权RRF融合三路；`RETAIL_RETRIEVAL_MODE=dense|bm25|hybrid`显式选择，默认Dense。前置过滤核对商品／问题、支持版本、来源、政策版本和类别，避免不适用片段挤占候选；原始用户消息和Host状态限定范围，模型改写不能放宽。记忆与原客服路径不变。
+零售知识已具备Dense、BM25和等权RRF融合三路；`RETAIL_RETRIEVAL_MODE=dense|bm25|hybrid`显式选择，当前默认Hybrid。前置过滤核对商品／问题、支持版本、来源、政策版本和类别，避免不适用片段挤占候选；原始用户消息和Host状态限定范围，模型改写不能放宽。记忆与原客服路径不变。
 
-固定中文消融中，Hybrid的已见test完整证据命中@5为95%（Dense90%），但dev／support的Recall下降，故本轮采用范围过滤并保留Dense默认。18条合成范围烟测中，Dense错误范围命中槽位从36降为0；此结果不代表真实回答质量或泛化错误率。完整数据、参数、三路指标与复现见[U05公开说明](evaluation/data/hybrid_retrieval/README.md)。
+固定中文消融中，Hybrid的已见test完整证据命中@5为95%（Dense90%），但dev／support的Recall下降，U05当时按冻结门槛保留Dense默认；维护者在U06开始前明确采用Hybrid，历史指标与门槛保留。18条合成范围烟测中，Dense错误范围命中槽位从36降为0；此结果不代表真实回答质量或泛化错误率。完整数据、参数、三路指标与复现见[U05公开说明](evaluation/data/hybrid_retrieval/README.md)。
+
+零售重排可通过`RETAIL_RERANKER_MODEL=llm|qwen`选择原生成式排序或本地专用评分，当前默认`qwen`。采用决策综合考虑已见固定集的证据覆盖、延迟、排序完整性和API成本：Qwen完整证据命中51/52（生成式52/52），重排P95约11.33–13.16秒（生成式39.58秒）。生成式保留显式选项；已知多条件证据漏项仍需后续改进。两者均保留证据来源，非法或不完整排序会回退原候选并记录原因；本地模型失败不额外调用付费重排。专用模型须先显式准备固定权重，复用现有独立推理环境，并占用额外本地内存。固定候选池、费用账本、CPU配置与验证边界见[U06公开说明](evaluation/data/reranker_comparison/README.md)。
 
 ```powershell
 uv run --locked --offline python -m evaluation.run_hybrid_retrieval --output data/evaluation/u05/local-001

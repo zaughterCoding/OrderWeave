@@ -431,6 +431,8 @@ async def health():
                                 if _retail_runtime.knowledge_base is not None else "disabled"),
             "retrieval_mode": (_retail_runtime.config.retrieval_mode
                                if _retail_runtime.knowledge_base is not None else "disabled"),
+            "reranker_model": (_retail_runtime.config.reranker_model
+                               if _retail_runtime.knowledge_base is not None else "disabled"),
         }
         if _retail_runtime.config.support_enabled:
             body["support"] = {
@@ -715,6 +717,7 @@ async def knowledge_stats():
                 "collection": _knowledge_base.collection_name,
                 "embedding_model": config.embedding_model,
                 "retrieval_mode": config.retrieval_mode,
+                "reranker_model": config.reranker_model,
                 "frozen": True,
                 "mode": "retail",
             }
@@ -723,6 +726,7 @@ async def knowledge_stats():
             "collection": _knowledge_base.collection_name,
             "embedding_model": config.embedding_model,
             "retrieval_mode": config.retrieval_mode,
+            "reranker_model": config.reranker_model,
             "frozen": True,
             "mode": "retail",
             "support_enabled": True,

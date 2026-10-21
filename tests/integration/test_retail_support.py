@@ -404,6 +404,7 @@ def _configure(monkeypatch, tmp_path, name: str, mode: str) -> tuple[str, str]:
     monkeypatch.setenv("RETAIL_MODE", "1")
     monkeypatch.setenv("RETAIL_EMBEDDING_MODEL", "minilm")
     monkeypatch.setenv("RETAIL_RETRIEVAL_MODE", "dense")
+    monkeypatch.setenv("RETAIL_RERANKER_MODEL", "llm")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("LLM_MODEL", "fake-model")
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
@@ -1493,8 +1494,8 @@ def test_real_chroma_support_collection_has_35_applicable_segments(
 
 @pytest.mark.skipif(os.getenv("RUN_QWEN_SMOKE") != "1", reason="显式启用本地 Qwen 链路烟测")
 @pytest.mark.parametrize("mode", ["single", "multi"])
-@pytest.mark.parametrize("retrieval_mode", ["dense", "hybrid"])
-def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mode, retrieval_mode):
+@pytest.mark.parametrize("retrieval_mode,reranker_model", [("dense", "llm"), ("hybrid", "llm"), ("hybrid", "qwen")])
+def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mode, retrieval_mode, reranker_model):
     """真实向量／存储／MCP，生成使用 Fake，不产生付费请求。"""
     from mcp.qwen_embedding import IDENTITY, QwenEmbeddingFunction
 
@@ -1503,6 +1504,10 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
     # 删除兼容测试的覆盖值，验收产品默认确为 Qwen。
     monkeypatch.delenv("RETAIL_EMBEDDING_MODEL")
     monkeypatch.setenv("RETAIL_RETRIEVAL_MODE", retrieval_mode)
+    if reranker_model == "qwen":
+        monkeypatch.delenv("RETAIL_RERANKER_MODEL")
+    else:
+        monkeypatch.setenv("RETAIL_RERANKER_MODEL", reranker_model)
     _patch_fake(monkeypatch, SupportFakeAnthropic())
     actual_collection = support_collection + QwenEmbeddingFunction.collection_suffix
     old_collection = legacy_collection + QwenEmbeddingFunction.collection_suffix
@@ -1514,6 +1519,7 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
                 kb = runtime.knowledge_base
                 assert runtime.config.embedding_model == "qwen"
                 assert runtime.config.retrieval_mode == retrieval_mode
+                assert runtime.config.reranker_model == reranker_model
                 assert kb.backend == "server"
                 assert kb.collection_name == actual_collection
                 assert kb.doc_count == 35
@@ -1522,6 +1528,7 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
                 assert client.get("/knowledge/stats").json()["retrieval_mode"] == retrieval_mode
                 health = client.get("/health").json()
                 assert health["embedding_model"] == "qwen"
+                assert health["reranker_model"] == reranker_model
                 assert health["support"]["collection"] == actual_collection
                 searched = client.post("/search", params={"query": "烤箱寄回前准备什么", "top_k": 5})
                 assert searched.status_code == 200
@@ -1532,6 +1539,8 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
                 assert any(item["evidence_id"].startswith("T17.") for item in explicit.json()["results"])
                 encoder = kb._embedding_function
                 processes.append(encoder._process)
+                if reranker_model == "qwen":
+                    processes.append(runtime.tool_manager._reranker._process)
                 hits = kb.search("无线耳机蓝牙搜不到，怎么配对？", top_k=5)
                 assert any(item["step_id"] in {"PAIR-01", "PAIR-02", "PAIR-03"} for item in hits)
                 assert kb.upsert_evidence(_load_all_support_rows()) == 0
@@ -1556,12 +1565,16 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
                 assert runtime.ledger.summary()["spent_cny"] == 0
             assert encoder._closed
             assert processes[-1].poll() is not None
-        assert processes[0].pid != processes[1].pid
+            if reranker_model == "qwen":
+                assert runtime.tool_manager._reranker._closed
+                assert all(process.poll() is not None for process in processes)
+        assert len({process.pid for process in processes}) == len(processes)
         # 证据留在本次测试目录，真实回答质量不由 Fake 判定。
         (tmp_path / "qwen_smoke.json").write_text(json.dumps({
             "status": "PASS", "mode": mode, "collection": actual_collection,
             "identity": IDENTITY, "segments": 35, "restarts": 1,
             "retrieval_mode": retrieval_mode,
+            "reranker_model": reranker_model,
             "pids": [process.pid for process in processes],
             "all_workers_stopped": all(process.poll() is not None for process in processes),
             "generation": "FAKE", "cost_cny": 0, "turns": results,

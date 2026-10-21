@@ -47,6 +47,7 @@ from evaluation.retail_ledger import (
 )
 from mcp.knowledge_base import KnowledgeBase
 from mcp.qwen_embedding import QwenEmbeddingFunction
+from mcp.qwen_reranker import QwenReranker
 from mcp.retail_client import RetailMCPClient
 from mcp.retail_store import RetailStore
 from mcp.tool_manager import MCPToolManager, Tool
@@ -408,7 +409,8 @@ class RetailRuntimeConfig:
     )
     support_max_chars: int = MAX_HANDOFF_CHARS
     embedding_model: str = "qwen"
-    retrieval_mode: str = "dense"
+    retrieval_mode: str = "hybrid"
+    reranker_model: str = "qwen"
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -530,7 +532,8 @@ class RetailRuntimeConfig:
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
             embedding_model=_env_text("RETAIL_EMBEDDING_MODEL", "qwen").lower(),
-            retrieval_mode=_env_text("RETAIL_RETRIEVAL_MODE", "dense").lower(),
+            retrieval_mode=_env_text("RETAIL_RETRIEVAL_MODE", "hybrid").lower(),
+            reranker_model=_env_text("RETAIL_RERANKER_MODEL", "qwen").lower(),
             language=language,
             support_enabled=support_enabled,
             support_collection=support_collection,
@@ -588,6 +591,8 @@ class RetailRuntime:
         try:
             if self.config.enable_knowledge and self.config.embedding_model == "qwen":
                 await asyncio.to_thread(self.knowledge_base._embedding_function, ["模型预热"])
+            if self.tool_manager is not None and self.tool_manager._reranker is not None:
+                await asyncio.to_thread(self.tool_manager._reranker.score, "模型预热", [{"content": "政策帮助"}])
             await self.mcp_client.start()
             discovered = self.mcp_client.tools()
             expected = set(retail_tool_scope(has_knowledge=False))
@@ -632,6 +637,11 @@ class RetailRuntime:
                 await asyncio.to_thread(self.knowledge_base.close)
             except Exception:
                 logger.exception("关闭知识向量进程失败")
+        if self.tool_manager is not None and self.tool_manager._reranker is not None:
+            try:
+                await asyncio.to_thread(self.tool_manager._reranker.close)
+            except Exception:
+                logger.exception("关闭重排进程失败")
         try:
             await self.client.aclose()
         except Exception:
@@ -647,6 +657,8 @@ def build_retail_runtime(
         raise ValueError("RETAIL_EMBEDDING_MODEL 只能是 qwen 或 minilm")
     if config.retrieval_mode not in {"dense", "bm25", "hybrid"}:
         raise ValueError("RETAIL_RETRIEVAL_MODE 只能是 dense、bm25 或 hybrid")
+    if config.reranker_model not in {"llm", "qwen"}:
+        raise ValueError("RETAIL_RERANKER_MODEL 只能是 llm 或 qwen")
     encoder = QwenEmbeddingFunction() if config.enable_knowledge and config.embedding_model == "qwen" else None
     try:
         return _build_retail_runtime(config, encoder)
@@ -819,6 +831,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
             base_url=config.base_url or None,
             model=config.model,
             client=client.for_stage("retrieval"),
+            reranker=QwenReranker() if config.reranker_model == "qwen" else None,
         )
         _register_knowledge_tool(tool_manager, knowledge_base)
 

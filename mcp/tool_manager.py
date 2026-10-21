@@ -184,6 +184,7 @@ class MCPToolManager:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         client: Optional[Any] = None,
+        reranker: Optional[Any] = None,
     ):
         if not model:
             raise ValueError("model is required")
@@ -193,6 +194,7 @@ class MCPToolManager:
         # 零售模式注入受预算保护的客户端；旧调用保持原构造行为。
         self._client = client or AsyncAnthropic(**kwargs)
         self._model = model
+        self._reranker = reranker
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}
 
@@ -612,9 +614,25 @@ class MCPToolManager:
         top_k: int,
         diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Any], bool]:
-        """用 LLM 对结果重排；第二个返回值表示是否实际执行了重排。"""
+        """按配置评分或生成排序；异常时保留原候选且标明原因。"""
         diag = diagnostics if diagnostics is not None else {}
         diag["rerank_candidate_count"] = len(items)
+        if self._reranker is not None and len(items) > 1:
+            from mcp.qwen_reranker import validate_scores
+
+            diag["rerank_backend"] = "qwen"
+            try:
+                scores = validate_scores(await asyncio.to_thread(self._reranker.score, query, items), len(items))
+                order = sorted(range(len(items)), key=lambda i: (-scores[i], i))
+                diag.update(rerank_status="applied", rerank_complete=True,
+                            rerank_order=order, rerank_scores=scores)
+                return [dict(items[i], rerank_score=scores[i]) for i in order[:top_k]], True
+            except Exception as exc:
+                diag.update(rerank_status="failed", rerank_complete=False,
+                            rerank_error=str(exc)[:300])
+                return items[:top_k], False
+
+        diag["rerank_backend"] = "llm" if self._reranker is None else "qwen"
         if len(items) <= top_k:
             diag["rerank_status"] = "skipped_candidates<=top_k"
             return items, False
@@ -634,6 +652,13 @@ class MCPToolManager:
             order: List[int] = json.loads(raw[start:end])
             if not isinstance(order, list):
                 diag["rerank_status"] = "invalid_output"
+                return items[:top_k], False
+            diag["rerank_raw_order"] = order
+            complete = (all(type(i) is int for i in order) and len(order) == len(items)
+                        and set(order) == set(range(len(items))))
+            diag["rerank_complete"] = complete
+            if not complete:
+                diag["rerank_status"] = "incomplete_or_invalid_order"
                 return items[:top_k], False
             reranked = [items[i] for i in order if isinstance(i, int) and 0 <= i < len(items)]
             if not reranked:
