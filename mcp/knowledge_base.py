@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import chromadb
 from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+from mcp.hybrid_retrieval import BM25Index, CANDIDATE_K, reciprocal_rank_fusion
 
 logger = logging.getLogger(__name__)
 
@@ -246,15 +247,47 @@ class KnowledgeBase:
             logger.info(f"零售证据写入 {len(new_ids)} 段")
         return len(new_ids)
 
-    def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def configure_retrieval(self, passages: List[Dict[str, Any]], mode: str) -> None:
+        """冻结零售语料的词法快照；在线通用文档不使用该快照。"""
+        if mode not in {"dense", "bm25", "hybrid"}:
+            raise ValueError("检索模式只能是 dense、bm25 或 hybrid")
+        if set(self.list_ids()) != {row["evidence_id"] for row in passages}:
+            raise ValueError("检索快照与向量集合证据ID不一致")
+        self._lexical_index = BM25Index([
+            {**row, "id": row["evidence_id"], "chunk": 0} for row in passages
+        ])
+        self.retrieval_mode = mode
+
+    def search(self, query: str, top_k: int = 5, item_filter=None) -> List[Dict[str, Any]]:
+        """先限制适用证据，再做Dense／BM25召回与可选排名融合。"""
+        index = getattr(self, "_lexical_index", None)
+        if index is None:
+            if item_filter is not None:
+                raise RuntimeError("范围过滤需要先配置冻结知识快照")
+            return self._dense_search(query, top_k)
+        allowed = {key for key, item in index.items.items() if item_filter is None or item_filter(item)}
+        if not allowed:
+            return []
+        mode = self.retrieval_mode
+        recall_k = max(top_k, CANDIDATE_K) if mode == "hybrid" else top_k
+        lexical = index.search(query, recall_k, allowed) if mode != "dense" else []
+        if mode == "bm25":
+            return lexical
+        dense = self._dense_search(query, min(recall_k, len(allowed)), allowed)
+        if mode == "hybrid":
+            return reciprocal_rank_fusion(dense, lexical, top_k)
+        return [{**item, "dense_score": item["score"], "retrieval_mode": "dense"} for item in dense]
+
+    def _dense_search(self, query: str, top_k: int, allowed=None) -> List[Dict[str, Any]]:
         """返回与查询最相关的片段，并保留稳定证据身份与来源。"""
+        options = {"where": {"evidence_id": {"$in": sorted(allowed)}}} if allowed is not None else {}
         encoder = getattr(self, "_embedding_function", None)
         if hasattr(encoder, "encode_query"):
             results = self._collection.query(
-                query_embeddings=encoder.encode_query(query), n_results=top_k,
+                query_embeddings=encoder.encode_query(query), n_results=top_k, **options,
             )
         else:
-            results = self._collection.query(query_texts=[query], n_results=top_k)
+            results = self._collection.query(query_texts=[query], n_results=top_k, **options)
 
         items = []
         ids = results.get("ids", [[]])[0]
@@ -284,6 +317,7 @@ class KnowledgeBase:
                         "policy_release": meta.get("policy_release", ""),
                         "policy_commit": meta.get("policy_commit", ""),
                         "scope": meta.get("scope", ""),
+                        "language": meta.get("language", ""),
                         "category": meta.get("category", ""),
                         "product_id": meta.get("product_id", ""),
                         "issue": meta.get("issue", ""),
@@ -306,9 +340,11 @@ class KnowledgeBase:
         if close is not None:
             close()
 
-    async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    async def search_async(self, query: str, top_k: int = 5, item_filter=None) -> List[Dict[str, Any]]:
         """在线程池中执行同步的 ChromaDB 查询。"""
-        return await asyncio.to_thread(self.search, query, top_k)
+        if item_filter is None:
+            return await asyncio.to_thread(self.search, query, top_k)
+        return await asyncio.to_thread(self.search, query, top_k, item_filter)
 
     @property
     def doc_count(self) -> int:
@@ -335,7 +371,8 @@ class KnowledgeBase:
         """本知识库注册为工具时使用的处理函数。"""
         query = params.get("query", "")
         top_k = params.get("top_k", 5)
-        return await self.search_async(query, top_k=top_k)
+        item_filter = (context or {}).get("knowledge_item_filter")
+        return await self.search_async(query, top_k=top_k, item_filter=item_filter)
 
     def _chunk_text(self, text: str, chunk_size: int = 500) -> List[str]:
         """按近似句子边界切分长文本。"""

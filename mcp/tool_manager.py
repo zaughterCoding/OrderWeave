@@ -259,7 +259,7 @@ class MCPToolManager:
                 data, reranked = await self._rerank(query, data, rerank_top_k)
 
             # 缓存最终结果，避免后续命中绕过重排。
-            if tool.cache_ttl > 0:
+            if use_cache and tool.cache_ttl > 0:
                 self._set_cache(
                     name,
                     params,
@@ -418,11 +418,12 @@ class MCPToolManager:
         context: Optional[Dict[str, Any]] = None,
         diagnostics: Optional[Dict[str, Any]] = None,
         item_filter: Optional[Callable[[Any], bool]] = None,
+        expand_filtered_recall: bool = True,
     ) -> ToolResult:
         """执行改写、并行召回、合并去重和重排。
 
-        item_filter 在合并后、重排前应用，只用于支持资料的适用性过滤；
-        默认 None 时保持原检索链。
+        item_filter 转发给本地知识处理器，在各通道top-k前过滤；合并后再复核。
+        带范围的调用不读写结果缓存，避免不同会话范围串用。
         """
         diag = diagnostics if diagnostics is not None else {}
         total_start = time.monotonic()
@@ -438,12 +439,17 @@ class MCPToolManager:
         logger.info(f"查询改写: {query!r} → {sub_queries}")
 
         recall_k = settings["recall_k"]
-        if item_filter is not None:
+        if item_filter is not None and expand_filtered_recall:
             recall_k = max(recall_k, SUPPORT_RECALL_K)
             diag["support_recall_k"] = recall_k
         recall_start = time.monotonic()
+        recall_context = context
+        if item_filter is not None:
+            recall_context = {**(context or {}), "knowledge_item_filter": item_filter}
+            diag["candidate_filter_forwarded"] = True
         tasks = [
-            self.call(tool_name, {"query": q, "top_k": recall_k}, context, use_cache=True)
+            self.call(tool_name, {"query": q, "top_k": recall_k}, recall_context,
+                      use_cache=item_filter is None)
             for q in sub_queries
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)

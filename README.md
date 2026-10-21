@@ -208,6 +208,17 @@ uv run --locked --offline python -m pytest tests/integration/test_retail_support
 
 完整模型来源、独立依赖安装、下载校验、运行与采用门槛见[公开复现说明](evaluation/data/embedding_comparison/README.md)。
 
+## 中文混合检索与范围过滤
+
+零售知识已具备Dense、BM25和等权RRF融合三路；`RETAIL_RETRIEVAL_MODE=dense|bm25|hybrid`显式选择，默认Dense。前置过滤核对商品／问题、支持版本、来源、政策版本和类别，避免不适用片段挤占候选；原始用户消息和Host状态限定范围，模型改写不能放宽。记忆与原客服路径不变。
+
+固定中文消融中，Hybrid的已见test完整证据命中@5为95%（Dense90%），但dev／support的Recall下降，故本轮采用范围过滤并保留Dense默认。18条合成范围烟测中，Dense错误范围命中槽位从36降为0；此结果不代表真实回答质量或泛化错误率。完整数据、参数、三路指标与复现见[U05公开说明](evaluation/data/hybrid_retrieval/README.md)。
+
+```powershell
+uv run --locked --offline python -m evaluation.run_hybrid_retrieval --output data/evaluation/u05/local-001
+uv run --locked --offline python -m pytest tests/test_hybrid_retrieval.py -q
+```
+
 ## τ-retail 固定子集评测
 
 该入口在项目内另建独立 Python 3.12 环境运行固定上游文字评测组件，不改变主环境或主 `uv.lock`。固定上游为 `sierra-research/tau2-bench` `v1.0.1`／提交 `fc0055dc4e0a316c3f83133267fbd6faaa770992`；任务顺序固定为 11、12、46、48、51、83、92、108，各 1 次，`concurrency=1`、`trials=1`、计划 `seed=300`（只记录在配置和协议日志，当前未传给模型 SDK，不承诺确定性复现）、`max_steps=200`、`max_errors=10`。被测业务始终走本文档所述的 `RetailService`／`RetailAgent`／`RetailStore`，不使用官方被测 Agent。

@@ -262,11 +262,12 @@ def create_handoff_summary(req: Request, args: Dict[str, Any]) -> Dict[str, Any]
 def build_shared_rag_tools(
     tool_manager: Any,
     filter_for_request: Optional[Callable[[Request, Any], bool]] = None,
+    expand_filtered_recall: bool = True,
 ) -> Dict[str, AgentToolSpec]:
     """构造所有 Agent 共用的 RAG 工具。
 
-    filter_for_request 仅在有限支持启用时传入，用于在合并前剔除不适用证据；
-    默认不改变原检索链。
+    filter_for_request 由业务提供，知识处理器在通道召回前过滤并于合并后复核；
+    通用模式默认不传入。
     """
 
     async def search_knowledge_base(req: Request, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -280,6 +281,8 @@ def build_shared_rag_tools(
         extra: Dict[str, Any] = {}
         if filter_for_request is not None:
             extra["item_filter"] = lambda item: filter_for_request(req, item)
+            if not expand_filtered_recall:
+                extra["expand_filtered_recall"] = False
         result = await tool_manager.search_with_rewrite(
             "knowledge_search",
             query,

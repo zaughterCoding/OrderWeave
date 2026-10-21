@@ -10,6 +10,35 @@ CHROMA_HOST = os.getenv("CHROMA_HOST", "127.0.0.1")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8002"))
 
 
+def test_real_chroma_prefilter_survives_more_than_20_wrong_scope_candidates(tmp_path):
+    """真实Chroma验证先过滤再取候选；固定向量只控制干扰排序。"""
+    import numpy as np
+
+    class FixedEmbedding:
+        def __call__(self, input):
+            return np.asarray([[0.0, 1.0] if "allowed" in text else [1.0, 0.0]
+                               for text in input], dtype=np.float32)
+
+    name = "u05filter_" + uuid.uuid4().hex[:12]
+    kb = KnowledgeBase(chroma_host=CHROMA_HOST, chroma_port=CHROMA_PORT,
+                       chroma_path=str(tmp_path / "chroma"), collection_name=name,
+                       embedding_function=FixedEmbedding(), load_demo_documents=False)
+    try:
+        assert kb.backend == "server"
+        rows = [{"evidence_id": f"wrong{i:02}", "doc_id": "wrong", "title": "PAIR-01",
+                 "content": "PAIR-01"} for i in range(25)]
+        rows.append({"evidence_id": "good", "doc_id": "good", "title": "PAIR-01",
+                     "content": "allowed PAIR-01"})
+        kb.upsert_evidence(rows)
+        for mode in ("dense", "bm25", "hybrid"):
+            kb.configure_retrieval(rows, mode)
+            assert kb.search("PAIR-01", 1)[0]["evidence_id"] != "good"
+            assert kb.search("PAIR-01", 1, lambda row: row["evidence_id"] == "good")[0]["evidence_id"] == "good"
+    finally:
+        kb.close()
+        kb._client.delete_collection(kb.collection_name)
+
+
 def test_real_chroma_import_search_and_idempotency(tmp_path):
     collection_name = f"retrieval_test_{uuid.uuid4().hex}"
     kb = KnowledgeBase(

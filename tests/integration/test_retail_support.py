@@ -403,6 +403,7 @@ def _configure(monkeypatch, tmp_path, name: str, mode: str) -> tuple[str, str]:
     legacy_collection = f"t17l{name}"
     monkeypatch.setenv("RETAIL_MODE", "1")
     monkeypatch.setenv("RETAIL_EMBEDDING_MODEL", "minilm")
+    monkeypatch.setenv("RETAIL_RETRIEVAL_MODE", "dense")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("LLM_MODEL", "fake-model")
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
@@ -1492,7 +1493,8 @@ def test_real_chroma_support_collection_has_35_applicable_segments(
 
 @pytest.mark.skipif(os.getenv("RUN_QWEN_SMOKE") != "1", reason="显式启用本地 Qwen 链路烟测")
 @pytest.mark.parametrize("mode", ["single", "multi"])
-def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mode):
+@pytest.mark.parametrize("retrieval_mode", ["dense", "hybrid"])
+def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mode, retrieval_mode):
     """真实向量／存储／MCP，生成使用 Fake，不产生付费请求。"""
     from mcp.qwen_embedding import IDENTITY, QwenEmbeddingFunction
 
@@ -1500,6 +1502,7 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
     support_collection, legacy_collection = _configure(monkeypatch, tmp_path, name, mode)
     # 删除兼容测试的覆盖值，验收产品默认确为 Qwen。
     monkeypatch.delenv("RETAIL_EMBEDDING_MODEL")
+    monkeypatch.setenv("RETAIL_RETRIEVAL_MODE", retrieval_mode)
     _patch_fake(monkeypatch, SupportFakeAnthropic())
     actual_collection = support_collection + QwenEmbeddingFunction.collection_suffix
     old_collection = legacy_collection + QwenEmbeddingFunction.collection_suffix
@@ -1510,14 +1513,23 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
                 runtime = api_main._retail_runtime
                 kb = runtime.knowledge_base
                 assert runtime.config.embedding_model == "qwen"
+                assert runtime.config.retrieval_mode == retrieval_mode
                 assert kb.backend == "server"
                 assert kb.collection_name == actual_collection
                 assert kb.doc_count == 35
                 assert kb._collection.metadata["embedding_identity"] == IDENTITY
                 assert client.get("/knowledge/stats").json()["collection"] == actual_collection
+                assert client.get("/knowledge/stats").json()["retrieval_mode"] == retrieval_mode
                 health = client.get("/health").json()
                 assert health["embedding_model"] == "qwen"
                 assert health["support"]["collection"] == actual_collection
+                searched = client.post("/search", params={"query": "烤箱寄回前准备什么", "top_k": 5})
+                assert searched.status_code == 200
+                assert searched.json()["results"]
+                assert all(item["category"] in {"all", "small_appliances"} for item in searched.json()["results"])
+                explicit = client.post("/search", params={"query": "Wireless Earbuds 蓝牙搜不到怎么配对", "top_k": 5})
+                assert explicit.status_code == 200
+                assert any(item["evidence_id"].startswith("T17.") for item in explicit.json()["results"])
                 encoder = kb._embedding_function
                 processes.append(encoder._process)
                 hits = kb.search("无线耳机蓝牙搜不到，怎么配对？", top_k=5)
@@ -1549,6 +1561,7 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
         (tmp_path / "qwen_smoke.json").write_text(json.dumps({
             "status": "PASS", "mode": mode, "collection": actual_collection,
             "identity": IDENTITY, "segments": 35, "restarts": 1,
+            "retrieval_mode": retrieval_mode,
             "pids": [process.pid for process in processes],
             "all_workers_stopped": all(process.poll() is not None for process in processes),
             "generation": "FAKE", "cost_cny": 0, "turns": results,

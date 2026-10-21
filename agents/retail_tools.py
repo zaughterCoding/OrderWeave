@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, Optional
 
 from agents.tools import (
@@ -44,6 +45,41 @@ RETAIL_SUPPORT_TECHNICAL_TOOLS = (
     "search_knowledge_base",
 )
 
+_CATEGORY_MARKERS = {
+    "consumer_electronics": ("电子", "耳机", "电脑", "手机", "相机", "平板", "earbuds", "headphones", "laptop", "smartphone", "camera", "tablet"),
+    "small_appliances": ("小家电", "烤箱", "咖啡机", "吸尘器", "净化器", "电水壶", "搅拌机", "微波炉", "电饭煲", "toaster", "coffee maker", "blender", "vacuum"),
+    "apparel_footwear": ("衣服", "服装", "鞋", "靴", "t恤", "衬衫", "外套", "裙", "尺码", "jacket", "shoes", "sneakers", "shirt", "dress"),
+}
+_POLICY_COMMIT = "fc0055dc4e0a316c3f83133267fbd6faaa770992"
+
+
+def retail_evidence_applicable(item: Any, packet: Optional[Dict[str, Any]], message: str) -> bool:
+    """原始询问限定类别，Host限定支持商品；改写文本不能放宽范围。"""
+    if not support_evidence_applicable(item, packet) or item.get("language") != "zh":
+        return False
+    category = item.get("category")
+    if category == "product_support":
+        return (item.get("product_id") == "9924732112"
+                and isinstance(packet, dict) and packet.get("issue") == "bluetooth_pairing"
+                and item.get("scope") == "project_zh_earbuds"
+                and item.get("support_version") == "t17.1"
+                and item.get("policy_release") == "t17-sandbox-v1"
+                and item.get("source_kind") == "project_authored_sandbox"
+                and item.get("issue") == "bluetooth_pairing")
+    if item.get("product_id"):
+        return False
+    if (item.get("scope") != "project_zh" or item.get("policy_release") != "v1.0.1"
+            or item.get("policy_commit") != _POLICY_COMMIT
+            or item.get("source_kind") not in {"upstream_paraphrase", "upstream_derived", "project_authored"}):
+        return False
+    categories = {name for name, markers in _CATEGORY_MARKERS.items() if any(
+        (re.search(r"\b" + re.escape(marker) + r"\b", message.casefold()) if marker.isascii()
+         else marker in message.casefold()) for marker in markers)}
+    if (not categories and isinstance(packet, dict) and packet.get("supported") is True
+            and packet.get("scope_state") == "active" and packet.get("product_id") == "9924732112"):
+        categories = {"consumer_electronics"}
+    return category == "all" or category in _CATEGORY_MARKERS and (not categories or category in categories)
+
 
 def retail_knowledge_tool(
     tool_manager: Any,
@@ -52,15 +88,15 @@ def retail_knowledge_tool(
     """复用既有 RAG 处理函数，只替换为零售模式可见的描述。
 
     T12 保留的 A 召回最终只返回 5 条；这里把模型可见的 top_k 上限也
-    收到 5，避免单次咨询扩大证据集合。支持模式增加适用性过滤。
+    收到 5；普通咨询候选5条，支持咨询保留原20条，前置过滤不扩大预算。
     """
-    filter_for_request = None
-    if support_enabled:
-        filter_for_request = lambda req, item: support_evidence_applicable(
-            item, getattr(req, "retail_support", None)
-        )
+    filter_for_request = lambda req, item: retail_evidence_applicable(
+        item, getattr(req, "retail_support", None) if support_enabled else None,
+        req.message,
+    )
     shared = build_shared_rag_tools(
-        tool_manager, filter_for_request=filter_for_request
+        tool_manager, filter_for_request=filter_for_request,
+        expand_filtered_recall=support_enabled,
     )["search_knowledge_base"]
     properties = dict(shared.input_schema["properties"])
     properties["top_k"] = {

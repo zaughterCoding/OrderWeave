@@ -429,6 +429,8 @@ async def health():
             "budget": _retail_runtime.ledger.summary(),
             "embedding_model": (_retail_runtime.config.embedding_model
                                 if _retail_runtime.knowledge_base is not None else "disabled"),
+            "retrieval_mode": (_retail_runtime.config.retrieval_mode
+                               if _retail_runtime.knowledge_base is not None else "disabled"),
         }
         if _retail_runtime.config.support_enabled:
             body["support"] = {
@@ -608,12 +610,24 @@ async def prometheus_metrics():
 
 @app.post("/search")
 async def search(query: str, top_k: int = 5):
+    extra = {}
     if _retail_runtime is not None:
         top_k = max(1, min(int(top_k), 10))
+        from agents.retail_tools import retail_evidence_applicable
+        from agents.retail_support import analyze_message, build_support_packet
+        packet = None
+        if _retail_runtime.config.support_enabled:
+            analysis = analyze_message(query, None, None, False)
+            packet = build_support_packet(None, analysis, query, 0, None, [])
+        extra = {
+            "item_filter": lambda item: retail_evidence_applicable(item, packet, query),
+            # 独立搜索保留原候选数；会话支持工具的20条预算由工具适配器控制。
+            "expand_filtered_recall": False,
+        }
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
     result = await _tool_manager.search_with_rewrite(
-        "knowledge_search", query, top_k=top_k
+        "knowledge_search", query, top_k=top_k, **extra
     )
     return {
         "query": query,
@@ -700,6 +714,7 @@ async def knowledge_stats():
                 "total_chunks": total,
                 "collection": _knowledge_base.collection_name,
                 "embedding_model": config.embedding_model,
+                "retrieval_mode": config.retrieval_mode,
                 "frozen": True,
                 "mode": "retail",
             }
@@ -707,6 +722,7 @@ async def knowledge_stats():
             "total_chunks": total,
             "collection": _knowledge_base.collection_name,
             "embedding_model": config.embedding_model,
+            "retrieval_mode": config.retrieval_mode,
             "frozen": True,
             "mode": "retail",
             "support_enabled": True,

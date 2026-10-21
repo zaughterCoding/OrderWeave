@@ -219,6 +219,7 @@ def _configure_retail(monkeypatch, tmp_path, name: str):
     monkeypatch.setenv("RETAIL_KNOWLEDGE_PATH", KNOWLEDGE)
     monkeypatch.setenv("RETAIL_COLLECTION", collection)
     monkeypatch.setenv("RETAIL_EMBEDDING_MODEL", "minilm")
+    monkeypatch.setenv("RETAIL_RETRIEVAL_MODE", "dense")
     monkeypatch.setenv("RETAIL_BUDGET_LEDGER", str(tmp_path / "ledger.db"))
     monkeypatch.setenv("RETAIL_BUDGET_CNY", "5")
     monkeypatch.setenv("RETAIL_INPUT_CNY_PER_MTOK", "1")
@@ -316,6 +317,7 @@ def test_retail_api_multiturn_display_confirm_and_knowledge(
                 "total_chunks": 29,
                 "collection": collection,
                 "embedding_model": "minilm",
+                "retrieval_mode": "dense",
                 "frozen": True,
                 "mode": "retail",
             }

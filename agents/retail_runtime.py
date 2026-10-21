@@ -408,6 +408,7 @@ class RetailRuntimeConfig:
     )
     support_max_chars: int = MAX_HANDOFF_CHARS
     embedding_model: str = "qwen"
+    retrieval_mode: str = "dense"
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -529,6 +530,7 @@ class RetailRuntimeConfig:
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
             embedding_model=_env_text("RETAIL_EMBEDDING_MODEL", "qwen").lower(),
+            retrieval_mode=_env_text("RETAIL_RETRIEVAL_MODE", "dense").lower(),
             language=language,
             support_enabled=support_enabled,
             support_collection=support_collection,
@@ -643,6 +645,8 @@ def build_retail_runtime(
     config = config or RetailRuntimeConfig.from_env()
     if config.embedding_model not in {"qwen", "minilm"}:
         raise ValueError("RETAIL_EMBEDDING_MODEL 只能是 qwen 或 minilm")
+    if config.retrieval_mode not in {"dense", "bm25", "hybrid"}:
+        raise ValueError("RETAIL_RETRIEVAL_MODE 只能是 dense、bm25 或 hybrid")
     encoder = QwenEmbeddingFunction() if config.enable_knowledge and config.embedding_model == "qwen" else None
     try:
         return _build_retail_runtime(config, encoder)
@@ -784,6 +788,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
             else list(knowledge_rows)
         )
         added = knowledge_base.upsert_evidence(incoming_rows)
+        knowledge_base.configure_retrieval(incoming_rows, config.retrieval_mode)
         total = knowledge_base.doc_count
         if total != expected_segments:
             raise RuntimeError(
