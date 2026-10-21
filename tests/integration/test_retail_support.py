@@ -500,6 +500,73 @@ def _db(tmp_path) -> RetailStore:
     return RetailStore(tmp_path / "retail.db", SEED, language="zh")
 
 
+@pytest.mark.parametrize("mode", ["single", "multi"])
+def test_u09_corrected_text_reaches_support_memory_and_logs(monkeypatch, tmp_path, mode):
+    """模型故意错说金额和到账，真实 MCP 操作仍只执行一次。"""
+    name = f"u09{mode}{uuid.uuid4().hex[:6]}"
+    support_collection, legacy_collection = _configure(monkeypatch, tmp_path, name, mode)
+
+    class WrongWording(SupportFakeMessages):
+        def _agent_response(self, messages):
+            result = _last_tool_result(messages)
+            response = super()._agent_response(messages)
+            if result and result.get("success") and (
+                "display_text" in result or result.get("status") == "return requested"
+            ):
+                return _text("预计申请金额：¥999999.99。退款已到账，之后可以修改退款去向。")
+            return response
+
+    fake = SupportFakeAnthropic()
+    fake.messages = WrongWording()
+    _patch_fake(monkeypatch, fake)
+    saved = []
+
+    class Memory:
+        async def get_context(self, *args, **kwargs):
+            return SimpleNamespace(to_prompt_text=lambda: "")
+
+        async def add_message(self, *args):
+            saved.append(args[-1])
+
+    async def scenario():
+        async with _runtime() as runtime:
+            runtime.service.memory = Memory()
+            first = await runtime.service.handle_turn(
+                f"我要退无线耳机，不想排查。我的邮箱是 {EMAIL}，订单 {ORDER}，直接退货。",
+                name, name,
+            )
+            assert "999999.99" not in first.response
+            assert "尚未提交" in first.response
+            pending = runtime.store.active_pending(name, name)
+            assert len(pending) == 1 and pending[0]["status"] == "displayed"
+            assert pending[0]["display_text"] in first.response
+            assert saved[-1] == first.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 0
+            second = await runtime.service.handle_turn("确认，就按这些申请退货", name, name)
+            assert ORDER in second.response and "¥258.84" in second.response
+            assert "尚未核实" in second.response and "不支持提交后更改" in second.response
+            assert "999999.99" not in second.response
+            assert runtime.store.stats()["counts"]["return_operations"] == 1
+            record = runtime.store.load_support_state(name, name)
+            assert record["visible_history"][-1]["assistant"] == second.response
+            assert saved[-1] == second.response
+            assert runtime.service.get_tool_trace(second.request_id)["response_guard"]["mode"] == "controlled"
+            assert runtime.ledger.summary()["spent_cny"] == 0
+        rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+        turns = [row for row in rows if row.get("type") == "turn"]
+        assert turns[-1]["assistant_message"] == second.response
+        assert all(row["response_guard"]["model_calls"] == 0 for row in turns)
+
+    try:
+        asyncio.run(scenario())
+        log_text = (tmp_path / "mcp_stderr.log").read_text(encoding="utf-8")
+        assert log_text.count("call tool=return_delivered_order_items ") == 1
+        for pid in _mcp_pids(log_text)[1]:
+            _assert_process_stopped(pid)
+    finally:
+        _cleanup(support_collection, legacy_collection)
+
+
 def _support_state(tmp_path, client_user, conv):
     return _db(tmp_path).load_support_state(client_user, conv)
 
