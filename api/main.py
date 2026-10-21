@@ -188,7 +188,8 @@ async def lifespan(app: FastAPI):
                 "零售模式已就绪: model=%s db=%s collection=%s budget=%.2f CNY",
                 _retail_runtime.config.model,
                 _retail_runtime.config.db_path,
-                _retail_runtime.config.knowledge_collection,
+                (_retail_runtime.knowledge_base.collection_name
+                 if _retail_runtime.knowledge_base is not None else "disabled"),
                 _retail_runtime.config.budget_cny,
             )
             yield
@@ -426,11 +427,13 @@ async def health():
             "agents": summary["agent"],
             "store": _retail_runtime.store.stats(),
             "budget": _retail_runtime.ledger.summary(),
+            "embedding_model": (_retail_runtime.config.embedding_model
+                                if _retail_runtime.knowledge_base is not None else "disabled"),
         }
         if _retail_runtime.config.support_enabled:
             body["support"] = {
                 "enabled": True,
-                "collection": _retail_runtime.config.support_collection,
+                "collection": _retail_runtime.knowledge_base.collection_name,
                 "language": _retail_runtime.config.language,
             }
         return body
@@ -695,13 +698,15 @@ async def knowledge_stats():
         if not config.support_enabled:
             return {
                 "total_chunks": total,
-                "collection": config.knowledge_collection,
+                "collection": _knowledge_base.collection_name,
+                "embedding_model": config.embedding_model,
                 "frozen": True,
                 "mode": "retail",
             }
         return {
             "total_chunks": total,
-            "collection": config.support_collection,
+            "collection": _knowledge_base.collection_name,
+            "embedding_model": config.embedding_model,
             "frozen": True,
             "mode": "retail",
             "support_enabled": True,

@@ -6,6 +6,7 @@ Chroma 集合、仅含冻结证据的知识集合、受预算账本约束的客�
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -45,6 +46,7 @@ from evaluation.retail_ledger import (
     build_budgeted_client,
 )
 from mcp.knowledge_base import KnowledgeBase
+from mcp.qwen_embedding import QwenEmbeddingFunction
 from mcp.retail_client import RetailMCPClient
 from mcp.retail_store import RetailStore
 from mcp.tool_manager import MCPToolManager, Tool
@@ -405,6 +407,7 @@ class RetailRuntimeConfig:
         )
     )
     support_max_chars: int = MAX_HANDOFF_CHARS
+    embedding_model: str = "qwen"
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -525,6 +528,7 @@ class RetailRuntimeConfig:
             agent_mode=agent_mode,
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
+            embedding_model=_env_text("RETAIL_EMBEDDING_MODEL", "qwen").lower(),
             language=language,
             support_enabled=support_enabled,
             support_collection=support_collection,
@@ -580,6 +584,8 @@ class RetailRuntime:
         if self._started:
             return
         try:
+            if self.config.enable_knowledge and self.config.embedding_model == "qwen":
+                await asyncio.to_thread(self.knowledge_base._embedding_function, ["模型预热"])
             await self.mcp_client.start()
             discovered = self.mcp_client.tools()
             expected = set(retail_tool_scope(has_knowledge=False))
@@ -605,7 +611,7 @@ class RetailRuntime:
         self._started = True
 
     async def close(self) -> None:
-        """按 MCP、记忆、模型客户端的顺序关闭，单步失败不跳过后续清理。"""
+        """关闭工具、记忆、向量进程与模型客户端，单步失败不跳过后续清理。"""
         if self._closed:
             return
         self._closed = True
@@ -619,6 +625,11 @@ class RetailRuntime:
                 await self.memory.close()
             except Exception:
                 logger.exception("关闭记忆服务失败")
+        if self.knowledge_base is not None:
+            try:
+                await asyncio.to_thread(self.knowledge_base.close)
+            except Exception:
+                logger.exception("关闭知识向量进程失败")
         try:
             await self.client.aclose()
         except Exception:
@@ -630,6 +641,18 @@ def build_retail_runtime(
 ) -> RetailRuntime:
     """按环境配置构造零售运行时；不会自动重置已有业务库。"""
     config = config or RetailRuntimeConfig.from_env()
+    if config.embedding_model not in {"qwen", "minilm"}:
+        raise ValueError("RETAIL_EMBEDDING_MODEL 只能是 qwen 或 minilm")
+    encoder = QwenEmbeddingFunction() if config.enable_knowledge and config.embedding_model == "qwen" else None
+    try:
+        return _build_retail_runtime(config, encoder)
+    except Exception:
+        if encoder is not None:
+            encoder.close()
+        raise
+
+
+def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime:
 
     if config.support_enabled:
         if str(config.language).lower() != "zh":
@@ -753,6 +776,7 @@ def build_retail_runtime(
             chroma_path=str(config.chroma_path),
             collection_name=collection_name,
             load_demo_documents=False,
+            embedding_function=encoder,
         )
         incoming_rows = (
             list(knowledge_rows) + list(support_rows)

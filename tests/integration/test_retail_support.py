@@ -402,6 +402,7 @@ def _configure(monkeypatch, tmp_path, name: str, mode: str) -> tuple[str, str]:
     support_collection = f"t17s{name}"
     legacy_collection = f"t17l{name}"
     monkeypatch.setenv("RETAIL_MODE", "1")
+    monkeypatch.setenv("RETAIL_EMBEDDING_MODEL", "minilm")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("LLM_MODEL", "fake-model")
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
@@ -1487,3 +1488,76 @@ def test_real_chroma_support_collection_has_35_applicable_segments(
         asyncio.run(scenario())
     finally:
         _cleanup(support_collection, legacy_collection)
+
+
+@pytest.mark.skipif(os.getenv("RUN_QWEN_SMOKE") != "1", reason="显式启用本地 Qwen 链路烟测")
+@pytest.mark.parametrize("mode", ["single", "multi"])
+def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mode):
+    """真实向量／存储／MCP，生成使用 Fake，不产生付费请求。"""
+    from mcp.qwen_embedding import IDENTITY, QwenEmbeddingFunction
+
+    name = f"u04{mode}{uuid.uuid4().hex[:6]}"
+    support_collection, legacy_collection = _configure(monkeypatch, tmp_path, name, mode)
+    # 删除兼容测试的覆盖值，验收产品默认确为 Qwen。
+    monkeypatch.delenv("RETAIL_EMBEDDING_MODEL")
+    _patch_fake(monkeypatch, SupportFakeAnthropic())
+    actual_collection = support_collection + QwenEmbeddingFunction.collection_suffix
+    old_collection = legacy_collection + QwenEmbeddingFunction.collection_suffix
+    processes, results = [], []
+    try:
+        for restart in range(2):
+            with TestClient(api_main.app) as client:
+                runtime = api_main._retail_runtime
+                kb = runtime.knowledge_base
+                assert runtime.config.embedding_model == "qwen"
+                assert kb.backend == "server"
+                assert kb.collection_name == actual_collection
+                assert kb.doc_count == 35
+                assert kb._collection.metadata["embedding_identity"] == IDENTITY
+                assert client.get("/knowledge/stats").json()["collection"] == actual_collection
+                health = client.get("/health").json()
+                assert health["embedding_model"] == "qwen"
+                assert health["support"]["collection"] == actual_collection
+                encoder = kb._embedding_function
+                processes.append(encoder._process)
+                hits = kb.search("无线耳机蓝牙搜不到，怎么配对？", top_k=5)
+                assert any(item["step_id"] in {"PAIR-01", "PAIR-02", "PAIR-03"} for item in hits)
+                assert kb.upsert_evidence(_load_all_support_rows()) == 0
+                if restart == 0:
+                    def chat(message):
+                        response = client.post("/chat", json={"message": message, "user_id": name, "conv_id": name})
+                        assert response.status_code == 200, response.text
+                        payload = response.json()
+                        results.append(payload)
+                        return payload
+
+                    first = chat("我的无线耳机蓝牙搜不到，怎么配对？")
+                    assert "search_knowledge_base" in first["tools_used"]
+                    assert "PAIR-0" in first["response"]
+                    chat("还是不行，那就退了吧")
+                    prepared = chat(f"我的邮箱是 {EMAIL}，订单 {ORDER}，申请退货，退无线耳机。")
+                    assert "【退货申请详情（待确认）】" in prepared["response"]
+                    assert runtime.store.stats()["counts"]["return_operations"] == 0
+                    confirmed = chat("确认，就按这些申请退货")
+                    assert "return requested" in confirmed["response"]
+                assert runtime.store.stats()["counts"]["return_operations"] == 1
+                assert runtime.ledger.summary()["spent_cny"] == 0
+            assert encoder._closed
+            assert processes[-1].poll() is not None
+        assert processes[0].pid != processes[1].pid
+        # 证据留在本次测试目录，真实回答质量不由 Fake 判定。
+        (tmp_path / "qwen_smoke.json").write_text(json.dumps({
+            "status": "PASS", "mode": mode, "collection": actual_collection,
+            "identity": IDENTITY, "segments": 35, "restarts": 1,
+            "pids": [process.pid for process in processes],
+            "all_workers_stopped": all(process.poll() is not None for process in processes),
+            "generation": "FAKE", "cost_cny": 0, "turns": results,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    finally:
+        _cleanup(actual_collection, old_collection)
+        _cleanup(support_collection, legacy_collection)
+
+
+def _load_all_support_rows():
+    from agents.retail_runtime import _load_knowledge, _load_support_knowledge
+    return _load_knowledge(Path(KNOWLEDGE)) + _load_support_knowledge(Path(SUPPORT_KNOWLEDGE))

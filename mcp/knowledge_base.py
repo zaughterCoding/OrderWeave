@@ -63,8 +63,7 @@ class KnowledgeBase:
         load_demo_documents: bool = True,
         embedding_function: Optional[Any] = None,
     ):
-        # 优先使用独立的 ChromaDB 服务。Embedding 模型在服务端运行，
-        # 客户端无需下载模型。
+        # 向量在客户端编码，Chroma 服务只存储和查询向量。
         self._use_server = False
         try:
             self._client = chromadb.HttpClient(
@@ -91,12 +90,22 @@ class KnowledgeBase:
                 )
             embedding_function = _ProjectEmbeddingFunction()
 
+        self._embedding_function = embedding_function
         self._collection_name = collection_name or self.COLLECTION_NAME
+        identity = getattr(embedding_function, "identity", None)
+        metadata = {"description": "AgentEcommerce RAG 知识库"}
+        if identity:
+            self._collection_name += embedding_function.collection_suffix
+            if len(self._collection_name) > 63:
+                raise ValueError("Qwen 知识集合基础名称过长，请使用不超过 45 字符的名称")
+            metadata.update(embedding_identity=identity, **{"hnsw:space": "l2"})
         self._collection = self._client.get_or_create_collection(
             name=self._collection_name,
-            metadata={"description": "AgentEcommerce RAG 知识库"},
+            metadata=metadata,
             embedding_function=embedding_function,
         )
+        if identity and (self._collection.metadata or {}).get("embedding_identity") != identity:
+            raise RuntimeError("已有集合的 Embedding 身份不符，拒绝读写且不会自动清理")
 
         if load_demo_documents and self._collection.count() == 0:
             self._load_default_docs()
@@ -239,10 +248,13 @@ class KnowledgeBase:
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """返回与查询最相关的片段，并保留稳定证据身份与来源。"""
-        results = self._collection.query(
-            query_texts=[query],
-            n_results=top_k,
-        )
+        encoder = getattr(self, "_embedding_function", None)
+        if hasattr(encoder, "encode_query"):
+            results = self._collection.query(
+                query_embeddings=encoder.encode_query(query), n_results=top_k,
+            )
+        else:
+            results = self._collection.query(query_texts=[query], n_results=top_k)
 
         items = []
         ids = results.get("ids", [[]])[0]
@@ -287,6 +299,12 @@ class KnowledgeBase:
         """返回集合内的稳定证据 ID，供导入完整性与幂等检查。"""
         result = self._collection.get(include=[])
         return sorted(str(item) for item in (result.get("ids") or []))
+
+    def close(self) -> None:
+        """释放本知识库拥有的编码进程；Chroma 数据保留。"""
+        close = getattr(self._embedding_function, "close", None)
+        if close is not None:
+            close()
 
     async def search_async(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """在线程池中执行同步的 ChromaDB 查询。"""

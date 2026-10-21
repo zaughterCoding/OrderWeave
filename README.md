@@ -202,6 +202,12 @@ uv run --locked --offline python -m pytest tests/integration/test_retail_support
 
 这些检查验证接线、状态隔离、重启续接、资料适用性与业务保护，不代表真实模型回答质量、检索指标或多 Agent 收益。详见 `evaluation/data/retail_support/README.md`。
 
+## 中文 Embedding 对照
+
+`evaluation/run_embedding_comparison.py` 使用现有35段中文知识，对照MiniLM与固定版本Qwen3-Embedding-0.6B；沿用48条已见中文检索题，另有12条耳机支持烟测，报告AllEvidenceHit、Recall、查询延迟与内存。Qwen在独立Python3.12环境运行，避免与现有Chroma依赖冲突；零售 RAG 默认已采用 Qwen，对照脚本不修改业务配置。模型准备需显式执行，缓存可复用；实验不调用付费API，也不验证生成回答质量。
+
+完整模型来源、独立依赖安装、下载校验、运行与采用门槛见[公开复现说明](evaluation/data/embedding_comparison/README.md)。
+
 ## τ-retail 固定子集评测
 
 该入口在项目内另建独立 Python 3.12 环境运行固定上游文字评测组件，不改变主环境或主 `uv.lock`。固定上游为 `sierra-research/tau2-bench` `v1.0.1`／提交 `fc0055dc4e0a316c3f83133267fbd6faaa770992`；任务顺序固定为 11、12、46、48、51、83、92、108，各 1 次，`concurrency=1`、`trials=1`、计划 `seed=300`（只记录在配置和协议日志，当前未传给模型 SDK，不承诺确定性复现）、`max_steps=200`、`max_errors=10`。被测业务始终走本文档所述的 `RetailService`／`RetailAgent`／`RetailStore`，不使用官方被测 Agent。
@@ -330,6 +336,20 @@ uv run --locked --offline pytest tests -q
 - `evaluation/validate_retail_data.py`：冻结零售资料的只读一致性校验。
 - `compose.yml`：独立的本地 Redis 与 ChromaDB 服务。
 - `tests/`：单元测试与真实 Redis／ChromaDB 集成测试。
+
+## 零售 Qwen 检索
+
+零售 RAG 默认使用本地 `Qwen/Qwen3-Embedding-0.6B`，原客服、意图与记忆表示不变。首次启用前按[Embedding 准备说明](evaluation/data/embedding_comparison/README.md#复现windows项目根目录)安装 `data/embedding-env` 独立推理环境并显式准备模型；已有完整缓存无需重复下载。主环境 ChromaDB 及其依赖保持原版本，Qwen 由运行时管理的常驻子进程串行编码，API／CLI 退出时回收。
+
+`RETAIL_EMBEDDING_MODEL=qwen` 为默认值；显式设为 `minilm` 可使用原表示和集合。Qwen 在配置的知识集合基础名后追加 `_qwen_<编码身份前12位>`，基础名不超过45字符；模型版本、查询指令、池化和归一化参与身份。首次运行重新编码冻结资料，不复用或删除旧向量。缺失缓存、损坏文件、身份冲突、编码超时或子进程退出均报错，不隐式下载或回退 MiniLM。CPU 配置沿用对照的 float32／4线程／batch1／最大512 token，长输入会截断；内存及启动时间需为约0.6B参数模型留出空间。
+
+本地完整链路烟测需已有模型、独立环境以及运行中的 Redis／ChromaDB；真实 Qwen、API、SQLite 和 MCP，生成／改写／重排使用 Fake，费用为0：
+
+```powershell
+$env:RUN_QWEN_SMOKE="1"
+uv run --locked --offline python -m pytest tests/integration/test_retail_support.py -k qwen_api -q
+Remove-Item Env:RUN_QWEN_SMOKE
+```
 
 ## 当前限制
 
