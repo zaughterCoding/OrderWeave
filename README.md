@@ -2,6 +2,10 @@
 
 基于 Anthropic 兼容协议与多路融合的电商客服 Agent 项目。当前提供 HTTP API 与交互式 CLI，接通意图识别、多 Agent 编排、Skills、ChromaDB 知识库检索、分层记忆、性能监控与回复评测。
 
+零售 API／CLI 默认使用 LangGraph 工作图，已展示的退货详情通过 SQLite checkpoint 与 Interrupt／Resume 等待并恢复。single／multi 共用此入口，`RETAIL_WORKFLOW_MODE=legacy` 可回退。节点图、零费用进程重启演示和验证命令见[退货工作图说明](evaluation/RETAIL_WORKFLOW.md)。
+
+U02 的技术、前后链路对照、新增能力、验收边界和简历表述见[技术总结](evaluation/U02_SUMMARY.md)。
+
 ## 环境要求
 
 - Windows

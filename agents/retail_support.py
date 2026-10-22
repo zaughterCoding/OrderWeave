@@ -86,6 +86,15 @@ _AMBIGUOUS_MULTI_WORDS = (
     "多副", "分别退", "退哪",
 )
 _PRODUCT_ID_RE = re.compile(r"(?<!\d)(\d{10})(?!\d)")
+_ITEM_REFERENCE_RE = re.compile(
+    r'''(?:\bitem_id\b|商品(?:条目)?编号|商品id|条目编号|款式号)["']?\s*[:：=#]?\s*["']?\s*(\d{10})(?!\d)''',
+    re.IGNORECASE,
+)
+_ITEM_QUANTITY_RE = re.compile(r"[（(]\s*(\d{10})\s*[）)]\s*[一二两三四五六七八九十\d]+\s*(?:件|个|副)")
+_EXPLICIT_PRODUCT_ID_RE = re.compile(
+    r'''(?:\bproduct_id\b|产品编号|产品id)["']?\s*[:：=#]?\s*["'（(]?\s*(\d{10})(?!\d)''',
+    re.IGNORECASE,
+)
 _ORDER_ID_RE = re.compile(r"(?<![a-z0-9])w\d{7}(?![0-9])", re.IGNORECASE)
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _LONG_NUMBER_RE = re.compile(r"(?<!\d)\d{6,}(?!\d)")
@@ -277,6 +286,52 @@ def _return_flow_active(flow: Dict[str, Any]) -> bool:
     return str(flow.get("status") or "") in ("active", "awaiting_confirmation")
 
 
+def _close_return_flow(flow: Dict[str, Any], action: str) -> Dict[str, Any]:
+    """输入视图与轮末更新共用退出规则；请求人工不代表工具成功。"""
+    flow = dict(flow)
+    if action == "human":
+        if _return_flow_active(flow):
+            flow.update(status="handed_off", awaiting="")
+        if flow["status"] == "handed_off":
+            flow.update(last_action="human", closed_reason="user_requested_human")
+    elif action in ("cancel", "switch_to_troubleshooting"):
+        if _return_flow_active(flow) or flow["status"] == "idle":
+            flow.update(
+                status="cancelled" if action == "cancel" else "switched", awaiting="",
+                last_action=action,
+                closed_reason="user_cancelled" if action == "cancel" else "user_switched_to_troubleshooting",
+            )
+    return flow
+
+
+def support_handoff_view(packet, pending=None):
+    """当前视图覆盖历史等待提示，显式空 pending 不回退到旧快照。"""
+    record = packet.get("work_record") or {}
+    flow = dict(packet.get("return_flow") or _normalize_return_flow(record))
+    items = list(packet.get("pending_confirmation") or []) if pending is None else list(pending)
+    stage = record.get("stage") or packet.get("scope_state") or "unknown"
+    unresolved = list(record.get("unresolved") or [])
+    action = flow.get("action")
+    exiting = not items and action in ("human", "cancel", "switch_to_troubleshooting")
+    if exiting:
+        flow = _close_return_flow(flow, action)
+        if flow["status"] != "idle":
+            flow["last_turn"] = int(flow.get("turn") or (packet.get("current_demand") or {}).get("turn") or 0)
+    phase = "confirmation" if items else str(flow.get("awaiting") or "executing")
+    if exiting:
+        unresolved = [u for u in unresolved if not str(u).startswith(
+            ("退货详情已展示", "退货流程进行中", "用户已表达退货诉求"))]
+        if action == "human":
+            handoff = record.get("handoff") or {}
+            recorded = handoff.get("status") == "recorded_mock" and handoff.get("turn") == (packet.get("current_demand") or {}).get("turn")
+            stage = phase = "handoff_recorded" if recorded else "handoff_requested"
+            unresolved.append("已记录模拟人工交接；未创建真实工单" if recorded else "用户请求人工；是否记录成功以实际工具结果为准")
+        else:
+            stage, phase = "troubleshooting", flow["status"]
+            unresolved.append("用户取消当前退货流程，未执行提交" if action == "cancel" else "用户要求暂停退货并继续排查，未执行提交")
+    return {"stage": stage, "phase": phase, "return_flow": flow, "unresolved": list(dict.fromkeys(unresolved))[:8], "pending": items}
+
+
 def asks_refund_destination(text: str) -> bool:
     """识别可见回复中的当前去向询问；业务记录与固定脚本共用同一口径。"""
     destination = r"(?:退款去向|退款方式|退款路径|退款渠道|原支付|原付款|原路|礼品卡|退回哪里|去向)"
@@ -365,7 +420,13 @@ def analyze_message(
     other_product = _contains_any(lower, _OTHER_PRODUCT_WORDS)
     unsupported_issue = _contains_any(lower, _UNSUPPORTED_ISSUE_WORDS)
     ambiguous_multi = _contains_any(lower, _AMBIGUOUS_MULTI_WORDS)
-    product_ids = set(_PRODUCT_ID_RE.findall(lower))
+    # 按出现位置排除条目引用，同一数字另作 product_id 声明时仍须核验。
+    item_spans = {m.span(1) for m in _ITEM_REFERENCE_RE.finditer(lower)}
+    if _has_return_choice(lower) or _ORDER_ID_RE.search(lower):
+        item_spans.update(m.span(1) for m in _ITEM_QUANTITY_RE.finditer(lower))
+    product_spans = {m.span(1) for m in _EXPLICIT_PRODUCT_ID_RE.finditer(lower)}
+    product_ids = {m.group(1) for m in _PRODUCT_ID_RE.finditer(lower)
+                   if m.span(1) not in item_spans or m.span(1) in product_spans}
     foreign_product_id = bool(product_ids - {SUPPORT_PRODUCT_ID})
     human = _contains_any(lower, _HUMAN_WORDS)
     return_choice = _has_return_choice(lower)
@@ -701,29 +762,8 @@ def update_support_record(
             last_action="submitted",
             closed_reason="return_submitted",
         )
-    elif handoff_trace or flow_action == "human":
-        if _return_flow_active(flow):
-            flow.update(status="handed_off", awaiting="")
-        if flow["status"] == "handed_off":
-            flow.update(
-                last_action="human", closed_reason="user_requested_human"
-            )
-    elif flow_action == "cancel":
-        if _return_flow_active(flow) or flow["status"] == "idle":
-            flow.update(
-                status="cancelled",
-                awaiting="",
-                last_action="cancel",
-                closed_reason="user_cancelled",
-            )
-    elif flow_action == "switch_to_troubleshooting":
-        if _return_flow_active(flow) or flow["status"] == "idle":
-            flow.update(
-                status="switched",
-                awaiting="",
-                last_action="switch_to_troubleshooting",
-                closed_reason="user_switched_to_troubleshooting",
-            )
+    elif handoff_trace or flow_action in ("human", "cancel", "switch_to_troubleshooting"):
+        flow = _close_return_flow(flow, "human" if handoff_trace else flow_action)
     elif flow_action == "start":
         if not _return_flow_active(flow):
             flow["start_turn"] = int(turn)
@@ -758,6 +798,8 @@ def update_support_record(
             "note": "未创建真实工单或连接真实坐席",
         }
         updated["stage"] = "handoff_recorded"
+    elif flow_action == "human":
+        updated["stage"] = "handoff_requested"
     elif flow["status"] in ("cancelled", "switched"):
         updated["stage"] = (
             "resolved"
@@ -958,6 +1000,10 @@ def build_support_packet(
             "handoff_chars": min(MAX_HANDOFF_CHARS, max_chars),
         },
     }
+    view = support_handoff_view(packet, pending)
+    packet["return_flow"] = view["return_flow"]
+    packet["current_state"] = {"source": "host_current_support_view", "turn": int(turn),
+                               "stage": view["stage"], "phase": view["phase"], "unresolved": view["unresolved"]}
     if _json_size(packet) > max_chars:
         packet["work_record"] = record_view(record, 1200)
     return packet
@@ -997,10 +1043,8 @@ def handoff_summary_from_packet(
     taken = record.get("taken_steps") or []
     suggestions = record.get("suggestions") or []
     feedback = record.get("feedback") or []
-    unresolved = record.get("unresolved") or []
-    stage = record.get("stage") or packet.get("scope_state") or "unknown"
-    flow = _normalize_return_flow(record)
-    pending_items = list(pending or packet.get("pending_confirmation") or [])
+    view = support_handoff_view(packet, pending)
+    unresolved, stage, flow, pending_items = view["unresolved"], view["stage"], view["return_flow"], view["pending"]
     if str(language).lower() == "en":
         return _truncate(
             "Retail support handoff. Product: Wireless Earbuds (9924732112); "

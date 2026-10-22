@@ -411,6 +411,8 @@ class RetailRuntimeConfig:
     embedding_model: str = "qwen"
     retrieval_mode: str = "hybrid"
     reranker_model: str = "qwen"
+    workflow_mode: str = "langgraph"
+    checkpoint_path: Optional[Path] = None
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -529,6 +531,8 @@ class RetailRuntimeConfig:
                 or _PROJECT_ROOT / "data" / "retail" / "mcp_stderr.log"
             ),
             agent_mode=agent_mode,
+            workflow_mode=_env_text("RETAIL_WORKFLOW_MODE", "langgraph"),
+            checkpoint_path=_env_optional_path("RETAIL_CHECKPOINT_PATH"),
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
             embedding_model=_env_text("RETAIL_EMBEDDING_MODEL", "qwen").lower(),
@@ -612,6 +616,8 @@ class RetailRuntime:
                     support_enabled=self.config.support_enabled,
                 )
             self.agent.set_shared_tools(tools)
+            if self.service.workflow is not None:
+                await self.service.workflow.start()
         except Exception:
             await self.close()
             raise
@@ -623,6 +629,12 @@ class RetailRuntime:
             return
         self._closed = True
         self._started = False
+        workflow = getattr(getattr(self, "service", None), "workflow", None)
+        if workflow is not None:
+            try:
+                await workflow.close()
+            except Exception:
+                logger.exception("关闭工作图 checkpoint 失败")
         try:
             await self.mcp_client.close()
         except Exception:
@@ -653,6 +665,8 @@ def build_retail_runtime(
 ) -> RetailRuntime:
     """按环境配置构造零售运行时；不会自动重置已有业务库。"""
     config = config or RetailRuntimeConfig.from_env()
+    if config.workflow_mode not in {"langgraph", "legacy"}:
+        raise ValueError("RETAIL_WORKFLOW_MODE 只能是 langgraph 或 legacy")
     if config.embedding_model not in {"qwen", "minilm"}:
         raise ValueError("RETAIL_EMBEDDING_MODEL 只能是 qwen 或 minilm")
     if config.retrieval_mode not in {"dense", "bm25", "hybrid"}:
@@ -913,6 +927,8 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         language=language,
         support_enabled=config.support_enabled,
         support_max_chars=config.support_max_chars,
+        workflow_mode=config.workflow_mode,
+        checkpoint_path=config.checkpoint_path,
     )
 
     return RetailRuntime(

@@ -184,6 +184,7 @@ class Request:
     retail_support: Optional[Dict[str, Any]] = None
     retail_support_enabled: bool = False
     retail_support_blocked: bool = False
+    retail_handoff: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -1207,11 +1208,21 @@ class AgentOrchestrator:
     # ── 主入口 ────────────────────────────────────────────────────────────────
 
     async def run(self, req: Request) -> OrchestratorResult:
-        """处理单个请求：识别意图、路由、执行、检查升级。"""
+        """处理单个请求，复用可供工作图调用的路由与收口边界。"""
+        t0 = time.monotonic()
+        prepared = await self.prepare_route(req)
+        if isinstance(prepared, OrchestratorResult):
+            return prepared
+        if prepared.multi_agent:
+            return await self.run_parallel(req, prepared)
+        response = await self._execute(req, prepared.primary_agent)
+        return self.finish_single(req, prepared, response, t0)
+
+    async def prepare_route(self, req: Request):
+        """识别并选择原有角色；澄清结果不执行角色。"""
         t0 = time.monotonic()
         retail_mode = bool(getattr(self, "retail_mode", False))
         language = str(getattr(self, "language", "zh"))
-
         # 1. 调用方未识别过意图时，这里识别。
         if req.intent is None:
             if retail_mode and req.retail_pending:
@@ -1293,12 +1304,11 @@ class AgentOrchestrator:
             )
         if retail_mode:
             req.retail_primary = decision.primary_agent.value
-        if decision.multi_agent:
-            return await self.run_parallel(req, decision)
+        return decision
 
-        # 2. 执行主 Agent（含降级）。
-        response = await self._execute(req, decision.primary_agent)
-
+    def finish_single(self, req, decision, response, t0):
+        """单角色结果沿用原升级核验与轨迹。"""
+        retail_mode = bool(getattr(self, "retail_mode", False))
         # 3. 检查升级。零售模式只认实际记录成功的 MCP 交接。
         if retail_mode:
             escalated = self._escalation_recorded([response])
@@ -1377,6 +1387,14 @@ class AgentOrchestrator:
                 None,
             )
 
+        return await self.finish_parallel(
+            req, decision, valid_responses, ordered_responses, primary_response, t0
+        )
+
+    async def finish_parallel(self, req, decision, valid_responses, ordered_responses, primary_response, t0):
+        """共享主辅结果合成；角色工作图与原调度保持同一口径。"""
+        retail_mode = bool(getattr(self, "retail_mode", False))
+        agent_types = decision.agent_types
         composer_result = await self._compose(req, ordered_responses)
         combined = composer_result.content
         if retail_mode:
@@ -1848,8 +1866,18 @@ class AgentOrchestrator:
 
     async def _execute(self, req: Request, agent_type: AgentType) -> AgentResponse:
         """执行 Agent，失败时回退到 GeneralAgent。"""
+        response = await self.execute_role(req, agent_type)
+        if self.should_fallback(req, agent_type, response):
+            logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
+            fallback = self._best_agent(AgentType.GENERAL)
+            if fallback:
+                return self.merge_fallback(response, await fallback.handle(req))
+        return response
+
+    async def execute_role(self, req, agent_type, allow_missing_fallback=True):
+        """执行一次角色；工作图自行调度降级节点。"""
         agent = self._best_agent(agent_type)
-        if agent is None:
+        if agent is None and allow_missing_fallback:
             agent = self._best_agent(AgentType.GENERAL)
         if agent is None:
             return AgentResponse(
@@ -1858,9 +1886,10 @@ class AgentOrchestrator:
                 success=False,
             )
 
-        response = await agent.handle(req)
+        return await agent.handle(req)
 
-        # 专属 Agent 失败时回退到 GeneralAgent。
+    def should_fallback(self, req, agent_type, response):
+        """复用原降级条件，任何工具或待确认状态都禁止跨角色重放。"""
         if not response.success and agent_type not in (AgentType.GENERAL, AgentType.ESCALATION):
             if (
                 getattr(self, "retail_mode", False)
@@ -1870,24 +1899,17 @@ class AgentOrchestrator:
                     "%s 失败，但本轮已进入状态操作，禁止跨角色重放",
                     agent_type.value,
                 )
-                return response
-            logger.warning(f"{agent_type.value} 失败，降级到 GeneralAgent")
-            fallback = self._best_agent(AgentType.GENERAL)
-            if fallback:
-                failed = response
-                response = await fallback.handle(req)
-                response.fallback_used = True
-                # 保留失败前的真实工具轨迹，避免降级掩盖已发生的调用。
-                response.tools_used = list(dict.fromkeys(
-                    list(failed.tools_used) + list(response.tools_used)
-                ))
-                response.tool_traces = (
-                    list(failed.tool_traces) + list(response.tool_traces)
-                )
-                response.knowledge_hits = int(
-                    failed.knowledge_hits or 0
-                ) + int(response.knowledge_hits or 0)
+                return False
+            return True
+        return False
 
+    @staticmethod
+    def merge_fallback(failed, response):
+        """保留失败角色的调用事实，不让降级掩盖先前执行。"""
+        response.fallback_used = True
+        response.tools_used = list(dict.fromkeys(list(failed.tools_used) + list(response.tools_used)))
+        response.tool_traces = list(failed.tool_traces) + list(response.tool_traces)
+        response.knowledge_hits = int(failed.knowledge_hits or 0) + int(response.knowledge_hits or 0)
         return response
 
     @staticmethod

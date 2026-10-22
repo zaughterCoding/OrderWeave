@@ -26,6 +26,7 @@ from agents.agent_orchestrator import (
     _stop_exception,
 )
 from agents.retail_support import handoff_summary_from_packet
+from agents.retail_handoff import handoff_note
 from agents.retail_tools import (
     RETAIL_ALL_TOOLS,
     RETAIL_READ_ONLY_TOOLS,
@@ -269,6 +270,8 @@ class RetailRoleMixin:
             "support_enabled": bool(getattr(self, "support_enabled", False)),
             "rules": rules,
         }
+        if req.retail_handoff is not None:
+            packet["role_handoff"] = req.retail_handoff
         if getattr(req, "retail_support", None) is not None:
             # 支持记录必须在目标角色调用前进入实际消息，而不是只留在编排器状态。
             packet["support"] = req.retail_support
@@ -496,7 +499,7 @@ class RetailEscalationAgent(RetailRoleMixin, BaseAgent):
                 else "out of scope"
             )
         args = {
-            "summary": summary,
+            "summary": summary + handoff_note(req.retail_handoff, self.language),
             "reason": reason,
         }
         tool_t0 = time.monotonic()
@@ -588,6 +591,15 @@ class RetailMultiAgent:
         return self.orchestrator.shared_tools
 
     async def handle(self, req: Request) -> AgentResponse:
+        t0 = self.begin_turn(req)
+        try:
+            result = await self.orchestrator.run(req)
+        except Exception as ex:
+            return self.fail_turn(ex, t0)
+        return self.finish_turn(req, result, t0)
+
+    def begin_turn(self, req: Request) -> float:
+        """图与 legacy 共用同一个轮次预算和交易保护。"""
         t0 = time.monotonic()
         self.stats.total += 1
         if self.ledger is not None:
@@ -604,25 +616,29 @@ class RetailMultiAgent:
             "submitted": False,
             "handoff": False,
         }
-        try:
-            result = await self.orchestrator.run(req)
-        except Exception as ex:
-            if _stop_exception(ex):
-                raise
-            ms = (time.monotonic() - t0) * 1000
-            self.stats.total_ms += ms
-            logger.exception("零售多 Agent 编排失败: %s", ex)
-            return AgentResponse(
-                agent_type=self.agent_type,
-                content=(
-                    "Sorry, something went wrong while handling your request. "
-                    "Please try again shortly."
-                    if self.language == "en"
-                    else "抱歉，处理您的请求时出现问题，请稍后重试。"
-                ),
-                success=False,
-                latency_ms=ms,
-            )
+        return t0
+
+    def fail_turn(self, ex, t0):
+        """保留预算穿透与原失败响应，不触发重放。"""
+        if _stop_exception(ex):
+            raise ex
+        ms = (time.monotonic() - t0) * 1000
+        self.stats.total_ms += ms
+        logger.exception("零售多 Agent 编排失败: %s", ex)
+        return AgentResponse(
+            agent_type=self.agent_type,
+            content=(
+                "Sorry, something went wrong while handling your request. "
+                "Please try again shortly."
+                if self.language == "en"
+                else "抱歉，处理您的请求时出现问题，请稍后重试。"
+            ),
+            success=False,
+            latency_ms=ms,
+        )
+
+    def finish_turn(self, req, result, t0):
+        """把已完成的角色结果映射回原服务接口。"""
         ms = (time.monotonic() - t0) * 1000
         self.stats.total_ms += ms
         if result.success:

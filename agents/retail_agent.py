@@ -289,6 +289,7 @@ class RetailTurnResult:
     display_appended: List[str] = field(default_factory=list)
     memory_error: str = ""
     response_guard: Dict[str, Any] = field(default_factory=dict)
+    workflow: Dict[str, Any] = field(default_factory=dict)
     # 多 Agent 模式下保留实际参与角色、路由与 Composer 事实；
     # 单 Agent 模式保持空值。
     agent_types: List[str] = field(default_factory=list)
@@ -325,6 +326,8 @@ class RetailService:
         language: Optional[str] = None,
         support_enabled: bool = False,
         support_max_chars: int = MAX_HANDOFF_CHARS,
+        workflow_mode: str = "legacy",
+        checkpoint_path: Optional[str | Path] = None,
     ):
         self.store = store
         self.agent = agent
@@ -349,6 +352,12 @@ class RetailService:
         self._traces: Dict[str, Dict[str, Any]] = {}
         self._trace_order: List[str] = []
         self._log_lock = threading.Lock()
+        if workflow_mode not in {"legacy", "langgraph"}:
+            raise ValueError("workflow_mode 只能是 legacy 或 langgraph")
+        self.workflow = None
+        if workflow_mode == "langgraph":
+            from agents.retail_workflow import RetailWorkflow
+            self.workflow = RetailWorkflow(self, checkpoint_path)
 
     def _lock_for(self, client_user_id: str, conv_id: str) -> asyncio.Lock:
         key = (client_user_id, conv_id)
@@ -389,9 +398,9 @@ class RetailService:
                 "请缩短输入后重试。"
             )
         async with self._lock_for(client_user_id, conv_id):
-            return await self._handle_turn_locked(
-                text, client_user_id, conv_id
-            )
+            if self.workflow is not None:
+                return await self.workflow.handle_turn(text, client_user_id, conv_id)
+            return await self._handle_turn_locked(text, client_user_id, conv_id)
 
     async def _handle_turn_locked(
         self,
@@ -399,6 +408,11 @@ class RetailService:
         client_user_id: str,
         conv_id: str,
     ) -> RetailTurnResult:
+        context = await self._prepare_turn(message, client_user_id, conv_id)
+        response = await self._execute_turn(context)
+        return await self._finish_turn(context, response)
+
+    async def _prepare_turn(self, message, client_user_id, conv_id):
         t0 = time.monotonic()
         # 进程重启后仍从真实会话事件末尾开始，不能重用历史成功。
         facts_started = time.perf_counter()
@@ -502,6 +516,23 @@ class RetailService:
             retail_support_blocked=support_blocked,
         )
 
+        return {
+            "t0": t0,
+            "first_event_id": first_event_id,
+            "facts_read_ms": facts_read_ms,
+            "turn": turn,
+            "memory_error": memory_error,
+            "pending_before": pending_before,
+            "support_record": support_record,
+            "support_state_error": support_state_error,
+            "support_blocked": support_blocked,
+            "analysis": analysis,
+            "request": request,
+        }
+
+    async def _execute_turn(self, context):
+        request = context["request"]
+        support_blocked = context["support_blocked"]
         if support_blocked:
             response = AgentResponse(
                 agent_type=AgentType.RETAIL,
@@ -521,6 +552,22 @@ class RetailService:
             )
         else:
             response = await self.agent.handle(request)
+        return response
+
+    async def _finish_turn(self, context, response):
+        t0 = context["t0"]
+        first_event_id = context["first_event_id"]
+        facts_read_ms = context["facts_read_ms"]
+        turn = context["turn"]
+        memory_error = context["memory_error"]
+        pending_before = context["pending_before"]
+        support_record = context["support_record"]
+        support_state_error = context["support_state_error"]
+        support_blocked = context["support_blocked"]
+        analysis = context["analysis"]
+        request = context["request"]
+        message = request.message
+        client_user_id, conv_id = request.user_id, request.conv_id
         text = str(response.content or "").strip()
         meta = dict(response.meta or {})
         facts_started = time.perf_counter()
@@ -671,7 +718,7 @@ class RetailService:
             support_state_error=support_state_error,
             support_context_limit=support_limit,
         )
-        self._record_turn_event(
+        event = dict(
             result=result,
             message=message,
             client_user_id=client_user_id,
@@ -681,7 +728,11 @@ class RetailService:
             new_events=new_events,
             display_failed=display_failed,
         )
-        self._record_trace(result, client_user_id, conv_id)
+        if self.workflow is None:
+            self._record_turn_event(**event)
+            self._record_trace(result, client_user_id, conv_id)
+        else:
+            context["event"] = event
         return result
 
     def _record_trace(
@@ -704,6 +755,7 @@ class RetailService:
             "escalated": result.escalated,
             "latency_ms": result.latency_ms,
             "response_guard": result.response_guard,
+            "workflow": result.workflow,
             "agent_types": list(result.agent_types),
             "primary_agent": result.primary_agent,
             "supporting_agents": list(result.supporting_agents),
@@ -721,6 +773,9 @@ class RetailService:
             },
         }
         with self._log_lock:
+            if result.request_id in self._traces:
+                self._traces[result.request_id] = trace
+                return
             self._traces[result.request_id] = trace
             self._trace_order.append(result.request_id)
             while len(self._trace_order) > 500:
@@ -771,6 +826,7 @@ class RetailService:
             "escalated": result.escalated,
             "latency_ms": result.latency_ms,
             "response_guard": result.response_guard,
+            "workflow": result.workflow,
             "agent_types": result.agent_types,
             "primary_agent": result.primary_agent,
             "supporting_agents": result.supporting_agents,
