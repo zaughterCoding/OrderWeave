@@ -1,8 +1,8 @@
 """零售模式的运行时装配。
 
 API 与 CLI 共用同一条装配路径：固定公开种子、独立 SQLite、隔离的记忆键与
-Chroma 集合、仅含冻结证据的知识集合、受预算账本约束的客户端，以及单个
-零售 Agent。旧客服模式不经过本模块。
+Chroma 集合、仅含冻结证据的知识集合、受预算账本约束的客户端，以及按需
+协作的零售角色。旧客服模式不经过本模块。
 """
 from __future__ import annotations
 
@@ -382,7 +382,7 @@ class RetailRuntimeConfig:
     mcp_timeout_seconds: float
     mcp_stderr_log: Optional[Path]
     # 正式英文对照关闭旧中文记忆与 RAG，保证两组可见信息一致。
-    agent_mode: str = "single"
+    agent_mode: str = "multi"
     enable_memory: bool = True
     enable_knowledge: bool = True
     # T17 默认关闭；开启时只加独立支持集合与工作记录，不改旧 29 段集合。
@@ -432,7 +432,7 @@ class RetailRuntimeConfig:
         suffix = _memory_suffix(
             _env_text("RETAIL_MEMORY_COLLECTION_SUFFIX", "_retail")
         )
-        agent_mode = _env_text("RETAIL_AGENT_MODE", "single").lower()
+        agent_mode = _env_text("RETAIL_AGENT_MODE", "multi").lower()
         if agent_mode not in {"single", "multi"}:
             raise RuntimeError(
                 "RETAIL_AGENT_MODE 只能是 single 或 multi: " + agent_mode

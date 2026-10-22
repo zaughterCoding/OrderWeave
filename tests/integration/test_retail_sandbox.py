@@ -206,6 +206,7 @@ def _configure_retail(monkeypatch, tmp_path, name: str):
     suffix = f"_t13{name}"
     prefix = f"t13test{name}:"
     monkeypatch.setenv("RETAIL_MODE", "1")
+    monkeypatch.setenv("RETAIL_AGENT_MODE", "single")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
     monkeypatch.setenv("LLM_MODEL", "fake-model")
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)

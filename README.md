@@ -2,7 +2,7 @@
 
 基于 Anthropic 兼容协议与多路融合的电商客服 Agent 项目。当前提供 HTTP API 与交互式 CLI，接通意图识别、多 Agent 编排、Skills、ChromaDB 知识库检索、分层记忆、性能监控与回复评测。
 
-零售 API／CLI 默认使用 LangGraph 工作图，已展示的退货详情通过 SQLite checkpoint 与 Interrupt／Resume 等待并恢复。single／multi 共用此入口，`RETAIL_WORKFLOW_MODE=legacy` 可回退。节点图、零费用进程重启演示和验证命令见[退货工作图说明](evaluation/RETAIL_WORKFLOW.md)。
+零售 API／CLI 默认使用多 Agent 与 LangGraph 有状态工作图，已展示的退货详情通过 SQLite checkpoint 与 Interrupt／Resume 等待并恢复。`RETAIL_AGENT_MODE=single` 可显式切换单 Agent，`RETAIL_WORKFLOW_MODE=legacy` 可回退工作流。节点图、零费用进程重启演示和验证命令见[退货工作图说明](evaluation/RETAIL_WORKFLOW.md)。
 
 U02 的技术、前后链路对照、新增能力、验收边界和简历表述见[技术总结](evaluation/U02_SUMMARY.md)。
 
@@ -126,7 +126,7 @@ uv run --locked --offline python -m evaluation.run_retail_baseline --mode live -
 
 ## 零售沙箱运行
 
-设置 `RETAIL_MODE=true` 后，HTTP API 与 CLI 切换到零售沙箱：支持订单查询、退货申请和知识咨询。默认由单 Agent 处理；设置 `RETAIL_AGENT_MODE=multi` 后改用现有 general／technical／billing／escalation 四角色的零售适配版。两种模式共用同一套服务端展示、确认与业务存储逻辑，默认客服模式不受影响。
+设置 `RETAIL_MODE=true` 后，HTTP API 与 CLI 切换到零售沙箱：支持订单查询、退货申请和知识咨询。默认采用现有 general／technical／billing／escalation 四角色与 LangGraph 有状态工作流，按需路由、顺序执行并传递结构化交接，不要求每轮执行全部角色。显式设置 `RETAIL_AGENT_MODE=single` 可作回退与对照；两种模式共用同一套服务端展示、确认与业务存储逻辑。`RETAIL_MODE` 未开启时仍使用原客服入口。
 
 零售模式下，九个订单／用户／退货相关业务工具由主程序启动的本地 stdio MCP 子进程提供，主程序通过官方 `mcp` SDK（锁定 `1.12.4`）完成初始化、工具发现与 `tools/call`，不提供外部客户端或 HTTP MCP 入口。`search_knowledge_base` 仍在主程序内走原有 RAG 链路。子进程与主程序使用同一个 SQLite 绝对路径，不复制业务状态；工具调用失败不会自动改走进程内直调。
 
@@ -138,6 +138,8 @@ docker compose up -d redis chromadb
 
 # 必填：模型接入与当前官方单价；单价缺失时拒绝启动付费链路
 $env:RETAIL_MODE = "true"
+$env:RETAIL_AGENT_MODE = "multi"
+$env:RETAIL_WORKFLOW_MODE = "langgraph"
 $env:ANTHROPIC_API_KEY = "<key>"
 $env:LLM_MODEL = "<model>"
 $env:RETAIL_INPUT_CNY_PER_MTOK = "<当前输入单价>"
@@ -152,7 +154,8 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/chat -ContentType 'applicat
 uv run --locked --offline python -m api.main --cli
 ```
 
-- `RETAIL_AGENT_MODE`：`single`（默认）或 `multi`；`multi` 使用四角色编排，身份绑定与退货提交等状态工具只对每轮主执行者开放，辅助角色只读，Composer 无工具。
+- `RETAIL_AGENT_MODE`：`multi`（默认）或 `single`；未配置或留空时构造多 Agent。身份绑定与退货提交等状态工具只对每轮唯一主执行者开放，辅助角色只读，Composer 无工具。
+- `RETAIL_WORKFLOW_MODE`：`langgraph`（默认）或 `legacy`。回退时设置 `$env:RETAIL_AGENT_MODE="single"` 或 `$env:RETAIL_WORKFLOW_MODE="legacy"` 后重启上述 API／CLI；两个选项可独立选择，保留业务库与 checkpoint。已有进程环境优先于 `.env`，启动前需清除或修改旧 `single` 覆盖。
 - `RETAIL_DB_PATH`：SQLite 路径，默认 `data/retail/retail.db`。首次启动从固定种子初始化；已有非空业务库不会自动重置，需要新数据时请显式指定新的空路径。
 - `RETAIL_SEED_PATH`、`RETAIL_POLICY_PATH`、`RETAIL_KNOWLEDGE_PATH`：默认指向上述固定资料，通常无需设置。
 - `RETAIL_COLLECTION`：知识集合名，默认 `retail_knowledge_v1`；只导入冻结的 29 段知识，旧演示政策不参与。
@@ -186,7 +189,7 @@ uv run --locked --offline python -m pytest tests/test_retail_response_guard.py t
 $env:RETAIL_MODE = "true"
 $env:RETAIL_SUPPORT_ENABLED = "true"
 $env:RETAIL_SUPPORT_COLLECTION = "retail_earbuds_support_v1"
-$env:RETAIL_AGENT_MODE = "single"   # 或 multi
+$env:RETAIL_AGENT_MODE = "multi"   # 显式 single 可对照
 ```
 
 - 开启要求 `RETAIL_LANGUAGE=zh`、知识检索开启，且支持集合不能与 `RETAIL_COLLECTION` 同名；冲突、缺文件或清单哈希不符会明确拒绝启动。
@@ -266,7 +269,7 @@ uv run --locked --offline python -m evaluation.run_t16_retail run --run-id <run-
 
 运行产物写入 `data/evaluation/t16-retail/<run-id>/`（已忽略）：按 arm／task／trial 保存对话、事件、完整前后快照、SQLite、MCP 与 worker 日志、原评分分量、项目检查、请求 usage／费用和共享账本；`summary.json` 保留 14 行正式结果与共同有效配对。预检通过后才允许付费，源码或资产变化会使冻结校验拒绝继续；预算不足或环境异常时保留 PARTIAL，不另开账本清零。单个用户轮的识别、角色、回退与 Composer 合计不超过 32 次请求，业务角色温度 0.1、`max_tokens=2048`，User 与 Judge 温度 0.0、`max_tokens=1024`；`seed=300` 未证明传给模型 SDK。
 
-该入口只产生固定 7 任务小样本观察，不构成统计显著性、排行榜或生产模式选择依据；默认零售模式仍是 `single`。价格、密钥与端点从项目配置读取，不写入产物。
+该入口只产生固定 7 任务小样本观察，不构成统计显著性、排行榜或生产模式选择依据；当前零售运行时默认 `multi`，对照运行器仍显式分别构造 single／multi。价格、密钥与端点从项目配置读取，不写入产物。
 
 ## 测试
 

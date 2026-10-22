@@ -1,6 +1,6 @@
 # 零售退货工作图
 
-API／CLI 的零售共享入口默认 `RETAIL_WORKFLOW_MODE=langgraph`，single／multi 都经过同一工作图。multi 由图逐个调度原有角色，single 保持原 Agent 节点；只有已展示的待确认退货进入 Interrupt。直接构造 `RetailService` 的旧调用者默认仍用 legacy。
+开启 `RETAIL_MODE=true` 后，API／CLI 的零售共享入口默认 `RETAIL_AGENT_MODE=multi`、`RETAIL_WORKFLOW_MODE=langgraph`；未开启时仍使用原客服入口。multi 由图按需逐个调度原有角色，显式 `RETAIL_AGENT_MODE=single` 保持原 Agent 节点；只有已展示的待确认退货进入 Interrupt。两种 Agent 模式均可独立设置 `RETAIL_WORKFLOW_MODE=legacy` 回退。直接构造 `RetailService` 的旧调用者默认仍用 legacy。
 
 ```mermaid
 flowchart TD

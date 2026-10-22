@@ -423,7 +423,7 @@ async def health():
         body = {
             "status": "ok",
             "mode": "retail",
-            "agent_mode": summary.get("agent_mode", "single"),
+            "agent_mode": summary.get("agent_mode", _retail_runtime.config.agent_mode),
             "agents": summary["agent"],
             "store": _retail_runtime.store.stats(),
             "budget": _retail_runtime.ledger.summary(),
