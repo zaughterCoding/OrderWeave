@@ -29,3 +29,6 @@ htmlcov/
 logs/
 /data/
 *.log
+
+# 本地评测代码与资料
+/evaluation/

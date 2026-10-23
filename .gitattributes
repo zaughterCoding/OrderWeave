@@ -1,2 +1,2 @@
 # 冻结评测资产按原始字节保存，避免换行转换破坏清单哈希。
-evaluation/data/retail/** -text
+evaluation/data/** -text
