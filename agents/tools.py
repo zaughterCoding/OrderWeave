@@ -279,6 +279,9 @@ def build_shared_rag_tools(
             return {"success": False, "error": "RAG 工具未初始化", "results": []}
 
         extra: Dict[str, Any] = {}
+        if getattr(tool_manager, "retrieval_strategy", "relevance") != "relevance":
+            extra["original_query"] = req.message
+            extra["coverage_context"] = getattr(req, "retail_support", None)
         if filter_for_request is not None:
             extra["item_filter"] = lambda item: filter_for_request(req, item)
             if not expand_filtered_recall:

@@ -185,6 +185,7 @@ class MCPToolManager:
         model: Optional[str] = None,
         client: Optional[Any] = None,
         reranker: Optional[Any] = None,
+        retrieval_strategy: str = "relevance",
     ):
         if not model:
             raise ValueError("model is required")
@@ -195,6 +196,10 @@ class MCPToolManager:
         self._client = client or AsyncAnthropic(**kwargs)
         self._model = model
         self._reranker = reranker
+        from mcp.evidence_coverage import STRATEGIES
+        if retrieval_strategy not in STRATEGIES:
+            raise ValueError("未知检索选择策略")
+        self.retrieval_strategy = retrieval_strategy
         self._tools: Dict[str, Tool] = {}
         self._cache: Dict[str, tuple] = {}
 
@@ -421,12 +426,36 @@ class MCPToolManager:
         diagnostics: Optional[Dict[str, Any]] = None,
         item_filter: Optional[Callable[[Any], bool]] = None,
         expand_filtered_recall: bool = True,
+        original_query: Optional[str] = None,
+        coverage_context: Optional[Dict[str, Any]] = None,
     ) -> ToolResult:
         """执行改写、并行召回、合并去重和重排。
 
         item_filter 转发给本地知识处理器，在各通道top-k前过滤；合并后再复核。
         带范围的调用不读写结果缓存，避免不同会话范围串用。
         """
+        if self.retrieval_strategy != "relevance":
+            from mcp.evidence_coverage import retrieve_with_coverage
+            async def recall(text, k):
+                scoped = {**(context or {}), "knowledge_item_filter": item_filter} if item_filter else context
+                result = await self.call(tool_name, {"query": text, "top_k": k}, scoped, use_cache=False)
+                if not result.success or result.degraded or not isinstance(result.data, list):
+                    raise RuntimeError(result.error or "未获得有效候选")
+                return result.data
+            async def scoring(text, items):
+                if self._reranker is None:
+                    raise RuntimeError("实验策略只允许本地专用重排，不回退付费服务")
+                return await asyncio.to_thread(self._reranker.score, text, items)
+            items, details = await retrieve_with_coverage(
+                original_query or query, recall, scoring, strategy=self.retrieval_strategy,
+                top_k=top_k, context=coverage_context, item_filter=item_filter)
+            details.update(rewrite_status="disabled_experimental_original_only", final_count=len(items),
+                           final_ids=[item.get("evidence_id") or item.get("id") for item in items])
+            if diagnostics is not None:
+                diagnostics.update(details)
+            return ToolResult(success=bool(items), data=items, tool_name=tool_name,
+                              reranked=bool(details.get("scores")), degraded=bool(details["failure"] and not items),
+                              diagnostics=details, error=details["failure"] if not items else None)
         diag = diagnostics if diagnostics is not None else {}
         total_start = time.monotonic()
         settings = retrieval_config(top_k)

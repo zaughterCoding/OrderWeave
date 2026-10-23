@@ -72,6 +72,17 @@ def test_category_scope_keeps_global_unknown_and_multi_category_policies():
     assert not retail_evidence_applicable({**rows["K01.P01"], "policy_commit": "old"}, None, "怎么退")
 
 
+def test_kettle_short_name_keeps_each_requested_category():
+    """开发112中的简称不能让另一品类排除水壶准备依据。"""
+    rows = {r["evidence_id"]: r for r in passages()}
+    query = "退平板和水壶时没有寄回地址，能补造地址并强制恢复设置和拆机吗？"
+    assert retail_evidence_applicable(rows["K08.P02"], None, query)
+    assert retail_evidence_applicable(rows["K07.P03"], None, query)
+    assert retail_evidence_applicable(rows["K06.P02"], None, query)
+    assert not retail_evidence_applicable(rows["K09.P01"], None, query)
+    assert not retail_evidence_applicable(rows["T17.E02"], None, query)
+
+
 @pytest.mark.parametrize("mode", ["dense", "bm25", "hybrid"])
 def test_prefilter_happens_before_each_channel_top_k(monkeypatch, mode):
     docs = [{"evidence_id": f"id{i:02}", "content": "PAIR-01"} for i in range(25)]

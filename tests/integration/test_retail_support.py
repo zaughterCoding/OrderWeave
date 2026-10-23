@@ -801,6 +801,8 @@ def test_c05_scope_clarification_and_no_support_record(monkeypatch, tmp_path, mo
                 "耳机连不上", client_user, f"conv-c05-bare-{name}"
             )
             assert bare.support_scope == "ambiguous"
+            assert "具体商品" in bare.response
+            assert "search_knowledge_base" not in bare.tools_used
             assert _support_state(
                 tmp_path, client_user, f"conv-c05-bare-{name}"
             ) is None
@@ -813,6 +815,12 @@ def test_c05_scope_clarification_and_no_support_record(monkeypatch, tmp_path, mo
                 tmp_path, client_user, f"conv-c05-out-{name}"
             ) is None
             assert runtime.store.business_snapshot() == before
+            (tmp_path / "u08_scope_entry.json").write_text(json.dumps({
+                "mode": mode, "host_scope": bare.support_scope,
+                "clarification": bare.response, "tools": bare.tools_used,
+                "support_record_created": False, "business_unchanged": True,
+                "generation": "FAKE", "real_model_response_verified": False,
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
 
     try:
         asyncio.run(scenario())
@@ -1494,8 +1502,8 @@ def test_real_chroma_support_collection_has_35_applicable_segments(
 
 @pytest.mark.skipif(os.getenv("RUN_QWEN_SMOKE") != "1", reason="显式启用本地 Qwen 链路烟测")
 @pytest.mark.parametrize("mode", ["single", "multi"])
-@pytest.mark.parametrize("retrieval_mode,reranker_model", [("dense", "llm"), ("hybrid", "llm"), ("hybrid", "qwen")])
-def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mode, retrieval_mode, reranker_model):
+@pytest.mark.parametrize("retrieval_mode,reranker_model,strategy", [("dense", "llm", "relevance"), ("hybrid", "llm", "relevance"), ("hybrid", "qwen", "relevance"), ("hybrid", "qwen", "targeted")])
+def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mode, retrieval_mode, reranker_model, strategy):
     """真实向量／存储／MCP，生成使用 Fake，不产生付费请求。"""
     from mcp.qwen_embedding import IDENTITY, QwenEmbeddingFunction
 
@@ -1504,6 +1512,7 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
     # 删除兼容测试的覆盖值，验收产品默认确为 Qwen。
     monkeypatch.delenv("RETAIL_EMBEDDING_MODEL")
     monkeypatch.setenv("RETAIL_RETRIEVAL_MODE", retrieval_mode)
+    monkeypatch.setenv("RETAIL_RETRIEVAL_STRATEGY", strategy)
     if reranker_model == "qwen":
         monkeypatch.delenv("RETAIL_RERANKER_MODEL")
     else:
@@ -1520,6 +1529,7 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
                 assert runtime.config.embedding_model == "qwen"
                 assert runtime.config.retrieval_mode == retrieval_mode
                 assert runtime.config.reranker_model == reranker_model
+                assert runtime.tool_manager.retrieval_strategy == strategy
                 assert kb.backend == "server"
                 assert kb.collection_name == actual_collection
                 assert kb.doc_count == 35
@@ -1575,6 +1585,7 @@ def test_qwen_api_retrieval_return_restart_and_cleanup(monkeypatch, tmp_path, mo
             "identity": IDENTITY, "segments": 35, "restarts": 1,
             "retrieval_mode": retrieval_mode,
             "reranker_model": reranker_model,
+            "retrieval_strategy": strategy,
             "pids": [process.pid for process in processes],
             "all_workers_stopped": all(process.poll() is not None for process in processes),
             "generation": "FAKE", "cost_cny": 0, "turns": results,

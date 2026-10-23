@@ -411,6 +411,7 @@ class RetailRuntimeConfig:
     embedding_model: str = "qwen"
     retrieval_mode: str = "hybrid"
     reranker_model: str = "qwen"
+    retrieval_strategy: str = "relevance"
     workflow_mode: str = "langgraph"
     checkpoint_path: Optional[Path] = None
 
@@ -538,6 +539,7 @@ class RetailRuntimeConfig:
             embedding_model=_env_text("RETAIL_EMBEDDING_MODEL", "qwen").lower(),
             retrieval_mode=_env_text("RETAIL_RETRIEVAL_MODE", "hybrid").lower(),
             reranker_model=_env_text("RETAIL_RERANKER_MODEL", "qwen").lower(),
+            retrieval_strategy=_env_text("RETAIL_RETRIEVAL_STRATEGY", "relevance").lower(),
             language=language,
             support_enabled=support_enabled,
             support_collection=support_collection,
@@ -673,6 +675,11 @@ def build_retail_runtime(
         raise ValueError("RETAIL_RETRIEVAL_MODE 只能是 dense、bm25 或 hybrid")
     if config.reranker_model not in {"llm", "qwen"}:
         raise ValueError("RETAIL_RERANKER_MODEL 只能是 llm 或 qwen")
+    from mcp.evidence_coverage import STRATEGIES
+    if config.retrieval_strategy not in STRATEGIES:
+        raise ValueError("未知RETAIL_RETRIEVAL_STRATEGY")
+    if config.retrieval_strategy != "relevance" and config.reranker_model != "qwen":
+        raise ValueError("实验覆盖策略需要本地Qwen重排")
     encoder = QwenEmbeddingFunction() if config.enable_knowledge and config.embedding_model == "qwen" else None
     try:
         return _build_retail_runtime(config, encoder)
@@ -846,6 +853,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
             model=config.model,
             client=client.for_stage("retrieval"),
             reranker=QwenReranker() if config.reranker_model == "qwen" else None,
+            retrieval_strategy=config.retrieval_strategy,
         )
         _register_knowledge_tool(tool_manager, knowledge_base)
 

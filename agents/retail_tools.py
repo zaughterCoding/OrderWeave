@@ -47,7 +47,7 @@ RETAIL_SUPPORT_TECHNICAL_TOOLS = (
 
 _CATEGORY_MARKERS = {
     "consumer_electronics": ("电子", "耳机", "电脑", "手机", "相机", "平板", "earbuds", "headphones", "laptop", "smartphone", "camera", "tablet"),
-    "small_appliances": ("小家电", "烤箱", "咖啡机", "吸尘器", "净化器", "电水壶", "搅拌机", "微波炉", "电饭煲", "toaster", "coffee maker", "blender", "vacuum"),
+    "small_appliances": ("小家电", "烤箱", "咖啡机", "吸尘器", "净化器", "电水壶", "水壶", "搅拌机", "微波炉", "电饭煲", "toaster", "coffee maker", "blender", "vacuum"),
     "apparel_footwear": ("衣服", "服装", "鞋", "靴", "t恤", "衬衫", "外套", "裙", "尺码", "jacket", "shoes", "sneakers", "shirt", "dress"),
 }
 _POLICY_COMMIT = "fc0055dc4e0a316c3f83133267fbd6faaa770992"

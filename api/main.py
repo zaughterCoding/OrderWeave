@@ -433,6 +433,7 @@ async def health():
                                if _retail_runtime.knowledge_base is not None else "disabled"),
             "reranker_model": (_retail_runtime.config.reranker_model
                                if _retail_runtime.knowledge_base is not None else "disabled"),
+            "retrieval_strategy": getattr(_retail_runtime.config, "retrieval_strategy", "relevance"),
         }
         if _retail_runtime.config.support_enabled:
             body["support"] = {
@@ -626,6 +627,8 @@ async def search(query: str, top_k: int = 5):
             # 独立搜索保留原候选数；会话支持工具的20条预算由工具适配器控制。
             "expand_filtered_recall": False,
         }
+        if getattr(_tool_manager, "retrieval_strategy", "relevance") != "relevance":
+            extra.update(original_query=query, coverage_context=packet)
     if _tool_manager is None:
         raise HTTPException(503, "服务未就绪")
     result = await _tool_manager.search_with_rewrite(

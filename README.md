@@ -378,3 +378,7 @@ Remove-Item Env:RUN_QWEN_SMOKE
 - CORS 允许任意来源，API 默认仅监听 `127.0.0.1`，不适合直接作为生产部署。
 - 记忆压缩与追加只在单进程内互斥，不提供分布式锁。
 - 监控与评测已接入 API 启动流程；真实 webhook、Prometheus 外部抓取和真实 Judge 评分尚未验证。
+
+## 多证据覆盖实验
+
+默认保留现有相关性排序。设置 `RETAIL_RETRIEVAL_STRATEGY=pool|coverage|targeted` 可显式试验受限候选池、需求覆盖与一次定向补检；实验检索不调用付费改写或生成式重排。普通 Agent 的最终生成仍沿原配置。该能力是可选实验，未采用为默认或证明整体质量提高；实验数据与报告留在本地。
