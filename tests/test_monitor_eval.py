@@ -62,7 +62,7 @@ class FakeMessages:
     async def create(self, **kwargs):
         text = self._responses.pop(0)
         return SimpleNamespace(
-            content=[SimpleNamespace(type="text", text=text)]
+            content=[SimpleNamespace(type="text", text=text)], stop_reason="end_turn"
         )
 
 
@@ -178,12 +178,12 @@ def test_judge_requires_every_score_and_reports_failure():
         assert bad.judge_failed is True
         assert bad.error == "judge response missing helpfulness"
         assert (bad.relevance, bad.accuracy, bad.completeness, bad.helpfulness) == (
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            None,
+            None,
+            None,
+            None,
         )
-        assert bad.overall == 0.0
+        assert bad.overall is None
 
     asyncio.run(scenario())
 
@@ -227,6 +227,10 @@ def test_evaluator_counts_grader_errors_without_fake_scores(tmp_path):
     assert report.passed == 1
     assert report.grader_errors == 1
     assert report.avg_scores["relevance"] == pytest.approx(0.8)
+    assert report.judge_summary["planned"] == report.judge_summary["processed"] == 2
+    assert report.judge_summary["valid"] == report.judge_summary["mean_denominator"] == 1
+    assert report.judge_summary["coverage"] == 0.5
+    assert report.judge_summary["failure_reasons"] == {"invalid_json": 1}
     assert any("评分失败" in item for item in report.recommendations)
 
     failed = [result for result in report.results if not result.passed]

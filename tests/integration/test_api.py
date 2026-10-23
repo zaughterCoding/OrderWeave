@@ -27,7 +27,7 @@ CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8002"))
 
 def _text_response(text: str):
     return SimpleNamespace(
-        content=[SimpleNamespace(type="text", text=text)]
+        content=[SimpleNamespace(type="text", text=text)], stop_reason="end_turn"
     )
 
 
@@ -336,6 +336,8 @@ def test_http_api_routes_with_fake_model_and_real_storage(monkeypatch, tmp_path)
             assert eval_payload["total"] == 1
             assert eval_payload["passed"] == 1
             assert eval_payload["grader_errors"] == 0
+            assert eval_payload["judge_summary"]["coverage"] == 1.0
+            assert eval_payload["judge_summary"]["valid"] == eval_payload["judge_summary"]["planned"]
             assert eval_payload["avg_scores"]["relevance"] == 0.9
     finally:
         _cleanup(user_id, conv_id, collection_name)

@@ -111,7 +111,9 @@ uv run --locked --offline python -m api.main --cli
   - `agent_executions_total{agent}`（Counter）：监控观测到的 Agent 执行次数累计值；多 Agent 请求会为每个参与的 Agent 各计一次，不代表 HTTP 请求数。
 - 未设置 `MONITOR_PROMETHEUS_PORT` 时只注册 Python 进程默认指标，不产出上述业务指标。
 - `EndToEndEvaluator` 计算意图识别 Accuracy／Macro-F1，并使用 LLM-as-Judge 评估相关性、准确性、完整性与有用性。
-- Judge 解析失败的结果记录 `GRADER_ERROR`、`passed=False` 和空 `scores`；报告保留结果总数并统计 `grader_errors`，平均值只使用有效评分。
+- Judge 输出上限由 `EVAL_JUDGE_MAX_TOKENS` 配置，缺省 4096（含 thinking 与最终 JSON）；直接使用 `LLMJudge` 时可传 `max_tokens` 覆盖。预算包装器按实际请求中的同一上限预留，不自动重试或调用备用模型。固定四条旧回答的小样本真实复验均完整返回，但不能代表原完整集合的有效率或质量提高。
+- Judge 仅接受 `end_turn` 完整响应和四个 0–1 有限数值；截断（即使含可解析 JSON）、空响应、非法 JSON、缺字段及非法数值均记录 `GRADER_ERROR`、`passed=False` 和空 `scores`，失败分值为 `null`。报告和 `/evaluate` 返回 `judge_summary`：计划／实际处理／有效／失败数量、失败原因、有效覆盖率（有效数÷计划数）及 `mean_denominator`。`avg_scores` 和 `means` 仅描述有效子集，不能作为完整集合质量成绩；无有效结果时 `means` 为 `null`。
+- 零售回答保护按完整语义单元保留否定／条件列表、一般核对建议与用户报告，具体订单状态仍须可信工具或事件支撑。局部无法安全修复时替换整个单元，避免留下脱离限定的列表断言；这仍是有限确定性保护，不保证任意语义正确。
 - `baseline_path` 只读；每次评测写入新的 `report_<timestamp>.json`，不会覆盖基线或已有报告。
 - 工具平均延迟只对实际记录延迟的调用求平均，样本数通过 `latency_samples` 暴露。
 
@@ -394,7 +396,7 @@ Remove-Item Env:RUN_QWEN_SMOKE
 - 没有登录与 RBAC；默认客服模式不查询订单或执行退款；零售沙箱只提供模拟订单查询与退货申请，不执行真实支付、退款、邮件或工单。`user_id`／`conv_id` 不是认证身份。
 - CORS 允许任意来源，API 默认仅监听 `127.0.0.1`，不适合直接作为生产部署。
 - 记忆压缩与追加只在单进程内互斥，不提供分布式锁。
-- 监控与评测已接入 API 启动流程；真实 webhook、Prometheus 外部抓取和真实 Judge 评分尚未验证。
+- 监控与评测已接入 API 启动流程；真实 webhook、Prometheus 外部抓取和完整集合的真实 Judge 验收尚未完成。
 
 ## 多证据覆盖实验
 

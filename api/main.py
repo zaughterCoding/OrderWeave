@@ -781,6 +781,7 @@ async def run_eval(body: Optional[EvalRunInput] = None):
         "total": report.total,
         "passed": report.passed,
         "grader_errors": report.grader_errors,
+        "judge_summary": report.judge_summary,
         "avg_scores": report.avg_scores,
         "regressions": report.regressions,
         "recommendations": report.recommendations,

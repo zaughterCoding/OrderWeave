@@ -38,6 +38,42 @@ def trace(name, result, **kwargs):
             "result_success": result.get("success"), **kwargs}
 
 
+@pytest.mark.parametrize("case", json.loads(
+    (Path(__file__).parent / "fixtures/u09_guard_saved.json").read_text(encoding="utf-8")
+)["cases"], ids=lambda case: case["query_id"])
+def test_saved_policy_candidates_keep_their_complete_meaning(case):
+    result = guard(case["candidate"], traces=case["traces"], events=case["events"])
+    assert result.text == case["candidate"]
+    assert not result.record["findings"]
+
+
+@pytest.mark.parametrize("text", [
+    "这并不代表：\n\n- 退款已到账。\n- 仓库已收到退货。",
+    "如果提交成功：\n- 退货申请已提交；\n- 订单状态：return requested。",
+    "请先核对订单状态为已送达，再整理商品行。",
+    "您反馈退款已到账；这只是您的描述，实际状态尚需工具核实。",
+    "订单状态是已送达吗？",
+    "订单状态为 delivered 时，才可准备退货。",
+])
+def test_scoped_explanations_are_not_order_facts(text):
+    assert guard(text).text == text
+
+
+@pytest.mark.parametrize("text", [
+    "仓库已收到退货。",
+    "请核对订单号。订单状态：delivered。",
+    "如果之后提交成功，会显示结果。但退货申请已提交。",
+    "您反馈退款已到账，但仓库已收到退货。",
+    "退款已到账，请问还需要帮助吗？",
+    "不代表退款已到账。仓库已收到退货。",
+    "我已核对订单状态为delivered。",
+])
+def test_explanation_cannot_authorize_a_separate_assertion(text):
+    result = guard(text)
+    assert result.text != text
+    assert result.record["findings"]
+
+
 @pytest.mark.parametrize("text,issue", [
     ("礼品卡余额不足，因此不能退款。", "gift_card_balance_refusal"),
     ("建议您申请换货。", "unsupported_exchange_advice"),

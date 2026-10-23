@@ -5,8 +5,11 @@
 """
 import json
 import logging
+import math
+import os
 import pathlib
 import statistics
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -15,6 +18,7 @@ from anthropic import AsyncAnthropic
 
 from core.intent_recognizer import IntentRecognizer
 from core.llm_utils import extract_text_content
+from evaluation.retail_budget import BudgetStopExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -32,17 +36,20 @@ class IntentTestCase:
 class QualityScores:
     """单个响应的 LLM-as-Judge 评分。"""
 
-    relevance: float
-    accuracy: float
-    completeness: float
-    helpfulness: float
+    relevance: Optional[float] = None
+    accuracy: Optional[float] = None
+    completeness: Optional[float] = None
+    helpfulness: Optional[float] = None
     judge_failed: bool = False
     error: Optional[str] = None
+    failure_reason: Optional[str] = None
+    stop_reason: Optional[str] = None
+    output_tokens: Optional[int] = None
 
     @property
-    def overall(self) -> float:
+    def overall(self) -> Optional[float]:
         if self.judge_failed:
-            return 0.0
+            return None
         return statistics.mean(
             [
                 self.relevance,
@@ -73,6 +80,23 @@ class EvalReport:
     recommendations: List[str]
     results: List[EvalResult]
     grader_errors: int = 0
+    judge_summary: Dict[str, Any] = field(default_factory=dict)
+
+
+def summarize_judgements(scores: List[QualityScores], *, planned: int) -> Dict[str, Any]:
+    """失败不参与均值，覆盖率以计划评分数为分母。"""
+    valid = [score for score in scores if not score.judge_failed]
+    return {
+        "planned": planned, "processed": len(scores), "valid": len(valid),
+        "failed": len(scores) - len(valid),
+        "failure_reasons": dict(Counter(
+            score.failure_reason or "judge_failed" for score in scores if score.judge_failed
+        )),
+        "coverage": len(valid) / planned if planned else 0.0,
+        "mean_denominator": len(valid), "mean_scope": "valid_subset_only",
+        "means": {name: statistics.mean(getattr(score, name) for score in valid) if valid else None
+                  for name in (*LLMJudge.REQUIRED_FIELDS, "overall")},
+    }
 
 
 class LLMJudge:
@@ -94,11 +118,15 @@ Agent 响应: {response}
 
     REQUIRED_FIELDS = ("relevance", "accuracy", "completeness", "helpfulness")
 
-    def __init__(self, client: AsyncAnthropic, model: str):
+    def __init__(self, client: AsyncAnthropic, model: str, *, max_tokens: Optional[int] = None):
         if not model:
             raise ValueError("model is required")
         self._client = client
         self._model = model
+        configured = max_tokens if max_tokens is not None else int(os.getenv("EVAL_JUDGE_MAX_TOKENS", "4096"))
+        if isinstance(configured, bool) or not isinstance(configured, int) or configured <= 0:
+            raise ValueError("Judge max_tokens must be a positive integer")
+        self.max_tokens = configured
 
     async def judge(
         self,
@@ -113,44 +141,57 @@ Agent 响应: {response}
             context_section=ctx_section,
         )
         prompt = self._clean_text(prompt)
+        failure_reason = "request_error"
+        stop_reason = output_tokens = None
         try:
             resp = await self._client.messages.create(
                 model=self._model,
-                # 结构化 JSON 输出需要给推理留出空间，1024 可覆盖较长答复。
-                max_tokens=1024,
+                # 同一上限交给预算包装器预留，包含 thinking 与最终 JSON。
+                max_tokens=self.max_tokens,
                 temperature=0.0,
                 messages=[{"role": "user", "content": prompt}],
             )
-            raw = extract_text_content(resp.content)
-            start, end = raw.find("{"), raw.rfind("}") + 1
-            if start < 0 or end <= start:
+            stop_reason = getattr(resp, "stop_reason", None)
+            output_tokens = getattr(getattr(resp, "usage", None), "output_tokens", None)
+            failure_reason = "incomplete_response"
+            if stop_reason != "end_turn":
+                raise ValueError(f"judge response incomplete: stop_reason={stop_reason}")
+            raw = extract_text_content(resp.content).strip()
+            failure_reason = "empty_response"
+            if not raw:
+                raise ValueError("judge response is empty")
+            failure_reason = "invalid_json"
+            if raw.startswith("```json\n") and raw.endswith("\n```"):
+                raw = raw[8:-4].strip()
+            if not raw.startswith("{"):
                 raise ValueError("judge response contains no JSON object")
-            data = json.loads(raw[start:end])
+            data = json.loads(raw)
             if not isinstance(data, dict):
                 raise ValueError("judge response JSON is not an object")
 
             values: Dict[str, float] = {}
             for name in self.REQUIRED_FIELDS:
                 if name not in data:
+                    failure_reason = "missing_field"
                     raise ValueError(f"judge response missing {name}")
                 raw_value = data[name]
-                if isinstance(raw_value, bool):
+                failure_reason = "invalid_score"
+                if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
                     raise ValueError(f"judge score {name} is not numeric")
                 value = float(raw_value)
-                if not 0.0 <= value <= 1.0:
+                if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                     raise ValueError(f"judge score {name} is outside 0-1")
                 values[name] = value
 
-            return QualityScores(**values)
+            return QualityScores(**values, stop_reason=stop_reason, output_tokens=output_tokens)
+        except BudgetStopExceeded:
+            raise
         except Exception as ex:
             logger.warning(f"LLM Judge 失败: {ex}")
             return QualityScores(
-                0.0,
-                0.0,
-                0.0,
-                0.0,
                 judge_failed=True,
                 error=str(ex),
+                failure_reason=failure_reason, stop_reason=stop_reason, output_tokens=output_tokens,
             )
 
     @staticmethod
@@ -264,7 +305,7 @@ class EndToEndEvaluator:
             raise ValueError("model is required")
 
         if judge is None:
-            kwargs: Dict[str, Any] = {"api_key": api_key}
+            kwargs: Dict[str, Any] = {"api_key": api_key, "max_retries": 0}
             if base_url:
                 kwargs["base_url"] = base_url
             client = AsyncAnthropic(**kwargs)
@@ -329,6 +370,15 @@ class EndToEndEvaluator:
                         if key in result.scores:
                             all_scores[key].append(result.scores[key])
 
+        judge_scores = [QualityScores(
+            **{name: result.scores.get(name) for name in LLMJudge.REQUIRED_FIELDS},
+            judge_failed=result.metadata["judge_failed"],
+            failure_reason=result.metadata.get("judge_failure_reason"),
+        ) for result in results if "judge_failed" in result.metadata]
+        judge_summary = summarize_judgements(
+            judge_scores, planned=sum(len(self._dialog_turns(case)) for case in (dialog_cases or []))
+        )
+
         avg_scores = {
             key: round(statistics.mean(values), 4)
             for key, values in all_scores.items()
@@ -356,6 +406,7 @@ class EndToEndEvaluator:
             recommendations=recommendations,
             results=results,
             grader_errors=grader_errors,
+            judge_summary=judge_summary,
         )
         self._history.append(report)
         self._save_report(report)
@@ -403,6 +454,9 @@ class EndToEndEvaluator:
                 "conv_id": conv_id,
                 "judge_failed": scores.judge_failed,
                 "judge_error": scores.error,
+                "judge_failure_reason": scores.failure_reason,
+                "judge_stop_reason": scores.stop_reason,
+                "judge_output_tokens": scores.output_tokens,
             }
 
             if scores.judge_failed:
@@ -580,6 +634,7 @@ class EndToEndEvaluator:
                 for result in data.get("results", [])
             ],
             grader_errors=int(data.get("grader_errors", 0)),
+            judge_summary=dict(data.get("judge_summary", {})),
         )
 
 

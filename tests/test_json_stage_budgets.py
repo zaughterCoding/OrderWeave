@@ -30,7 +30,7 @@ class RecordingMessages:
     async def create(self, **kwargs):
         self.calls.append(kwargs)
         text = self._responses.pop(0)
-        return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)])
+        return SimpleNamespace(content=[SimpleNamespace(type="text", text=text)], stop_reason="end_turn")
 
 
 class RecordingClient:

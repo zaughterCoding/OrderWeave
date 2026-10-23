@@ -17,7 +17,7 @@ _ACTIONS = {
 _QUESTIONS = re.compile(r"[？?]|(?:是否|有没有|能否|吗)(?:[，。！；\s]|$)|^(?:can|could|has|have|is|are|did)\b", re.I)
 _UNOBSERVED = re.compile(
     r"退款.{0,8}(?:已到账|未到账|没有到账|尚未到账|已经退回)|"
-    r"仓库.{0,8}(?:已收货|未收货|没有收到|尚未收到)|"
+    r"仓库.{0,8}(?:已收货|已收到|未收货|没有收到|尚未收到)|"
     r"邮件.{0,5}(?:已发送|未发送)|"
     r"(?:已|已经).{0,4}创建.{0,4}真实工单|"
     r"(?:refund.{0,20}(?:has been issued|has not been issued|has arrived)|"
@@ -38,6 +38,59 @@ _CHANGE_DESTINATION = re.compile(r"(?:之后|后续|提交后|稍后|随时).{0,
 _ORDER_ID = re.compile(r"#?W\d+", re.I)
 _STATUS = re.compile(r"(?:订单状态|order status)\s*(?:[:：]|为|是)\s*([^\n，。.,;；]+)", re.I)
 _AMOUNT = re.compile(r"(?:预计申请金额|预计退款金额|退款金额|estimated refund amount)\s*[:：为是]?\s*[¥￥$]?\s*(\d[\d,]*(?:\.\d+)?)", re.I)
+
+
+def _semantic_units(text: str) -> list[str]:
+    """换行不终止语义；冒号引出的列表与上文限定一起处理。"""
+    units: list[str] = []
+    listing = False
+    for part in re.split(r"(?<=[。！？!?])", text):
+        if not part:
+            continue
+        if listing and re.match(r"\s*(?:[-*]|\d+[.)、])\s+", part):
+            units[-1] += part
+        else:
+            units.append(part)
+            listing = bool(re.search(r"[:：]\s*\n\s*(?:[-*]|\d+[.)、])\s+", part))
+    return units
+
+
+def _explanation(unit: str, match: re.Match) -> bool:
+    """仅把支配当前谓词的说明范围排除，不把后文否定当作前文的限定。"""
+    label = re.match(r'\s*[“"](?:return requested|已申请退货)[^”"]*[”"]只(?:表示|代表|说明)', unit, re.I)
+    if label and match.start() < label.end():
+        return True
+    prefix = re.sub(r"[*`“”\"‘’]", "", unit[:match.start()])
+    listing = bool(re.search(r"[:：]\s*\n\s*(?:[-*]|\d+[.)、])\s+", prefix))
+    boundary = r"但是|但|然而|不过|\bbut\b|\bhowever\b"
+    prefix = re.split(boundary if listing else r"[。！？!?]|" + boundary, prefix, flags=re.I)[-1]
+    # 列表的限定可跨分号；普通分号后的独立断言重新检查。
+    if not re.search(r"[:：]\s*\n\s*(?:[-*]|\d+[.)、])\s+", prefix):
+        prefix = re.split(r"[；;]", prefix)[-1]
+    if re.search(r"不(?:代表|表示|等于)|does not mean|尚未核实|无法确认|cannot confirm", prefix, re.I):
+        return True
+    if re.search(r"(?:如果|假如|若|只有|如需)|\bif\b|(?:确认|提交)(?:成功)?后", prefix, re.I):
+        return True
+    if match.re is _STATUS and re.search(r"时\s*$", match.group(1)):
+        return True
+    if re.search(r"(?:您|你|用户)(?:反馈|表示|报告|说)|\byou (?:said|reported)\b", prefix, re.I):
+        return True
+    instruction = re.split(r"[，,:：\n]", prefix)[-1].strip()
+    if re.fullmatch(r"(?:\d+[.)、]\s*)?(?:请(?:先)?|需(?:要)?(?:先)?|建议(?:先)?|先|并)?(?:确认|核对|检查)(?:该|此)?", instruction):
+        return True
+    # 状态名的定义不是对本人订单的查询结果。
+    return bool(re.match(r"\s*(?:return requested|已申请退货).{0,30}只(?:表示|代表|说明)", prefix, re.I))
+
+
+def _fact_matches(pattern: re.Pattern, unit: str) -> list[re.Match]:
+    matches = []
+    for match in pattern.finditer(unit):
+        tail = re.split(r"[，,；;]", unit[match.end():], maxsplit=1)[0]
+        # 问号只限定所在分句，不能放过前面已作出的业务断言。
+        if _QUESTIONS.search(match.group()) or _QUESTIONS.search(tail) or _explanation(unit, match):
+            continue
+        matches.append(match)
+    return matches
 
 
 @dataclass
@@ -198,20 +251,17 @@ def constrain_response(
         if display:
             text = text.replace(display, "")
     kept: list[str] = []
-    for clause in re.split(r"(?<=[。！？!?；;\n])", text):
-        if _QUESTIONS.search(clause):
-            kept.append(clause)
-            continue
+    for clause in _semantic_units(text):
         issue = ""
         replacement = ""
-        if _GIFT_REFUSAL.search(clause):
+        if _GIFT_REFUSAL.search(clause) and not _QUESTIONS.search(clause):
             issue = "gift_card_balance_refusal"
             replacement = (
                 "An existing gift card owned by you may be a refund destination; "
                 "eligibility must be checked with the business tools."
                 if english else "本人已有礼品卡可作为退款去向；是否可办理须以业务工具校验为准。"
             )
-        elif _EXCHANGE.search(clause) and not re.search(r"不(?:能|支持|可)|cannot|can't|not support", clause, re.I):
+        elif _EXCHANGE.search(clause) and not _QUESTIONS.search(clause) and not re.search(r"不(?:能|支持|可)|cannot|can't|not support", clause, re.I):
             issue = "unsupported_exchange_advice"
             replacement = ("This sandbox does not support exchanges." if english
                            else "本沙箱不支持换货办理。")
@@ -219,25 +269,24 @@ def constrain_response(
             issue = "post_submission_destination_change"
             replacement = ("This sandbox does not support changing the destination after submission."
                            if english else "本沙箱不支持提交后更改退款去向。")
-        elif any(_UNOBSERVED.search(part) and not _QUESTIONS.search(part) and not re.search(
-            r"不代表|不表示|尚未核实|无法确认|未知|does not mean|not verified|unknown|cannot confirm", part, re.I
-        ) for part in re.split(r"[，,]", clause)):
+        elif any(not re.search(r"尚未核实|无法确认|未知|not verified|unknown|cannot confirm", clause[m.end():].split("，")[0], re.I)
+                 for m in _fact_matches(_UNOBSERVED, clause)):
             issue = "unverified_external_status"
             replacement = ("Refund arrival, warehouse receipt and email delivery have not been verified."
                            if english else "退款到账、仓库收货及邮件发送状态尚未核实。")
-        elif _SUBMITTED.search(clause) and not submitted and not re.search(
+        elif _fact_matches(_SUBMITTED, clause) and not submitted and not re.search(
             r"尚未|没有|未提交|不能|无法|确认后|提交后|will|not |cannot", clause, re.I
         ):
             issue = "unsupported_submission_claim"
             replacement = ("No new submitted return is verified in this turn." if english
                            else "本轮没有可核验的新退货提交结果。")
-        elif _HANDOFF.search(clause) and not handoffs and not re.search(
+        elif _fact_matches(_HANDOFF, clause) and not handoffs and not re.search(
             r"尚未|没有|未连接|未接入|不代表|not |cannot", clause, re.I
         ):
             issue = "unsupported_handoff_claim"
             replacement = ("No new simulated handoff is verified in this turn." if english
                            else "本轮没有可核验的新模拟交接记录。")
-        elif _IDENTITY.search(clause) and not bound_user_id and not re.search(
+        elif _fact_matches(_IDENTITY, clause) and not bound_user_id and not re.search(
             r"尚未|没有|未验证|未核实|not |cannot", clause, re.I
         ):
             issue = "unsupported_identity_claim"
@@ -267,20 +316,22 @@ def constrain_response(
                       "source": "tool_trace", "trace_index": index, "status": order["status"]})
     known_ids = set(orders) | {p["order_id"] for p in pending_after + pending_before}
     known_ids |= {e["order_id"] for e in submitted}
-    assertions = "".join(c for c in re.split(r"(?<=[。！？!?；;\n])", text) if not _QUESTIONS.search(c))
-    invalid_ids = {"#" + m.group().lstrip("#").upper() for m in _ORDER_ID.finditer(assertions)} - known_ids
-    amount_matches = list(_AMOUNT.finditer(assertions))
+    units = _semantic_units(text)
+    invalid_ids = {"#" + m.group().lstrip("#").upper()
+                   for unit in units for m in _fact_matches(_ORDER_ID, unit)} - known_ids
+    amount_matches = [m for unit in units for m in _fact_matches(_AMOUNT, unit)]
+    status_matches = [m for unit in units for m in _fact_matches(_STATUS, unit)]
     amounts = {p.get("amount_cents") for p in pending_after}
     bad_amount = bool(amount_matches) and (
         len(pending_after) != 1 or any(
             Decimal(m.group(1).replace(",", "")) * 100 not in amounts for m in amount_matches
         )
     )
-    if invalid_ids or (bad_amount and not blocks) or (_STATUS.search(assertions) and not orders and not blocks):
+    if invalid_ids or (bad_amount and not blocks) or (status_matches and not orders and not blocks):
         findings.append("unverified_labeled_order_fact")
         text = ("Please read the order with the business tools before confirming its details."
                 if english else "请先通过业务工具核对订单，再确认具体状态和金额。")
-    if orders and _STATUS.search(assertions) and not blocks:
+    if orders and status_matches and not blocks:
         def checked_status(match: re.Match) -> str:
             # 只替换对应状态字段，不能覆盖后续退款去向等待补询问。
             ids = list(_ORDER_ID.finditer(text[:match.start()]))
@@ -303,7 +354,11 @@ def constrain_response(
             findings.append("inconsistent_order_status")
             return match.group()[:match.start(1) - match.start()] + str(order["status"])
 
-        text = _STATUS.sub(checked_status, text)
+        starts, offset = set(), 0
+        for unit in units:
+            starts.update(offset + match.start() for match in _fact_matches(_STATUS, unit))
+            offset += len(unit)
+        text = _STATUS.sub(lambda match: checked_status(match) if match.start() in starts else match.group(), text)
 
     if blocks:
         text = "\n\n".join(blocks)
@@ -312,7 +367,7 @@ def constrain_response(
         if display and (item in prepared or display in candidate):
             text = (text + "\n\n" + display).strip()
     return GuardedResponse(text=text, record={
-        "version": "u09.1", "changed": text != candidate,
+        "version": "u09.2", "changed": text != candidate,
         "mode": "controlled" if blocks else "checked",
         "findings": sorted(set(findings)), "facts": facts,
         "candidate_text": candidate,
