@@ -300,6 +300,7 @@ class RetailTurnResult:
     composer_used: bool = False
     fallback_used: bool = False
     role_traces: List[Dict[str, Any]] = field(default_factory=list)
+    semantic_routing: Dict[str, Any] = field(default_factory=dict)
     # 有限支持模式的可观察状态；关闭时保持空值和原语义。
     support_enabled: bool = False
     support_scope: str = ""
@@ -503,6 +504,8 @@ class RetailService:
                 memory_error = f"读取记忆失败: {ex}"
                 logger.warning(memory_error)
 
+        from core.retail_semantic_router import task_view, visible_history
+
         request = Request(
             message=message,
             user_id=client_user_id,
@@ -514,6 +517,11 @@ class RetailService:
             retail_support=support_packet,
             retail_support_enabled=self.support_enabled,
             retail_support_blocked=support_blocked,
+            history=visible_history(support_record),
+            retail_task=task_view(support_packet or {
+                "current_state": {"stage": (support_record or {}).get("stage", "none")},
+                "return_flow": (support_record or {}).get("return_flow", {}),
+            }, pending_brief),
         )
 
         return {
@@ -710,6 +718,7 @@ class RetailService:
             composer_used=bool(meta.get("composer_used")),
             fallback_used=bool(meta.get("fallback_used")),
             role_traces=list(meta.get("role_traces") or []),
+            semantic_routing=dict(request.retail_routing),
             support_enabled=self.support_enabled,
             support_scope=(
                 analysis.scope_state if self.support_enabled else ""
@@ -760,6 +769,7 @@ class RetailService:
             "primary_agent": result.primary_agent,
             "supporting_agents": list(result.supporting_agents),
             "routing_reason": result.routing_reason,
+            "semantic_routing": dict(result.semantic_routing),
             "routing_confidence": result.routing_confidence,
             "composer_used": result.composer_used,
             "fallback_used": result.fallback_used,
@@ -831,6 +841,7 @@ class RetailService:
             "primary_agent": result.primary_agent,
             "supporting_agents": result.supporting_agents,
             "routing_reason": result.routing_reason,
+            "semantic_routing": dict(result.semantic_routing),
             "routing_confidence": result.routing_confidence,
             "composer_used": result.composer_used,
             "fallback_used": result.fallback_used,

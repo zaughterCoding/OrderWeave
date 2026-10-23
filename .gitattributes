@@ -1,2 +1,4 @@
 # 冻结评测资产按原始字节保存，避免换行转换破坏清单哈希。
 evaluation/data/** -text
+evaluation/data/semantic_routing/** -text
+core/retail_semantic_model.json -text

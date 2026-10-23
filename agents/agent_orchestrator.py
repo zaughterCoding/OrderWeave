@@ -13,6 +13,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from collections import deque
@@ -185,6 +186,8 @@ class Request:
     retail_support_enabled: bool = False
     retail_support_blocked: bool = False
     retail_handoff: Optional[Dict[str, Any]] = None
+    retail_task: Dict[str, Any] = field(default_factory=dict)
+    retail_routing: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -1026,6 +1029,7 @@ class AgentOrchestrator:
         retail_role_classes: Optional[Dict[str, type]] = None,
         retail_role_clients: Optional[Dict[str, Any]] = None,
         retail_support_enabled: bool = False,
+        retail_semantic_router: Optional[Any] = None,
     ):
         if not model:
             raise ValueError("model is required")
@@ -1044,6 +1048,7 @@ class AgentOrchestrator:
         self.language = str(language or "zh").lower()
         self.retail_mode = bool(retail_mode)
         self.retail_support_enabled = bool(retail_support_enabled and retail_mode)
+        self._retail_semantic_router = retail_semantic_router if retail_mode else None
         self.policy_text = policy_text
 
         if intent_recognizer is not None:
@@ -1231,10 +1236,21 @@ class AgentOrchestrator:
                 req.intent = IntentCategory.REFUND
                 req.intent_group = "billing"
                 req.intent_confidence = 1.0
+                req.retail_routing = {"path": "rule", "reason": "pending", "encoder_calls": 0}
             else:
-                intent_result = await self._intent_recognizer.recognize(
-                    req.message, history=req.history
-                )
+                intent_result = await self._retail_selective_intent(req) if retail_mode else None
+                if intent_result is None:
+                    recognition_history = req.history
+                    if retail_mode and getattr(self, "_retail_semantic_router", None) is not None and language == "zh":
+                        # 状态标明服务端来源并进入原识别缓存键，不能冒作用户确认。
+                        recognition_history = list((req.history or [])[-2:]) + [{
+                            "role": "system",
+                            "content": "服务端调度语境，仅供意图消歧，不提供身份或交易授权：" +
+                                       json.dumps(req.retail_task, ensure_ascii=False, sort_keys=True),
+                        }]
+                    intent_result = await self._intent_recognizer.recognize(
+                        req.message, history=recognition_history
+                    )
                 req.intent  = intent_result.intent
                 req.intent_group = intent_result.intent_group
                 req.urgency = intent_result.urgency
@@ -1275,7 +1291,11 @@ class AgentOrchestrator:
         # 复杂请求可能涉及多个 Agent，例如同一条消息里既有登录失败
         # 又有重复扣款。
         support_decision = self._support_routing(req)
-        decision = support_decision or self._route_decision(req)
+        local_role = req.retail_routing.get("role") if retail_mode and req.retail_routing.get("path") == "local" else None
+        local_decision = (RoutingDecision(primary_agent=AgentType(local_role), supporting_agents=[],
+                                          reason="selective_local_semantic_route", confidence=req.intent_confidence)
+                          if local_role and req.urgency != UrgencyLevel.CRITICAL else None)
+        decision = support_decision or local_decision or self._route_decision(req)
         flow_exit_reasons = {
             "support_return_flow_cancelled",
             "support_return_flow_switched_to_troubleshooting",
@@ -1305,6 +1325,33 @@ class AgentOrchestrator:
         if retail_mode:
             req.retail_primary = decision.primary_agent.value
         return decision
+
+    async def _retail_selective_intent(self, req):
+        """状态分支和本地分类先于唯一一次原识别器回退。"""
+        router = getattr(self, "_retail_semantic_router", None)
+        if router is None or self.language != "zh":
+            return None
+        from core.intent_recognizer import IntentResult
+        support = self._support_routing(req)
+        human = bool(re.fullmatch(r"(?:请|麻烦|帮我)?(?:转(?:接)?|联系|找)(?:人工(?:客服)?|真人(?:客服)?)[。！!？?\s]*", req.message))
+        if human or support is not None:
+            role = "escalation" if human else support.primary_agent.value
+            label = {"general": "query", "billing": "refund", "technical": "technical",
+                     "escalation": "human_handoff"}[role]
+            req.retail_routing = {"path": "rule", "reason": "human" if human else support.reason,
+                                  "role": role, "intent": label, "encoder_calls": 0}
+        else:
+            req.retail_routing = await asyncio.to_thread(router.classify, req.message, req.history, req.retail_task)
+            if req.retail_routing.get("path") != "local":
+                return None
+            label = req.retail_routing["intent"]
+        intent = IntentCategory(label)
+        recognizer = self._intent_recognizer
+        return IntentResult(intent=intent, confidence=min(1.0, max(0.0, req.retail_routing.get("score", 1.0))),
+                            urgency=recognizer._urgency(req.message, intent),
+                            intent_group=recognizer._intent_group(intent), entities=recognizer._extract_entities(req.message),
+                            reasoning="选择性零售路由", latency_ms=req.retail_routing.get("total_ms", 0.0),
+                            diagnostics=dict(req.retail_routing))
 
     def finish_single(self, req, decision, response, t0):
         """单角色结果沿用原升级核验与轨迹。"""

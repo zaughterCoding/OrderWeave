@@ -414,6 +414,8 @@ class RetailRuntimeConfig:
     retrieval_strategy: str = "relevance"
     workflow_mode: str = "langgraph"
     checkpoint_path: Optional[Path] = None
+    semantic_routing: bool = True
+    semantic_model_path: Optional[Path] = None
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -534,6 +536,8 @@ class RetailRuntimeConfig:
             agent_mode=agent_mode,
             workflow_mode=_env_text("RETAIL_WORKFLOW_MODE", "langgraph"),
             checkpoint_path=_env_optional_path("RETAIL_CHECKPOINT_PATH"),
+            semantic_routing=_env_bool("RETAIL_SEMANTIC_ROUTING", True),
+            semantic_model_path=_env_optional_path("RETAIL_SEMANTIC_MODEL_PATH"),
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
             embedding_model=_env_text("RETAIL_EMBEDDING_MODEL", "qwen").lower(),
@@ -631,6 +635,12 @@ class RetailRuntime:
             return
         self._closed = True
         self._started = False
+        router = getattr(getattr(getattr(self, "agent", None), "orchestrator", None), "_retail_semantic_router", None)
+        if router is not None:
+            try:
+                await asyncio.to_thread(router.close)
+            except Exception:
+                logger.exception("关闭语义路由编码器失败")
         workflow = getattr(getattr(self, "service", None), "workflow", None)
         if workflow is not None:
             try:
@@ -860,6 +870,8 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
     policy_text = config.policy_path.read_text(encoding="utf-8")
     skill_manager = None
     if config.agent_mode == "multi":
+        from core.retail_semantic_router import DEFAULT_MODEL, RetailSemanticRouter
+
         # 四个角色、识别与 Composer 共用同一预算客户端，并按阶段计数。
         orchestrator = AgentOrchestrator(
             client=client.for_stage("roles", count_turn=True),
@@ -886,6 +898,9 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
                 "escalation": RetailEscalationAgent,
             },
             retail_support_enabled=config.support_enabled,
+            retail_semantic_router=(RetailSemanticRouter(config.semantic_model_path or DEFAULT_MODEL,
+                                                         encoder=encoder, owns_encoder=encoder is None)
+                                    if config.semantic_routing and language == "zh" else None),
         )
         agent = RetailMultiAgent(
             orchestrator,

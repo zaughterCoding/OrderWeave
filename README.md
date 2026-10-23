@@ -6,6 +6,23 @@
 
 U02 的技术、前后链路对照、新增能力、验收边界和简历表述见[技术总结](evaluation/U02_SUMMARY.md)。
 
+U03 已接入本地 Qwen 文档向量＋岭回归线性分类头。中文 multi 默认仅对满足分数、间隔、训练语义支持及状态一致性门槛的问候／致谢直达 general；其他类别、活跃任务冲突和模型不可用时继续原识别器／澄清。取消、人工、pending及原支持规则优先，不额外编码或分类。项目仍默认 multi＋langgraph，业务写入继续由原唯一主执行者及 Store 核验。
+
+运行所需分类头与语义参考向量在 `core/retail_semantic_model.json`，不依赖被忽略的 evaluation 目录。编码器仅使用已有的固定 Qwen 缓存及 `data/embedding-env`，不自动下载；RAG 编码指令与索引不变。`RETAIL_SEMANTIC_MODEL_PATH` 留空使用附带模型，加载或编码失败自动走原识别路径。启动 API／CLI 前配置：
+
+```powershell
+$env:RETAIL_MODE="true"
+$env:RETAIL_AGENT_MODE="multi"
+$env:RETAIL_WORKFLOW_MODE="langgraph"
+$env:RETAIL_SEMANTIC_ROUTING="true"
+# 关闭语义快速路径，恢复原意图识别：
+# $env:RETAIL_SEMANTIC_ROUTING="false"
+```
+
+分类按本轮话语编码，任务状态另行约束；不缓存本地分类，原识别回退缓存包含任务视图。分数不是正确概率，分类不能绑定身份、确认或授权交易。trace 的 `semantic_routing` 披露路径、原因、分数／间隔／语义相似度和实际编码次数。single 与英文入口不装配该分类器，legacy 复用共享路由。
+
+固定小样本结果：新32条内部合成验收分类28/32、Macro-F1 0.8773；仅接受4/32且未观察到接受错误，12条范围外全部回退，其余28/32需原路径。已见56题诊断接受5条、零接受错误。默认仅采用 greeting，不宣称覆盖所有角色、独立泛化、总体加速或节费；完整结果、历史失败与实验脚本留在本地评测目录，不随代码发布。
+
 ## 环境要求
 
 - Windows
