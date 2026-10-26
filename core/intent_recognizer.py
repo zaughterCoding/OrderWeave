@@ -122,6 +122,9 @@ _EN_PROMPT_EXAMPLES = (
     (IntentCategory.OTHER, "Write me a poem."),
 )
 
+_RETAIL_INTENTS = tuple(cat for cat, _ in _PROMPT_EXAMPLES)
+_RETAIL_ALIASES = {"logistics": "order_status", "escalation": "human_handoff"}
+
 
 def _is_english(language: Optional[str]) -> bool:
     return str(language or "").strip().lower().startswith("en")
@@ -131,9 +134,28 @@ def build_intent_prompt(
     message: str,
     history: Optional[List[Dict[str, str]]] = None,
     language: Optional[str] = None,
+    retail_mode: bool = False,
 ) -> str:
     """构造与实际意图请求完全一致的 Prompt，供预算预检复用。"""
     message = _sanitize_text(message)
+    candidates = _RETAIL_INTENTS if retail_mode else tuple(IntentCategory)
+    contract = ""
+    if retail_mode:
+        contract = (
+            "本零售场景只能返回下列六类。order_status：查询本人已有订单、商品价格、配送或已发生退款的记录事实；"
+            "refund：当前明确要求办理、调整退货；query：政策、资格、运费、准备材料等咨询，不等于授权办理；"
+            "human_handoff：当前明确要求真人接手；greeting：问候、致谢、告别；"
+            "other：范围外需求或其他表达。取消订单、换货、改收货地址、开发票、选购推荐、库存、下单及通用电脑排障均不支持，归other。"
+            "商品或身份信息不足不改变已明确表达的退货或人工意图；仅询问退货条件、查询退款记录时不得判为办理退货。"
+            if not _is_english(language) else
+            "Return only one of the six retail intents. order_status: recorded facts about the user's existing orders, "
+            "item prices, delivery or completed refunds. refund: an explicit current request to arrange or revise a return. "
+            "query: policy, eligibility, shipping fees or preparation, without authorization to act. "
+            "human_handoff: an explicit current request for a human. greeting: greetings, thanks or farewells. "
+            "other: unsupported requests or other messages. Order cancellation, exchange, address changes, invoices, "
+            "recommendations, stock, purchases and general computer troubleshooting are unsupported. "
+            "Missing product or identity details do not erase an explicit return or human request."
+        )
     if not _is_english(language):
         examples = "\n".join(
             f'  消息: "{_sanitize_text(t)}" → 意图: {cat.value}'
@@ -150,6 +172,7 @@ def build_intent_prompt(
 如果用户问题能匹配本场景的细粒度业务意图，请优先返回 order_status、refund、query、human_handoff、greeting、other，而不是 complaint、request、billing 等宽泛大类。
 退货办理相关优先返回 refund，不要返回 billing 或 request；查询本人订单事实优先返回 order_status，不要返回 logistics；政策与准备咨询返回 query；明确要求真人接手返回 human_handoff。
 只判断当前消息的主要目标；历史只用于消歧，用户明确否定或改口时以当前消息为准。
+{contract}
 
 示例:
 {examples}
@@ -159,7 +182,7 @@ def build_intent_prompt(
 返回格式（仅 JSON，不要其他文字）:
 {{"intent": "<意图值>", "confidence": <0-1>, "reasoning": "<一句话说明>"}}
 
-可选意图: {", ".join(c.value for c in IntentCategory)}"""
+可选意图: {", ".join(c.value for c in candidates)}"""
         return _sanitize_text(prompt)
 
     examples = "\n".join(
@@ -177,6 +200,7 @@ def build_intent_prompt(
 If the message matches a specific business intent in this scenario, prefer order_status, refund, query, human_handoff, greeting or other over broad categories such as complaint, request, billing or account.
 Return requests should be refund, not billing or request. Questions about the user's own order facts should be order_status, not logistics. Policy and preparation questions are query. An explicit request for a human is human_handoff.
 Judge only the main goal of the current message; history is only for disambiguation, and the current message wins when the user contradicts or corrects it.
+{contract}
 
 Examples:
 {examples}
@@ -186,7 +210,7 @@ User message: "{message}"
 Return format (JSON only, no other text):
 {{"intent": "<intent value>", "confidence": <0-1>, "reasoning": "<one sentence>"}}
 
-Available intents: {", ".join(c.value for c in IntentCategory)}"""
+Available intents: {", ".join(c.value for c in candidates)}"""
     return _sanitize_text(prompt)
 
 _SPECIFIC_INTENTS = {
@@ -306,6 +330,7 @@ class IntentRecognizer:
         confidence_threshold: float = 0.5,
         client: Any = None,
         language: Optional[str] = None,
+        retail_mode: bool = False,
     ):
         if not model:
             raise ValueError("model is required")
@@ -321,6 +346,7 @@ class IntentRecognizer:
         self.model     = model
         self.threshold = confidence_threshold
         self.language  = language
+        self.retail_mode = retail_mode
         # 本地字符 n-gram 向量始终可用。若客户端暴露 embeddings 资源，
         # _embed_text 会优先使用它，否则退回本地向量。
         self._embedding_enabled = True
@@ -376,7 +402,7 @@ class IntentRecognizer:
         else:
             recognition_status = "ok"
         fallback_source = "none"
-        if llm_failed and intent is not IntentCategory.OTHER:
+        if (llm_failed or unknown_label) and intent is not IntentCategory.OTHER:
             if emb.get("intent") is intent and float(emb.get("confidence", 0.0) or 0.0) > 0:
                 fallback_source = "embedding"
             elif pat.get("intent") is intent and float(pat.get("confidence", 0.0) or 0.0) > 0:
@@ -435,18 +461,20 @@ class IntentRecognizer:
         """信号 1：结合少样本示例和上下文的 LLM 语义理解。"""
         message = self._clean_text(message)
         prompt = build_intent_prompt(
-            message, history, language=getattr(self, "language", None)
+            message, history, language=getattr(self, "language", None),
+            retail_mode=getattr(self, "retail_mode", False),
         )
 
         last_error: Optional[Exception] = None
         last_kind = "request_error"
         attempts: List[Dict[str, Any]] = []
-        # 推理偶尔耗尽预算仍未输出 JSON；有界重试一次，避免静默降级。
+        # 普通请求／解析错误有限重试；硬预算与截断停止由评测守卫向上抛出。
         for attempt in range(2):
             try:
                 resp = await self.client.messages.create(
                     model=self.model,
-                    # 意图判断会先输出推理，需要给完整 JSON 留出足够空间。
+                    # 分类只需完整JSON，避免默认思考耗尽正文输出额度。
+                    extra_body={"thinking": {"type": "disabled"}},
                     max_tokens=2048,
                     temperature=0.1,
                     messages=[{"role": "user", "content": prompt}],
@@ -466,11 +494,17 @@ class IntentRecognizer:
                 data["attempts"] = attempts
                 data["unknown_label"] = False
                 try:
-                    data["intent"] = IntentCategory(raw_intent.strip().lower())
+                    label = raw_intent.strip().lower()
+                    if getattr(self, "retail_mode", False):
+                        label = _RETAIL_ALIASES.get(label, label)
+                    data["intent"] = IntentCategory(label)
+                    if getattr(self, "retail_mode", False) and data["intent"] not in _RETAIL_INTENTS:
+                        raise ValueError("标签不属于零售六类")
                 except ValueError:
                     # 未知标签保留为显式错误，不能伪装成正确的 other。
                     data["intent"] = IntentCategory.OTHER
                     data["unknown_label"] = True
+                    data["confidence"] = 0.0
                 return data
             except Exception as ex:
                 # 预算停止与单轮请求上限必须向上抛出，不能被降级为 OTHER。
@@ -598,12 +632,17 @@ class IntentRecognizer:
 
     def _vote(self, llm: Dict, emb: Dict, pat: Dict) -> tuple[IntentCategory, float, Dict[str, float]]:
         """加权投票。返回最终意图、融合置信度和各信号得分。"""
+        if getattr(self, "retail_mode", False):
+            # 旧模板和关键词不得把零售结果重新扩展成发票、账户等标签。
+            llm, emb, pat = [r if r.get("intent") in _RETAIL_INTENTS else
+                             {**r, "intent": IntentCategory.OTHER, "confidence": 0.0}
+                             for r in (llm, emb, pat)]
         source_scores = {
             "llm": float(llm.get("confidence", 0.0) or 0.0),
             "embedding": float(emb.get("confidence", 0.0) or 0.0),
             "pattern": float(pat.get("confidence", 0.0) or 0.0),
         }
-        if llm.get("failed"):
+        if llm.get("failed") or llm.get("unknown_label"):
             if emb.get("intent") != IntentCategory.OTHER and emb.get("confidence", 0.0) > 0:
                 return emb["intent"], source_scores["embedding"], source_scores
             if pat.get("intent") != IntentCategory.OTHER and pat.get("confidence", 0.0) > 0:
@@ -633,7 +672,8 @@ class IntentRecognizer:
         )
         pat_intent = pat.get("intent", IntentCategory.OTHER)
         pat_conf = float(pat.get("confidence", 0.0) or 0.0)
-        if (best in _GENERIC_INTENTS and pat_intent in _SPECIFIC_INTENTS
+        if (not getattr(self, "retail_mode", False)
+                and best in _GENERIC_INTENTS and pat_intent in _SPECIFIC_INTENTS
                 and _INTENT_GROUPS.get(pat_intent, pat_intent) == best_group
                 and pat_conf >= 0.5 and best_score < 0.8):
             source_scores["refined_by_pattern"] = pat_conf
@@ -753,7 +793,9 @@ class IntentRecognizer:
     def _cache_key(self, message: str, history: Optional[List[Dict[str, str]]] = None) -> str:
         # 缓存包含实体和紧急度，因此键必须覆盖历史窗口内所有可能
         # 影响识别的输入字符。
-        payload = {"message": self._clean_text(message)}
+        payload = {"message": self._clean_text(message),
+                   "retail_mode": bool(getattr(self, "retail_mode", False)),
+                   "language": getattr(self, "language", None)}
         if history:
             payload["history"] = [
                 {

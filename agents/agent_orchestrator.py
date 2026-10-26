@@ -243,6 +243,7 @@ class BaseAgent:
     # 旧 Agent 保持原有 3 轮、每轮执行全部 tool_use；零售 Agent 在子类收窄。
     max_tool_rounds: int = 3
     max_tool_uses_per_response: Optional[int] = None
+    serial_read_tools: Tuple[str, ...] = ()
     capture_tool_results: bool = False
     language: str = "zh"
 
@@ -390,6 +391,8 @@ class BaseAgent:
 
                 messages.append({"role": "assistant", "content": resp.content})
                 tool_results = []
+                # 供应商可能忽略单工具参数；仅纯只读批次可串行消费，写入仍逐次限制。
+                read_batch = all(self._block_value(block, "name") in self.serial_read_tools for block in tool_uses)
                 for index, block in enumerate(tool_uses):
                     name = self._block_value(block, "name")
                     tool_use_id = self._block_value(block, "id")
@@ -404,6 +407,7 @@ class BaseAgent:
                     if (
                         self.max_tool_uses_per_response is not None
                         and index >= self.max_tool_uses_per_response
+                        and not read_batch
                     ):
                         call_success = False
                         result_success = False
@@ -493,6 +497,13 @@ class BaseAgent:
                         "content": json.dumps(result, ensure_ascii=False),
                     })
                 messages.append({"role": "user", "content": tool_results})
+                if guard_state.get("stop_response"):
+                    return AgentCallResult(
+                        content=guard_state["stop_response"],
+                        tools_used=list(tools_used),
+                        tool_traces=list(tool_traces),
+                        knowledge_hits=knowledge_hits,
+                    )
 
             raise AgentCallError(
                 f"{self.agent_type.value} 工具调用超过最大轮数",
@@ -654,7 +665,7 @@ class GeneralAgent(BaseAgent):
         max_tokens=1600,
     )
     system_prompt = (
-        "你是 EchoMind 智能客服。友好、简洁地回答用户问题。"
+        "你是 OrderWeave 智能客服。友好、简洁地回答用户问题。"
         "如果问题超出你的能力范围，明确说明并建议转接专业客服。"
     )
 
@@ -1062,6 +1073,8 @@ class AgentOrchestrator:
             self._intent_recognizer = IntentRecognizer(
                 api_key=api_key, base_url=base_url, model=model
             )
+        if isinstance(self._intent_recognizer, IntentRecognizer):
+            self._intent_recognizer.retail_mode = self.retail_mode
         self._skill_manager = None if self.retail_mode else skill_manager
         if composer is not None:
             self._composer = composer
@@ -1228,11 +1241,23 @@ class AgentOrchestrator:
         t0 = time.monotonic()
         retail_mode = bool(getattr(self, "retail_mode", False))
         language = str(getattr(self, "language", "zh"))
+        pending_reply = False
+        if retail_mode and req.retail_pending:
+            from agents.retail_support import analyze_message
+            from mcp.retail_store import evaluate_confirmation
+            action = ((req.retail_support or {}).get("return_flow") or {}).get("action")
+            action = action or analyze_message(req.message, has_pending=True).return_flow_action
+            pending_reply = action not in {
+                "cancel", "human", "switch_to_troubleshooting", "conditional_return",
+                "related_question", "independent_question",
+            } and (action == "provide_info" or any(
+                evaluate_confirmation(req.message, item, req.retail_pending, language=language).approved
+                for item in req.retail_pending
+            ))
         # 1. 调用方未识别过意图时，这里识别。
         if req.intent is None:
-            if retail_mode and req.retail_pending:
-                # 待确认详情后的回复固定交给账单角色；是否授权仍由服务端
-                # 根据真实用户消息判断，模型不能自行确认。
+            if pending_reply:
+                # 仅当前详情的确认或补充由账单角色续接；提交仍由工具独立核验。
                 req.intent = IntentCategory.REFUND
                 req.intent_group = "billing"
                 req.intent_confidence = 1.0
@@ -1262,7 +1287,7 @@ class AgentOrchestrator:
                 req.entities = recognized_entities
 
         if self._needs_clarification(req):
-            if retail_mode and self._support_routing(req) is not None:
+            if retail_mode and (self._support_routing(req) is not None or self._information_followup(req)):
                 # 支持范围的澄清由 General 结合 Host 上下文完成，避免通用
                 # 低置信度分支先截断用户已说明的耳机问题。
                 pass
@@ -1285,6 +1310,14 @@ class AgentOrchestrator:
                     routing_reason="低置信度 OTHER 意图，先澄清用户需求",
                     routing_confidence=req.intent_confidence,
                 )
+                previous = [h.get("content", "") for h in (req.history or []) if h.get("role") == "assistant"]
+                if retail_mode and result.response in previous:
+                    result.response = ("I still need your request and identification details together to continue. "
+                        "Please state what you want to do and provide your email, or full name and zip code. "
+                        "You may also ask for a human. No business action was taken."
+                        if language == "en" else "请将要办理的事项和邮箱，或姓名加邮编一起提供，也可以要求人工协助。本轮未办理业务。")
+                    result.success = False
+                    result.routing_reason = "repeated_clarification_stopped"
                 self._record_tool_trace(result)
                 return result
 
@@ -1303,7 +1336,7 @@ class AgentOrchestrator:
         }
         if (
             retail_mode
-            and req.retail_pending
+            and pending_reply
             and req.intent not in (
                 IntentCategory.ESCALATION,
                 IntentCategory.HUMAN_HANDOFF,
@@ -1315,7 +1348,7 @@ class AgentOrchestrator:
             and decision.primary_agent != AgentType.ESCALATION
             and self._pool.get(AgentType.BILLING)
         ):
-            # 已展示待确认详情时，只允许账单角色处理，且不再并行辅助角色。
+            # 当前退货详情的回复不并行辅助角色。
             decision = RoutingDecision(
                 primary_agent=AgentType.BILLING,
                 supporting_agents=[],
@@ -1334,7 +1367,13 @@ class AgentOrchestrator:
         from core.intent_recognizer import IntentResult
         support = self._support_routing(req)
         human = bool(re.fullmatch(r"(?:请|麻烦|帮我)?(?:转(?:接)?|联系|找)(?:人工(?:客服)?|真人(?:客服)?)[。！!？?\s]*", req.message))
-        if human or support is not None:
+        state_reasons = {
+            "support_user_requested_human_handoff", "support_user_currently_chose_return",
+            "support_return_flow_continuation", "support_return_flow_cancelled",
+            "support_return_flow_switched_to_troubleshooting", "support_return_flow_related_question",
+            "support_conditional_return_requires_troubleshooting_first", "support_limited_troubleshooting",
+        }
+        if human or (support is not None and support.reason in state_reasons):
             role = "escalation" if human else support.primary_agent.value
             label = {"general": "query", "billing": "refund", "technical": "technical",
                      "escalation": "human_handoff"}[role]
@@ -1561,6 +1600,22 @@ class AgentOrchestrator:
         if not isinstance(packet, dict) or packet.get("enabled") is not True:
             return None
         scope = str(packet.get("scope_state") or "")
+        demand = packet.get("current_demand") or {}
+        demand_kind = str(demand.get("kind") or "none")
+        flow = packet.get("return_flow") or {}
+        flow_action = str(flow.get("action") or "none")
+        if demand_kind == "human" or flow_action == "human":
+            return RoutingDecision(primary_agent=AgentType.ESCALATION, supporting_agents=[],
+                                   reason="support_user_requested_human_handoff", confidence=1.0)
+        if flow_action == "independent_question":
+            return None
+        if req.intent in (IntentCategory.ORDER_STATUS, IntentCategory.REFUND,
+                          IntentCategory.HUMAN_HANDOFF, IntentCategory.GREETING, IntentCategory.OTHER):
+            # 商品澄清不能覆盖已识别的当前目标；退出动作仍由支持状态处理。
+            if flow_action not in ("cancel", "switch_to_troubleshooting"):
+                return None
+        if demand_kind == "return" and scope != "active":
+            return None
         if scope == "ambiguous":
             return RoutingDecision(
                 primary_agent=AgentType.GENERAL,
@@ -1577,21 +1632,10 @@ class AgentOrchestrator:
             )
         if scope != "active":
             return None
-        demand = packet.get("current_demand") or {}
-        demand_kind = str(demand.get("kind") or "none")
         record = packet.get("work_record") or {}
         stage = str(record.get("stage") or "")
-        flow = packet.get("return_flow") or {}
         flow_status = str(flow.get("status") or "idle")
-        flow_action = str(flow.get("action") or "none")
         flow_active = flow_status in ("active", "awaiting_confirmation")
-        if demand_kind == "human" or flow_action == "human":
-            return RoutingDecision(
-                primary_agent=AgentType.ESCALATION,
-                supporting_agents=[],
-                reason="support_user_requested_human_handoff",
-                confidence=1.0,
-            )
         if flow_action == "switch_to_troubleshooting":
             return RoutingDecision(
                 primary_agent=AgentType.TECHNICAL,
@@ -1625,9 +1669,8 @@ class AgentOrchestrator:
                 reason="support_return_flow_related_question",
                 confidence=0.85,
             )
-        if flow_active and flow_action != "conditional_return":
-            # 退货流程已开始且未明确退出时，补充信息、确认或追问都继续由
-            # 账单角色处理；本轮的“当前诉求”不能覆盖进行中的任务。
+        if flow_active and flow_action in ("provide_info", "none"):
+            # 只续接当前任务；独立问题已在上方退出支持路由。
             return RoutingDecision(
                 primary_agent=AgentType.BILLING,
                 supporting_agents=[],
@@ -1875,6 +1918,14 @@ class AgentOrchestrator:
         # 保留顺序、去重，并且只返回存在实例的类型。
         deduped = list(dict.fromkeys(targets))
         return [agent_type for agent_type in deduped if self._pool.get(agent_type)]
+
+    @staticmethod
+    def _information_followup(req: Request) -> bool:
+        """对上一轮提问的补充交给角色理解，不据此继承任何业务授权。"""
+        recent = [h.get("content", "") for h in (req.history or []) if h.get("role") == "assistant"]
+        if not recent or "I cannot tell which issue" in recent[-1] or "我还不能确定" in recent[-1]:
+            return False
+        return bool(re.search(r"[?？]|please\s+(?:provide|tell|send|choose|confirm)|请(?:提供|告诉|选择|确认)", recent[-1], re.I))
 
     @staticmethod
     def _needs_clarification(req: Request) -> bool:

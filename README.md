@@ -1,403 +1,249 @@
-# AgentEcommerce
+# OrderWeave
 
-基于 Anthropic 兼容协议与多路融合的电商客服 Agent 项目。当前提供 HTTP API 与交互式 CLI，接通意图识别、多 Agent 编排、Skills、ChromaDB 知识库检索、分层记忆、性能监控与回复评测。
+**基于 LangGraph、MCP 与受控事务的多 Agent 零售客服系统。**
 
-零售 API／CLI 默认使用多 Agent 与 LangGraph 有状态工作图，已展示的退货详情通过 SQLite checkpoint 与 Interrupt／Resume 等待并恢复。`RETAIL_AGENT_MODE=single` 可显式切换单 Agent，`RETAIL_WORKFLOW_MODE=legacy` 可回退工作流。节点图、零费用进程重启演示和验证命令见[退货工作图说明](evaluation/RETAIL_WORKFLOW.md)。
+[English](README.en.md) · [评测方法](evaluation/README.md) · [结果与适用范围](evaluation/RESULTS.md) · [MIT](LICENSE)
 
-U02 的技术、前后链路对照、新增能力、验收边界和简历表述见[技术总结](evaluation/U02_SUMMARY.md)。
+OrderWeave 将意图识别、按需角色协作、订单工具和可恢复状态图连接到同一条客服链路。项目重点是多轮办理：识别用户需求，核对身份和订单，展示完整退货详情，等待用户确认，再由服务端提交并记录结果。
 
-U03 已接入本地 Qwen 文档向量＋岭回归线性分类头。中文 multi 默认仅对满足分数、间隔、训练语义支持及状态一致性门槛的问候／致谢直达 general；其他类别、活跃任务冲突和模型不可用时继续原识别器／澄清。取消、人工、pending及原支持规则优先，不额外编码或分类。项目仍默认 multi＋langgraph，业务写入继续由原唯一主执行者及 Store 核验。
+公开代码面向研究、学习和本地演示。订单来自使用者自行准备的虚构沙箱；退货申请不等于真实退款，人工交接仅为模拟记录。
 
-运行所需分类头与语义参考向量在 `core/retail_semantic_model.json`，不依赖被忽略的 evaluation 目录。编码器仅使用已有的固定 Qwen 缓存及 `data/embedding-env`，不自动下载；RAG 编码指令与索引不变。`RETAIL_SEMANTIC_MODEL_PATH` 留空使用附带模型，加载或编码失败自动走原识别路径。启动 API／CLI 前配置：
+## 功能
 
-```powershell
-$env:RETAIL_MODE="true"
-$env:RETAIL_AGENT_MODE="multi"
-$env:RETAIL_WORKFLOW_MODE="langgraph"
-$env:RETAIL_SEMANTIC_ROUTING="true"
-# 关闭语义快速路径，恢复原意图识别：
-# $env:RETAIL_SEMANTIC_ROUTING="false"
+- **统一入口**：FastAPI HTTP API 与交互式 CLI 共用零售服务；默认 `multi + langgraph`，保留单 Agent 和 legacy 回退。
+- **按需协作**：general、technical、billing、escalation 四角色；只有主执行者可执行身份绑定、准备、提交和交接，辅助角色只读。
+- **可恢复办理**：SQLite checkpoint 保存工作图；退货详情展示后通过 Interrupt／Resume 等待新用户消息，修改后重新确认。
+- **受控工具调用**：真实 stdio MCP 子进程；服务端根据会话身份、已展示详情和本轮消息校验授权，提供事务、防重和未知结果保护。
+- **分层识别与知识检索**：规则、LLM 与可选本地语义门控；可选 Dense + BM25 + RRF 融合检索及 Qwen 本地重排。
+- **可观察性**：按阶段记录工具轨迹、路由、守卫和预算；可选 Redis／ChromaDB 分层记忆与 Prometheus 监控。
+
+## 架构
+
+```mermaid
+flowchart TD
+    Client[HTTP API / CLI] --> Service[共享零售会话服务]
+    Service --> Graph[LangGraph 状态图 / SQLite checkpoint]
+    Graph --> Route[规则 / 意图识别 / 可选语义门控]
+    Route --> Host[Host 按需分派]
+    Host --> General[General 接待与订单]
+    Host --> Technical[Technical 商品与有限支持]
+    Host --> Billing[Billing 退货办理]
+    Host --> Escalation[Escalation 模拟交接]
+    General --> Tools[MCP 工具边界]
+    Billing --> Tools
+    Technical --> Tools
+    Escalation --> Tools
+    Tools --> Store[SQLite 身份 / 待确认详情 / 事务 / 事件]
+    Host --> Compose[按需 Composer]
+    Compose --> Guard[发布守卫与无进展保护]
+    Guard --> Service
+    Tools -. 可选 .-> RAG[ChromaDB / Dense + BM25 / RRF / Qwen 重排]
+    Service -. 可选 .-> Memory[Redis 短期记忆 / 摘要 / ChromaDB 长期记忆]
 ```
 
-分类按本轮话语编码，任务状态另行约束；不缓存本地分类，原识别回退缓存包含任务视图。分数不是正确概率，分类不能绑定身份、确认或授权交易。trace 的 `semantic_routing` 披露路径、原因、分数／间隔／语义相似度和实际编码次数。single 与英文入口不装配该分类器，legacy 复用共享路由。
+图状态负责推进流程，Store 负责业务授权。模型输出、历史摘要、客户端 `user_id` 和分类结果都不能代替用户确认。断点恢复也不会自动重放不确定的写操作。
 
-固定小样本结果：新32条内部合成验收分类28/32、Macro-F1 0.8773；仅接受4/32且未观察到接受错误，12条范围外全部回退，其余28/32需原路径。已见56题诊断接受5条、零接受错误。默认仅采用 greeting，不宣称覆盖所有角色、独立泛化、总体加速或节费；完整结果、历史失败与实验脚本留在本地评测目录，不随代码发布。
+## 算法与控制机制
 
-## 环境要求
+| 模块 | 实现 | 边界 |
+| --- | --- | --- |
+| 意图与路由 | 规则优先级、LLM结构化分类、多源融合；六类零售意图映射到四角色 | 分类不绑定身份、不授权交易 |
+| 可选本地语义路径 | Qwen3文档向量、岭回归线性头；分数、间隔、同类参考相似度与任务状态共同门控 | 分数不是正确概率；需要外部校准工件，缺失时走原识别路径 |
+| 混合检索 | ChromaDB Dense、BM25（k1=1.2、b=0.75）、等权RRF（常数60） | 知识仅作说明，不提供业务状态或交易授权 |
+| 本地重排 | Qwen3-Reranker，按最后位置的yes/no相关性分数排序；独立进程隔离依赖 | 需要外部权重，缓存不符时报错，不隐式下载 |
+| 事务与恢复 | 准备→原样展示→后续确认→事务提交；参数一致、防重、事件与checkpoint恢复 | 取消待确认退货不等于取消订单；结果未知时不盲重试 |
+| 发布守卫 | 对照本轮本人订单、清单、金额和事件；无法核实则具体澄清 | 有限格式校验，不是完整自由文本语义审计 |
+| 无进展保护 | 同一事实下连续两轮守卫回退明确失败；新事实或正常通过可恢复 | 失败仍保留为失败，不通过截短会话提高分数 |
+| 记忆 | 可选Redis工作记忆与摘要、ChromaDB情景记忆和画像；独立SQLite保存有限可见对话 | 画像默认关闭；历史不提供身份或提交授权 |
 
-- Windows
-- Python 3.12
-- [uv](https://docs.astral.sh/uv/)
-- Docker（仅运行独立的 Redis 与 ChromaDB 服务）
+## 业务流程展示
 
-## 安装
+以下是交互流程说明，不是在线服务录屏或新的模型评测记录。
+
+```text
+用户：想退回某件已送达商品。
+系统：请提供本人邮箱，或姓名和邮编。
+用户：提供外部沙箱中的身份信息。
+系统：通过工具核对身份、查询本人订单，询问商品与退款去向。
+用户：指定商品和合法退款去向。
+系统：准备并展示订单号、商品、数量、预计金额、去向及操作编号。
+用户：在下一轮明确确认；也可以修改、取消待确认申请或要求人工。
+系统：服务端校验后提交，反馈“已申请退货”；不宣称退款已经到账。
+```
+
+已展示详情可以在服务重启后继续确认；同一确认不能导致重复写入。缺少退款去向、存在附加条件或改口时，系统需要补充信息或重新展示，不能直接提交。
+
+## 运行环境
+
+- Windows、Python 3.12、[uv](https://docs.astral.sh/uv/)。其他系统未作同等验证。
+- 支持 Anthropic Messages 协议的模型服务。真实请求需要使用者自己的凭证与明确预算。
+- **轻量业务入口**：仅需外部订单种子、政策和模型服务；不需要Redis、ChromaDB或本地Qwen。
+- **扩展资料链**：另外需要Redis、ChromaDB、对应本地模型及知识／语义工件。
+
+### 1. 安装
+
+在仓库根目录执行：
 
 ```powershell
 uv python find 3.12
-uv lock
 uv sync --locked --group dev
+Copy-Item .env.example .env
 ```
 
-## 本地服务
+本仓库**不分发任何评测数据集、运行订单、知识资料、参考向量或模型权重**。公开源代码不会自动恢复维护者的私有评测环境。
 
-`compose.yml` 只包含独立的 Redis 与 ChromaDB，容器名、卷和宿主机端口均与本机其他项目隔离：
+### 2. 显式准备外部运行资料
+
+准备工具只在指定 `--download` 时联网，获取固定提交的τ²-bench虚构订单、政策及其LICENSE，并校验SHA-256：
 
 ```powershell
-docker compose -f compose.yml up -d redis chromadb
-docker compose -f compose.yml stop
+uv run python -m evaluation.prepare_assets --download
+# 已有合法资料时，只做本地核对，不联网：
+uv run python -m evaluation.prepare_assets
 ```
 
-默认端口：Redis `6380`，ChromaDB `8002`。卷为 `agent-ecommerce-redis-data`、`agent-ecommerce-chromadb-data`。
+默认目录为 `data/retail-assets/`，受Git忽略规则保护。也可以自行获取相同版本的文件，通过 `--directory` 指定位置并同步修改环境变量。工具不下载任务、gold、知识集或模型。
 
-## 启动 API 与 CLI
+上游为 [τ²-bench固定提交](https://github.com/sierra-research/tau2-bench/tree/fc0055dc4e0a316c3f83133267fbd6faaa770992)。这些资源保留原许可证，详见[第三方说明](THIRD_PARTY_NOTICES.md)。
 
-先启动 Redis 与 ChromaDB，并配置 `.env`。API 默认只绑定本机回环地址：
+### 3. 配置模型与预算
 
-```powershell
-uv run --locked --offline python -m uvicorn api.main:app --host 127.0.0.1 --port 8000
+编辑本地 `.env`：
+
+```dotenv
+ANTHROPIC_API_KEY=填写自己的凭证
+ANTHROPIC_BASE_URL=填写兼容服务地址
+LLM_MODEL=填写服务接受的模型ID
+RETAIL_INPUT_CNY_PER_MTOK=填写当前输入费率
+RETAIL_OUTPUT_CNY_PER_MTOK=填写当前输出费率
+RETAIL_BUDGET_CNY=1
 ```
 
-Swagger 位于 `http://127.0.0.1:8000/docs`，健康检查为 `GET /health`。也可以直接运行：
+费率单位为人民币／百万token，须按实际供应商核对。模板故意不预填模型价格；缺少有效费率时拒绝启动。预算按请求上界预留并记录usage，不等于供应商账单，也不保证同一预算在所有模型上完成同样轮数。
+
+模板默认关闭知识、外部记忆和语义快速路径，使用新的本地SQLite业务库与checkpoint。请勿将真实客户信息用于这个演示沙箱。
+
+### 4. 启动API或CLI
 
 ```powershell
-uv run --locked --offline python -m api.main
+# API，默认只绑定127.0.0.1:8000
+uv run python -m api.main
+
+# 或在另一个独立运行中使用CLI
+uv run python -m api.main --cli
 ```
 
-交互式 CLI：
+API启动后访问 `http://127.0.0.1:8000/docs` 查看交互文档：
 
 ```powershell
-uv run --locked --offline python -m api.main --cli
+Invoke-RestMethod http://127.0.0.1:8000/health
+$body = @{ message = "你好，我想申请退货"; user_id = "demo-client"; conv_id = "demo-conversation" } | ConvertTo-Json
+Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($body))
 ```
 
-输入 `quit`、`exit` 或 `退出` 结束 CLI。导入 `api.main` 只加载配置，不连接 Redis、ChromaDB 或付费模型；组件在应用启动时创建，停机时关闭。
+后续轮次使用相同的 `user_id`／`conv_id`；身份信息和订单内容从你本地的外部种子中取得。改变会话标识不会授权访问其他人的订单。
 
-### HTTP 接口
+| 接口 | 用途 |
+| --- | --- |
+| `GET /health` | 当前运行模式、工具与预算状态 |
+| `POST /chat` | 多轮客服入口 |
+| `GET /trace/tool/{request_id}` | 指定请求的工具与控制轨迹 |
+| `GET /skills` | 已加载Skills |
+| `GET /monitor`、`GET /metrics` | 监控；是否可用取决于运行模式和配置 |
+| `POST /search` | 可选知识检索；轻量模式未启用 |
 
-| 方法 | 路径 | 说明 |
-| --- | --- | --- |
-| GET | `/health` | 服务状态与 Agent 统计 |
-| GET | `/skills` | 当前已加载的 Skills |
-| POST | `/skills/reload` | 重新扫描并热重载 Skills |
-| POST | `/chat` | 主对话：记忆读取、意图识别、Agent 路由、记忆写回 |
-| GET | `/monitor` | 监控摘要、告警与优化建议 |
-| GET | `/trace/tool/{request_id}` | 单次请求的工具调用明细 |
-| GET | `/trace/tools` | 最近请求的工具调用明细 |
-| GET | `/metrics` | Prometheus 文本指标 |
-| POST | `/search` | 查询改写、并行召回与重排 |
-| GET | `/knowledge/stats` | 知识库片段总数 |
-| POST | `/knowledge/add` | 批量导入 `{title, content}` 文档 |
-| POST | `/knowledge/upload` | 上传 `.txt`／`.md` 或 JSON 数组，限制 10MB |
-| POST | `/eval/run` | 运行意图与对话质量评测 |
+## 可选扩展配置
 
-`POST /chat` 接受 `message`、`user_id` 和可选的 `conv_id`；未提供 `conv_id` 时由服务生成。`user_id`／`conv_id` 是原接口参数，不是已认证身份，本项目没有登录、权限控制或支付功能。
+| 参数 | 默认／说明 |
+| --- | --- |
+| `RETAIL_AGENT_MODE` | `multi`；可设`single` |
+| `RETAIL_WORKFLOW_MODE` | `langgraph`；可设`legacy` |
+| `RETAIL_ENABLE_MEMORY` | 模板为`false`；启用需Redis、ChromaDB及本地记忆编码缓存 |
+| `RETAIL_ENABLE_KNOWLEDGE` | 模板为`false`；启用需与现有校验约定一致的本地知识资料 |
+| `RETAIL_SEMANTIC_ROUTING` | 模板为`false`；启用需外部语义工件和匹配的Qwen编码器 |
+| `RETAIL_SEMANTIC_MODEL_PATH` | 外部分类头与参考向量文件；本仓库不附带 |
+| `RETAIL_EMBEDDING_MODEL` | `qwen`，也支持`minilm` |
+| `RETAIL_RERANKER_MODEL` | `qwen`，可显式选`llm`；后者可能增加费用 |
+| `RETAIL_RETRIEVAL_MODE` | `hybrid`、`dense`或`bm25` |
+| `RETAIL_SUPPORT_ENABLED` | `false`；有限技术支持需额外匹配资料，不是通用故障处理 |
 
-## 分层记忆
-
-- 工作记忆存于 Redis 列表，键为 `wm:{user_id}:{conv_id}`，保留最近消息，TTL 24 小时。
-- 会话摘要存于 `summary:{user_id}:{conv_id}`，TTL 24 小时；达到 15 条消息时压缩，只保留最近 5 条。
-- 情景记忆与用户画像存于 ChromaDB 的 `episodic`、`user_profile` 集合，支持同一用户跨会话召回，查询按 `user_id` 隔离。
-- 摘要生成或情景记忆写入失败时保留原消息，不会静默丢失。
-- Embedding 缓存默认位于项目内 `data/chroma_cache`，可用 `CHROMA_EMBEDDING_CACHE` 覆盖。
-
-## 监控与评测
-
-- `PerformanceMonitor` 定时读取 `AgentOrchestrator.get_stats()` 与 `MCPToolManager.get_stats()`，按阈值产生告警，并把成功率与平均延迟折算为路由惩罚回传给编排器。
-- 告警按 `指标:标签` 维护活动状态：故障持续时更新同一条活动告警，恢复时标记为已解决，再次触发时创建新告警；webhook 只在新建告警时发送。
-- 告警可选通过 webhook 发送，指标可选通过 Prometheus 暴露；自动化测试不会向外部发送 webhook。
-- 设置 `MONITOR_PROMETHEUS_PORT` 后，监控进程在该端口启动 Prometheus HTTP 暴露器，`/metrics` 同时输出这些业务指标：
-  - `agent_success_rate{agent}`（Gauge）：Agent 当前成功率。
-  - `agent_avg_latency_ms{agent}`（Gauge，毫秒）：Agent 当前平均延迟；采集轮询不会产生延迟样本。
-  - `tool_success_rate{tool}`（Gauge）：工具当前成功率。
-  - `agent_executions_total{agent}`（Counter）：监控观测到的 Agent 执行次数累计值；多 Agent 请求会为每个参与的 Agent 各计一次，不代表 HTTP 请求数。
-- 未设置 `MONITOR_PROMETHEUS_PORT` 时只注册 Python 进程默认指标，不产出上述业务指标。
-- `EndToEndEvaluator` 计算意图识别 Accuracy／Macro-F1，并使用 LLM-as-Judge 评估相关性、准确性、完整性与有用性。
-- Judge 输出上限由 `EVAL_JUDGE_MAX_TOKENS` 配置，缺省 4096（含 thinking 与最终 JSON）；直接使用 `LLMJudge` 时可传 `max_tokens` 覆盖。预算包装器按实际请求中的同一上限预留，不自动重试或调用备用模型。固定四条旧回答的小样本真实复验均完整返回，但不能代表原完整集合的有效率或质量提高。
-- Judge 仅接受 `end_turn` 完整响应和四个 0–1 有限数值；截断（即使含可解析 JSON）、空响应、非法 JSON、缺字段及非法数值均记录 `GRADER_ERROR`、`passed=False` 和空 `scores`，失败分值为 `null`。报告和 `/evaluate` 返回 `judge_summary`：计划／实际处理／有效／失败数量、失败原因、有效覆盖率（有效数÷计划数）及 `mean_denominator`。`avg_scores` 和 `means` 仅描述有效子集，不能作为完整集合质量成绩；无有效结果时 `means` 为 `null`。
-- 零售回答保护按完整语义单元保留否定／条件列表、一般核对建议与用户报告，具体订单状态仍须可信工具或事件支撑。局部无法安全修复时替换整个单元，避免留下脱离限定的列表断言；这仍是有限确定性保护，不保证任意语义正确。
-- `baseline_path` 只读；每次评测写入新的 `report_<timestamp>.json`，不会覆盖基线或已有报告。
-- 工具平均延迟只对实际记录延迟的调用求平均，样本数通过 `latency_samples` 暴露。
-
-## 零售组件基线
-
-`evaluation/data/retail/` 保存冻结的 `retail-zh-v1` 资料：120 条意图／槽位样本、48 个检索问题、29 段知识与固定划分。校验器只读；不要修改 gold、qrels 或按 test 反复调参。
+需要外部服务时显式启动：
 
 ```powershell
-# 纯离线：资料校验与计分合同自检，不导入模型或存储客户端，不发请求
-uv run --locked --offline python -m evaluation.run_retail_baseline --mode offline-check
-
-# 真实 ChromaDB 向量检索（V）：使用独立集合，结束后只删除本次集合
-uv run --locked --offline python -m evaluation.run_retail_baseline --mode vector --split dev
-
-# 付费链路（仅在有明确新预算时）：意图与改写／召回／重排（P）
-uv run --locked --offline python -m evaluation.run_retail_baseline --mode live --split dev `
-  --budget-cny <授权上限> --input-price-cny-per-mtok <当前输入单价> `
-  --output-price-cny-per-mtok <当前输出单价>
-```
-
-- `--split` 可选 `dev`、`test`、`all`，默认 `all`。
-- `--component` 可选 `both`、`intent`、`retrieval`，默认 `both`；只运行指定组件的 live 阶段，未选组件标 `NOT_RUN_COMPONENT`。
-- 分阶段或 A/B 对照时，用 `--budget-ledger` 指定同一份累计账本，并用 `--stage-label`、`--ab-label`、`--config-label` 记录阶段与配置身份；未完成条目按计划上界占用，重跑不会清零。检索候选可用 `--vector-from` 复用已封存的 V 预测，避免重复付费。
-- 检索链最终固定交付 `top_k=5`；内部每路召回量由生产配置 `mcp/tool_manager.py:retrieval_config` 决定，预检、运行记录和实际请求共用该配置。
-- `vector` 要求 ChromaDB 已在 `CHROMA_HOST:CHROMA_PORT`（默认 `127.0.0.1:8002`）运行，且本地 Embedding 缓存完整；缺失时直接停止，不自动下载模型。29 段知识按 `evidence_id` 幂等导入隔离集合，旧集合不受影响。
-- `live` 在创建模型客户端前检查预算与显式单价；缺失即拒绝。有密钥不代表可以调用。远程 Embedding 被显式屏蔽，意图向量回退到本地字符 n-gram。
-- 运行产物写入 `data/evaluation/retail/<run_id>/`（已忽略）：`run.json`、`metrics.json`、`intent_predictions.jsonl`、`retrieval_predictions.jsonl`、`usage.jsonl`。
-- 状态含义：`OFFLINE_READY_REAL_BASELINE_PENDING_BUDGET`（离线就绪、真实基线待预算）、`PARTIAL_RUN`、`SMOKE_COMPLETE`（指定子集烟测完成，不代表完整基线）、`COMPONENT_COMPLETE`（所选组件完整跑完，不代表整体基线）、`BASELINE_COMPLETE`（识别与检索完整跑完）。Fake 或离线检查只证明接线、计分与边界，不代表真实模型成绩。
-
-## 零售沙箱运行
-
-设置 `RETAIL_MODE=true` 后，HTTP API 与 CLI 切换到零售沙箱：支持订单查询、退货申请和知识咨询。默认采用现有 general／technical／billing／escalation 四角色与 LangGraph 有状态工作流，按需路由、顺序执行并传递结构化交接，不要求每轮执行全部角色。显式设置 `RETAIL_AGENT_MODE=single` 可作回退与对照；两种模式共用同一套服务端展示、确认与业务存储逻辑。`RETAIL_MODE` 未开启时仍使用原客服入口。
-
-零售模式下，九个订单／用户／退货相关业务工具由主程序启动的本地 stdio MCP 子进程提供，主程序通过官方 `mcp` SDK（锁定 `1.12.4`）完成初始化、工具发现与 `tools/call`，不提供外部客户端或 HTTP MCP 入口。`search_knowledge_base` 仍在主程序内走原有 RAG 链路。子进程与主程序使用同一个 SQLite 绝对路径，不复制业务状态；工具调用失败不会自动改走进程内直调。
-
-固定运行资料位于 `evaluation/data/retail_sandbox/`：公开种子 `db.json`、`policy.md`、29 段 `knowledge.jsonl`、上游 MIT `LICENSE` 与 `sources.json`。启动时校验种子、政策与知识哈希、知识条数及 500 用户／1000 订单／50 商品；该目录不含官方隐藏任务、gold、用户模拟器或判定器。
-
-```powershell
-# 启动本地 Redis 与 ChromaDB（沿用 compose.yml 的卷）
 docker compose up -d redis chromadb
-
-# 必填：模型接入与当前官方单价；单价缺失时拒绝启动付费链路
-$env:RETAIL_MODE = "true"
-$env:RETAIL_AGENT_MODE = "multi"
-$env:RETAIL_WORKFLOW_MODE = "langgraph"
-$env:ANTHROPIC_API_KEY = "<key>"
-$env:LLM_MODEL = "<model>"
-$env:RETAIL_INPUT_CNY_PER_MTOK = "<当前输入单价>"
-$env:RETAIL_OUTPUT_CNY_PER_MTOK = "<当前输出单价>"
-
-# HTTP 入口
-uv run --locked --offline uvicorn api.main:app --host 127.0.0.1 --port 8000
-Invoke-RestMethod -Method Post http://127.0.0.1:8000/chat -ContentType 'application/json' `
-  -Body '{"user_id":"sandbox-client","conv_id":"conv-1","message":"帮我查一下我的订单"}'
-
-# CLI 入口；RETAIL_CLIENT_USER 与 RETAIL_CONV_ID 缺省分别为 cli_user 和随机值
-uv run --locked --offline python -m api.main --cli
+# 停止而不删除数据卷：
+docker compose stop
 ```
 
-- `RETAIL_AGENT_MODE`：`multi`（默认）或 `single`；未配置或留空时构造多 Agent。身份绑定与退货提交等状态工具只对每轮唯一主执行者开放，辅助角色只读，Composer 无工具。
-- `RETAIL_WORKFLOW_MODE`：`langgraph`（默认）或 `legacy`。回退时设置 `$env:RETAIL_AGENT_MODE="single"` 或 `$env:RETAIL_WORKFLOW_MODE="legacy"` 后重启上述 API／CLI；两个选项可独立选择，保留业务库与 checkpoint。已有进程环境优先于 `.env`，启动前需清除或修改旧 `single` 覆盖。
-- `RETAIL_DB_PATH`：SQLite 路径，默认 `data/retail/retail.db`。首次启动从固定种子初始化；已有非空业务库不会自动重置，需要新数据时请显式指定新的空路径。
-- `RETAIL_SEED_PATH`、`RETAIL_POLICY_PATH`、`RETAIL_KNOWLEDGE_PATH`：默认指向上述固定资料，通常无需设置。
-- `RETAIL_COLLECTION`：知识集合名，默认 `retail_knowledge_v1`；只导入冻结的 29 段知识，旧演示政策不参与。
-- `RETAIL_MEMORY_COLLECTION_SUFFIX`、`RETAIL_MEMORY_KEY_PREFIX`：记忆集合后缀与 Redis 键前缀，默认 `_retail`、`retail:`；并行运行时请显式区分。
-- `RETAIL_BUDGET_LEDGER`、`RETAIL_BUDGET_CNY`：跨进程累计账本路径与上限，默认 `data/retail/budget_ledger.db`、`5` 元。所有 Agent、改写、重排、摘要请求共用同一账本；预算不足或价格不可核实会停止付费调用，账本不会自动清零。
-- `RETAIL_EVENT_LOG`：业务事件 JSONL，默认 `data/retail/events.jsonl`。
-- `RETAIL_MCP_TIMEOUT_SECONDS`：MCP 初始化与单次工具调用的读取超时秒数，默认 `30`，必须为正数。
-- `RETAIL_MCP_STDERR_LOG`：工具子进程诊断日志路径，默认 `data/retail/mcp_stderr.log`；stdout 只用于协议消息。
-- `RETAIL_PROFILE_ENABLED`：用户画像开关，默认 `false`；启用会增加一次付费请求并计入账本。
-- `RETAIL_CASE_ID`、`RETAIL_RUN_ID`：可选的运行标识，写入事件与账本；`RETAIL_AGENT_MAX_TOKENS`（默认 2048）、`RETAIL_MAX_MESSAGE_CHARS`（默认 4000）、`RETAIL_MAX_CONTEXT_CHARS`（默认 12000）限制单轮输入输出。
-- 身份绑定：服务端通过邮箱或“姓名＋邮编”绑定沙箱用户；请求里的 `user_id`、`conv_id` 不是订单授权，只能查询和操作当前绑定用户的订单。
-- 退货：仅 `delivered` 订单可申请；去向只能是原支付方式或用户已有礼品卡。详情由程序保存并实际展示，只有当前用户对同一详情的明确确认才能写入；修改详情需重新展示并重新确认，多订单逐笔确认与提交。人工交接只记录模拟事件，不代表真实工单、邮件或资金到账。
+Redis使用6380端口，ChromaDB使用8002端口。compose保留既有`agent-ecommerce-*`容器／卷名以兼容本地部署。记忆使用MiniLM缓存，零售RAG可使用Qwen；二者并非同一个索引或缓存。不要在缺少资料时直接打开全部开关。
 
-### 高风险回答依据约束
-
-零售 single／multi 共用服务端回复出口。待确认详情原样展示后才登记展示；提交结果的订单、商品数量、整数分金额和退款去向取自本轮同会话事务事件。人工交接只描述模拟记录，到账、仓库收货和邮件状态只说明尚未核实。进程重启不会把旧事件当成本轮成功；调用结果不明时保留未知，不为修正文字重放交易。
-
-已有礼品卡余额误拒答、换货流程建议、提交后改去向、未核实状态等明确措辞有有限规则回归。该检查覆盖约定类别，不保证理解任意自然语言，也不等于完整政策引用验证；修正错误拒答文字不能代替原本漏执行的业务动作。普通咨询、提问及否定说明保留。工具保护和业务成功判定独立于回答质量。
-
-`/trace` 和轮次日志中的 `response_guard` 记录原候选、事实来源、发现、是否改写和本地耗时；该阶段不增加模型调用。离线回归：
+Qwen推理在独立环境运行，主环境依赖保持锁定：
 
 ```powershell
-uv run --locked --offline python -m pytest tests/test_retail_response_guard.py tests/integration/test_retail_support.py -q
+uv venv data/embedding-env --python 3.12
+uv pip sync evaluation/embedding_requirements.lock --python data/embedding-env/Scripts/python.exe --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-### 无线耳机有限支持（默认关闭）
+按官方模型卡自行下载 [Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) 和 [Reranker](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B)。本地目录分别为 `data/models/qwen3-embedding-0.6b` 和 `data/models/qwen3-reranker-0.6b`；固定revision及逐文件哈希见两个生产模块的`REVISION`／`MODEL_FILES`，缺少或不符会报错。模型权重须为这些固定版本，运行时不联网下载或执行模型仓库代码。
 
-`RETAIL_SUPPORT_ENABLED` 默认 `false`。开启后，单 Agent 与多 Agent 都只额外支持公开种子中的 `Wireless Earbuds`（`product_id=9924732112`）在蓝牙无法发现／配对／连接时的有限建议；资料是项目自编沙箱材料，不是厂商手册，也没有经过真实设备、品牌客服或真实模型验证。未知按键时长、恢复出厂、驱动、固件、兼容性、维修、换货、保修和硬件损坏结论均不覆盖；排查失败不等于退货资格。
+显式下载固定模型文件的示例（会联网，不会调用付费模型）：
 
 ```powershell
-$env:RETAIL_MODE = "true"
-$env:RETAIL_SUPPORT_ENABLED = "true"
-$env:RETAIL_SUPPORT_COLLECTION = "retail_earbuds_support_v1"
-$env:RETAIL_AGENT_MODE = "multi"   # 显式 single 可对照
+.\data\embedding-env\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Embedding-0.6B', revision='97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3', local_dir='data/models/qwen3-embedding-0.6b', allow_patterns=['config.json','model.safetensors','tokenizer.json','tokenizer_config.json','README.md'])"
+.\data\embedding-env\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Reranker-0.6B', revision='e61197ed45024b0ed8a2d74b80b4d909f1255473', local_dir='data/models/qwen3-reranker-0.6b', allow_patterns=['config.json','model.safetensors','tokenizer.json','tokenizer_config.json','README.md'])"
+# 若启用分层记忆，另行显式准备其MiniLM缓存：
+uv run python -c "from mcp.knowledge_base import _ProjectEmbeddingFunction; _ProjectEmbeddingFunction()._download_model_if_not_exists()"
 ```
 
-- 开启要求 `RETAIL_LANGUAGE=zh`、知识检索开启，且支持集合不能与 `RETAIL_COLLECTION` 同名；冲突、缺文件或清单哈希不符会明确拒绝启动。
-- 新集合导入旧 29 段固定证据加 6 段项目自编耳机资料，共 35 段；旧集合、旧 29 段校验和 T16 资产保持不变，不会自动清空或改写。
-- 同一会话的有限工作记录保存在现有 SQLite 的独立表中，按 `(client_user_id, conv_id)` 隔离，可在进程重启后继续；不依赖可选 Redis、用户画像或跨会话记忆。
-- 支持记录只保存当前诉求、用户真实反馈、实际展示过的建议与证据、未解决项和最近有限对话；检索到但未展示的内容不算建议，用户报告不等于工具实测，模型摘要不作为可信进度。
-- 用户当前明确选择退货后仍走原 `prepare_return` → 展示 → 后续真实确认 → 提交链路；“如果不行就退”“先排查、不行再退”只是条件选择，不构成提交授权。
-- multi按当前业务阶段选择general／technical／billing／escalation。退货流程单独保存待补信息与生命周期，退款去向等补充回答继续交给billing；取消、返回排查或转人工时结束当前流程，并作废旧待确认详情。该协作以跨轮角色切换为主。
-- 关闭开关时，原单／多 Agent、29 段知识、英文评测和旧客服模式语义不变，也不增加支持专用阶段。
+知识资料和语义参考工件未分发，因此历史完整资料链的结果无法仅凭本仓库复现。可以先使用轻量业务入口；通用客服模式`RETAIL_MODE=false`另外支持自行导入知识，仍需完整的外部服务与编码缓存。
 
-对应的离线验收只使用 Fake 模型、真实 SQLite、真实 stdio MCP 和已有 ChromaDB 缓存：
+## 评测结果
+
+| 能力 | 历史结果 | 测试范围 |
+| --- | --- | --- |
+| 六类意图 | Macro-F1 **0.9917**，119/120正确 | 150条自建回归集中的120条意图计分样本；样本参与过修复诊断 |
+| 四角色路由 | **99.30%**，142/143正确 | 同一150条回归集中的143条角色计分样本 |
+| 事务与恢复 | **10/10**场景通过 | 真实SQLite／checkpoint／MCP＋Fake模型的工程契约验证 |
+| 能力内τ-retail | **92.31%**，36/39严格成功；10/13题三次均成功 | 单模型deepseek-flash，13道原题×3次，公开虚构沙箱 |
+
+τ结果由v5中断后分两批完成，任务51重新开始会话，保留3个失败；不是全量τ基准、独立盲测或线上成功率。最新守卫修复完成后，仅做离线验证，不能将这些历史数字归为修后新成绩。历史完整本地检查为804项通过；公开包只包含不依赖私有资料的测试子集。
+
+详细分母与限制见[结果说明](evaluation/RESULTS.md)。本仓库不提供支持这些结果的逐条数据、gold、请求、对话或数据库；不能宣称一键重现历史分数。
+
+## 本地测试与评测
+
+干净发布目录中的公开测试子集已本地通过139项，无外网尝试；该计数与历史804项完整本地检查不同。
 
 ```powershell
-uv run --locked --offline python -m pytest tests/test_retail_support.py -q
-uv run --locked --offline python -m pytest tests/integration/test_retail_support.py -q
+# 公开的无数据、零模型测试
+uv run --locked python -m pytest tests -q
+
+# 对自行准备的私有预测记录汇总，文件不进入Git
+uv run python -m evaluation.score_results --kind task --input data/my-run/results.jsonl --planned 39
 ```
 
-这些检查验证接线、状态隔离、重启续接、资料适用性与业务保护，不代表真实模型回答质量、检索指标或多 Agent 收益。详见 `evaluation/data/retail_support/README.md`。
+意图、角色、恢复和任务会话的输入格式、固定分母、错误／未运行记录要求见[评测方法](evaluation/README.md)。汇总工具不执行模型、业务工具或官方Judge，不能代替实际验收。
 
-## 中文 Embedding 对照
+## 目录
 
-`evaluation/run_embedding_comparison.py` 使用现有35段中文知识，对照MiniLM与固定版本Qwen3-Embedding-0.6B；沿用48条已见中文检索题，另有12条耳机支持烟测，报告AllEvidenceHit、Recall、查询延迟与内存。Qwen在独立Python3.12环境运行，避免与现有Chroma依赖冲突；零售 RAG 默认已采用 Qwen，对照脚本不修改业务配置。模型准备需显式执行，缓存可复用；实验不调用付费API，也不验证生成回答质量。
-
-完整模型来源、独立依赖安装、下载校验、运行与采用门槛见[公开复现说明](evaluation/data/embedding_comparison/README.md)。
-
-## 中文混合检索与范围过滤
-
-零售知识已具备Dense、BM25和等权RRF融合三路；`RETAIL_RETRIEVAL_MODE=dense|bm25|hybrid`显式选择，当前默认Hybrid。前置过滤核对商品／问题、支持版本、来源、政策版本和类别，避免不适用片段挤占候选；原始用户消息和Host状态限定范围，模型改写不能放宽。记忆与原客服路径不变。
-
-固定中文消融中，Hybrid的已见test完整证据命中@5为95%（Dense90%），但dev／support的Recall下降，U05当时按冻结门槛保留Dense默认；维护者在U06开始前明确采用Hybrid，历史指标与门槛保留。18条合成范围烟测中，Dense错误范围命中槽位从36降为0；此结果不代表真实回答质量或泛化错误率。完整数据、参数、三路指标与复现见[U05公开说明](evaluation/data/hybrid_retrieval/README.md)。
-
-零售重排可通过`RETAIL_RERANKER_MODEL=llm|qwen`选择原生成式排序或本地专用评分，当前默认`qwen`。采用决策综合考虑已见固定集的证据覆盖、延迟、排序完整性和API成本：Qwen完整证据命中51/52（生成式52/52），重排P95约11.33–13.16秒（生成式39.58秒）。生成式保留显式选项；已知多条件证据漏项仍需后续改进。两者均保留证据来源，非法或不完整排序会回退原候选并记录原因；本地模型失败不额外调用付费重排。专用模型须先显式准备固定权重，复用现有独立推理环境，并占用额外本地内存。固定候选池、费用账本、CPU配置与验证边界见[U06公开说明](evaluation/data/reranker_comparison/README.md)。
-
-```powershell
-uv run --locked --offline python -m evaluation.run_hybrid_retrieval --output data/evaluation/u05/local-001
-uv run --locked --offline python -m pytest tests/test_hybrid_retrieval.py -q
+```text
+api/          HTTP API与CLI
+agents/       Host、四角色、共享服务、状态图与发布守卫
+core/         意图识别、可选语义路由、Skills加载
+mcp/          stdio工具服务、SQLite、检索和本地模型适配
+memory/       分层记忆
+monitor/      监控与指标
+evaluation/   必要评测组件、外部资产准备、方法与结果摘要
+skills/       运行时业务Skills
+tests/        不依赖私有数据的公开检查
 ```
 
-## τ-retail 固定子集评测
+## 使用边界与贡献
 
-该入口在项目内另建独立 Python 3.12 环境运行固定上游文字评测组件，不改变主环境或主 `uv.lock`。固定上游为 `sierra-research/tau2-bench` `v1.0.1`／提交 `fc0055dc4e0a316c3f83133267fbd6faaa770992`；任务顺序固定为 11、12、46、48、51、83、92、108，各 1 次，`concurrency=1`、`trials=1`、计划 `seed=300`（只记录在配置和协议日志，当前未传给模型 SDK，不承诺确定性复现）、`max_steps=200`、`max_errors=10`。被测业务始终走本文档所述的 `RetailService`／`RetailAgent`／`RetailStore`，不使用官方被测 Agent。
+本地沙箱不执行真实支付、退款、邮件、快递标签或真人接入。API没有生产级登录／RBAC，CORS配置面向本地使用；不要直接暴露到公网。有限模板校验不覆盖所有自然语言含义，记忆也不是授权来源。
 
-```powershell
-# 一次性建立独立评测环境（项目内；不安装 voice/knowledge/gym/experiments extras）
-uv venv --python 3.12 .venv-tau
-uv pip install --python .venv-tau/Scripts/python.exe `
-  "tau2 @ git+https://github.com/sierra-research/tau2-bench@fc0055dc4e0a316c3f83133267fbd6faaa770992"
+提交修改前运行公开测试。复现问题时提供最小的脱敏输入、配置与错误说明，不提交密钥、客户信息、运行数据库、模型缓存或数据集。公开文档仅保留本README、英文版、必要许可声明，以及评测方法和结果摘要；开发计划、任务记录和过程性报告不属于发行物。
 
-# 必填：三个角色共用同一 DeepSeek Anthropic 兼容端点；密钥只从根 .env 读取
-$env:ANTHROPIC_API_KEY = "<key>"
-$env:ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+## 许可证
 
-# 免费预检：核对任务、种子、环境、价格、配置与费用计划，不发送模型请求，不产生费用
-uv run --locked --offline python evaluation/run_tau_retail.py preflight --run-id <run-id>
-
-# 显式付费运行：8 案各 1 次，共用项目内持久化账本，累计上限 ¥5；不足即记 PARTIAL 并停止
-uv run --locked --offline python evaluation/run_tau_retail.py run --run-id <run-id>
-```
-
-固定资料与依赖记录位于 `evaluation/data/tau_retail/`（含原版任务、政策、公开种子、许可与 `requirements-freeze.txt`），运行说明见同目录 `ENVIRONMENT.md`。预检通过后把源码、资产、角色配置与顺序哈希写入 `data/evaluation/tau_retail/<run-id>/manifest.json`；正式运行前会复核，源码变化时拒绝继续。产物包含逐案原序对话、工具与确认事件、前后完整业务快照、官方 DB／NL 分量、Judge 原始输出、项目行为检查和共享账本。只有 Agent 与用户均正常停止、两个原评分分量有效时，该案才计入有效完成 `M/8`；`S/M` 中的 `S` 为原 reward 两分量乘积为 1 的案件数，只有 `M=8` 时报告 `S/8`。业务金额沿用原任务的 USD，模型费用账本使用 CNY。
-
-DB 分量使用每案实际完整 SQLite 业务快照，经官方 `RetailDB` 模型和官方 hash 比较得到；预测侧不执行官方原生 strict replay，只以实际快照作为状态来源，不能把该适配描述为原生轨迹回放。`summary.json` 中 `run_status` 只表示计划案例是否执行并保存行（`EXECUTION_COMPLETE`／`EXECUTION_PARTIAL`），`evaluation_status` 单独表示评测是否有效完整（`EVALUATION_COMPLETE`／`PARTIAL`／`EVALUATOR_INVALID`），`successful_effective_completed`／`failed_effective_completed` 在有效完成案例内区分任务成败。配置中的 `seed=300` 未实际传给模型 SDK，不能据此声称结果可确定复现。
-
-结果只代表“τ³-bench v1.0.1 retail 固定 8 任务／项目适配环境／DeepSeek 用户与评分配置”，不是全量排行榜、原生官方运行环境成绩、独立盲测或生产可用性证明；模型失败是有效实验结果，不通过反复重跑刷分。公开复现不依赖被忽略的 `docs/`。
-
-## 单 Agent 与多 Agent 零售对照
-
-`evaluation/run_t16_retail.py` 在同一批固定英文任务上比较单 Agent（A）与现有编排的零售适配版（B）：11、12、48、51、83、92、108 各运行 1 次，固定交替顺序共 14 个 trial；46 只做离线参考核验，不进入付费分母，也不修改 gold。两组都使用固定英文政策、同源独立 SQLite、真实本地 MCP 九工具和官方 UserSimulator／DB／NL 评分；不含中文 RAG、长期画像或跨案例记忆。
-
-```powershell
-# 预检：核对 .venv-tau、上游提交、任务集、价格、端点、MCP 九工具、46 缺失订单与费用计划，不发送模型请求
-uv run --locked --offline python -m evaluation.run_t16_retail preflight --run-id <run-id>
-
-# 正式付费运行：A/B 全部角色、意图、Composer、User 与 Judge 共用同一累计账本，硬上限 ¥10
-uv run --locked --offline python -m evaluation.run_t16_retail run --run-id <run-id>
-```
-
-运行产物写入 `data/evaluation/t16-retail/<run-id>/`（已忽略）：按 arm／task／trial 保存对话、事件、完整前后快照、SQLite、MCP 与 worker 日志、原评分分量、项目检查、请求 usage／费用和共享账本；`summary.json` 保留 14 行正式结果与共同有效配对。预检通过后才允许付费，源码或资产变化会使冻结校验拒绝继续；预算不足或环境异常时保留 PARTIAL，不另开账本清零。单个用户轮的识别、角色、回退与 Composer 合计不超过 32 次请求，业务角色温度 0.1、`max_tokens=2048`，User 与 Judge 温度 0.0、`max_tokens=1024`；`seed=300` 未证明传给模型 SDK。
-
-该入口只产生固定 7 任务小样本观察，不构成统计显著性、排行榜或生产模式选择依据；当前零售运行时默认 `multi`，对照运行器仍显式分别构造 single／multi。价格、密钥与端点从项目配置读取，不写入产物。
-
-## 测试
-
-```powershell
-# 单元测试，不访问网络
-uv run --locked --offline pytest tests/test_memory.py tests/test_retrieval.py tests/test_agents.py tests/test_monitor_eval.py -q
-
-# 真实 ChromaDB 集成测试，需先启动 chromadb
-uv run --locked --offline pytest tests/integration/test_retrieval.py -q
-
-# 真实 Redis／ChromaDB 记忆集成测试，需先启动 redis 与 chromadb
-uv run --locked --offline pytest tests/integration/test_memory.py -q
-
-# HTTP API 与 CLI 集成测试，需先启动 redis 与 chromadb，使用 Fake 模型
-uv run --locked --offline pytest tests/integration/test_api.py -q
-
-# 零售沙箱单元测试：临时 SQLite 与 Fake 模型，不发真实请求
-uv run --locked --offline pytest tests/test_retail_agent.py tests/test_retail_store.py tests/test_retail_ledger.py tests/test_retail_live.py -q
-
-# 零售业务工具的直调／MCP 确定性对照与协议边界，使用真实本地子进程与临时 SQLite
-uv run --locked --offline pytest tests/test_retail_mcp.py -q
-
-# 零售沙箱 API／CLI 集成测试，需先启动 redis 与 chromadb，使用 Fake 模型
-uv run --locked --offline pytest tests/integration/test_retail_sandbox.py -q
-
-# τ-retail 运行器、桥接与评分适配测试：需先建 .venv-tau，不访问网络
-uv run --locked --offline pytest tests/test_run_tau_retail.py tests/test_tau_retail.py -q
-uv run --locked --offline pytest tests/test_tau_eval.py -q
-
-# 单／多 Agent 零售对照的权限、记账、配对汇总与真实 MCP 生命周期（Fake 传输层）
-uv run --locked --offline pytest tests/test_t16_retail_runner.py -q
-
-# 当前全部测试
-uv run --locked --offline pytest tests -q
-```
-
-测试模型使用 Fake 客户端。API 集成测试通过 Fake 模型完成两轮对话、知识检索与记忆回读，覆盖全部 13 个路由和 CLI 退出。集成测试连接独立 Redis／ChromaDB，使用随机用户标识和随机测试集合，结束后只删除本次写入的键与记录。
-
-## 配置
-
-复制 `.env.example` 为 `.env` 并填写：
-
-- `ANTHROPIC_API_KEY`：API 密钥
-- `ANTHROPIC_BASE_URL`：Anthropic 兼容端点（可选）
-- `LLM_MODEL`：端点支持的模型标识
-- `ECHOMIND_SKILLS_DIR`：Skill 目录（可选，默认项目内 `skills/`）
-- `ECHOMIND_SKILLS_MAX_PROMPT_CHARS`：注入 Agent 的 Skill 内容上限（可选，默认 5000）
-- `API_HOST`、`API_PORT`：API 监听地址（默认 `127.0.0.1:8000`）
-- `APP_ENV`：设为 `development` 时启用 uvicorn 自动重载（可选）
-- `LOG_LEVEL`：日志级别（可选，默认 `INFO`）
-- `REDIS_URL`：独立 Redis 连接地址
-- `CHROMA_HOST`、`CHROMA_PORT`：独立 ChromaDB 地址
-- `CHROMA_PERSIST_DIRECTORY`：ChromaDB 服务不可用时的本地回退目录
-- `CHROMA_EMBEDDING_CACHE`：Embedding 模型缓存目录（可选，默认项目内 `data/chroma_cache`）
-- `MONITOR_INTERVAL_S`：监控采集间隔秒数（可选，默认 10）
-- `MONITOR_WEBHOOK_URL`：告警 webhook 地址（可选，留空不发送）
-- `MONITOR_PROMETHEUS_PORT`：Prometheus 暴露端口（可选，留空不启动）
-- `EVAL_BASELINE_PATH`：只读评测基线文件（可选）
-- `EVAL_REPORT_DIR`：评测报告目录（可选；设置基线时默认基线同级的 `reports/`）
-
-真实模型调用会产生费用；自动化测试只使用 Fake 客户端，不调用真实模型。
-
-## 当前内容
-
-- `api/main.py`：FastAPI 入口、13 个路由、lifespan 组件装配与交互式 CLI。
-- `core/llm_utils.py`：从 Anthropic 风格响应中提取文本块。
-- `core/intent_recognizer.py`：LLM、Embedding 与关键词三路融合的意图识别，含本地 n-gram 回退与结果缓存。
-- `agents/agent_orchestrator.py`：General、Technical、Billing、Escalation 四类角色，意图路由、复合问题协作、工具往返、升级与响应合并。
-- `agents/tools.py`：请求检查、排障、账单字段核验、人工交接及共享知识库工具；不伪造订单查询、退款或账单修改。
-- `core/skill_loader.py` 与 `skills/`：三个业务 Skill 的加载、按 Agent 匹配、热重载与 `ECHOMIND_SKILLS_DIR` 覆盖。
-- `mcp/tool_manager.py`：工具注册、查询改写、并行召回、去重、LLM 重排、TTL 缓存、熔断与降级。降级结果标记 `degraded=True` 且不计为成功命中。
-- `mcp/knowledge_base.py`：ChromaDB 文档切片、幂等导入与语义检索；返回文档 ID、标题、内容、相似度与片段序号。
-- `agents/retail_agent.py`、`agents/retail_runtime.py`、`agents/retail_tools.py`：单 Agent 零售沙箱的决策循环、运行时装配，以及订单查询、退货申请与知识工具。
-- `agents/retail_multi_agent.py`：四角色零售适配与 Host 侧工具权限、共享确认状态和确定性交接。
-- `mcp/retail_server.py`、`mcp/retail_client.py`、`mcp/retail_protocol.py`：本地 stdio MCP 工具服务、受信任主程序客户端与请求上下文 `_meta` 校验；项目内 `mcp/` 仍是原工具与存储包，与官方 `mcp` SDK 同名共存。
-- `mcp/retail_store.py`：零售沙箱 SQLite 存储、身份绑定、退货确认状态机与事务写入。
-- `skills/retail_support/SKILL.md`：零售沙箱每轮生效的业务指引；不与其他模式的审计规则混用。
-- `memory/conversation_memory.py`：Redis 工作记忆、会话摘要、ChromaDB 情景记忆与用户画像；压缩与追加按会话加锁。
-- `monitor/performance_monitor.py`：Agent／工具统计采样、Z-score 异常检测、阈值告警、路由惩罚反馈、优化建议、Prometheus 与 webhook。
-- `evaluation/evaluator.py`：意图 Accuracy／Macro-F1、LLM-as-Judge 对话评分、回归检测、只读基线与独立报告文件。
-- `evaluation/retail_metrics.py`：固定六类意图、类型化槽位与证据级检索指标；错误、未知标签、无答案问题按显式合同处理。
-- `evaluation/retail_budget.py`：付费请求前的预算上界、原子预留与按 usage／上界结算。
-- `evaluation/run_retail_baseline.py`：离线检查、真实向量检索 V 与受控 live 链路的可复现入口。
-- `evaluation/validate_retail_data.py`：冻结零售资料的只读一致性校验。
-- `compose.yml`：独立的本地 Redis 与 ChromaDB 服务。
-- `tests/`：单元测试与真实 Redis／ChromaDB 集成测试。
-
-## 零售 Qwen 检索
-
-零售 RAG 默认使用本地 `Qwen/Qwen3-Embedding-0.6B`，原客服、意图与记忆表示不变。首次启用前按[Embedding 准备说明](evaluation/data/embedding_comparison/README.md#复现windows项目根目录)安装 `data/embedding-env` 独立推理环境并显式准备模型；已有完整缓存无需重复下载。主环境 ChromaDB 及其依赖保持原版本，Qwen 由运行时管理的常驻子进程串行编码，API／CLI 退出时回收。
-
-`RETAIL_EMBEDDING_MODEL=qwen` 为默认值；显式设为 `minilm` 可使用原表示和集合。Qwen 在配置的知识集合基础名后追加 `_qwen_<编码身份前12位>`，基础名不超过45字符；模型版本、查询指令、池化和归一化参与身份。首次运行重新编码冻结资料，不复用或删除旧向量。缺失缓存、损坏文件、身份冲突、编码超时或子进程退出均报错，不隐式下载或回退 MiniLM。CPU 配置沿用对照的 float32／4线程／batch1／最大512 token，长输入会截断；内存及启动时间需为约0.6B参数模型留出空间。
-
-本地完整链路烟测需已有模型、独立环境以及运行中的 Redis／ChromaDB；真实 Qwen、API、SQLite 和 MCP，生成／改写／重排使用 Fake，费用为0：
-
-```powershell
-$env:RUN_QWEN_SMOKE="1"
-uv run --locked --offline python -m pytest tests/integration/test_retail_support.py -k qwen_api -q
-Remove-Item Env:RUN_QWEN_SMOKE
-```
-
-## 当前限制
-
-- 真实模型表现只覆盖现有回归样本，不代表通用质量或生产可靠性。
-- 没有登录与 RBAC；默认客服模式不查询订单或执行退款；零售沙箱只提供模拟订单查询与退货申请，不执行真实支付、退款、邮件或工单。`user_id`／`conv_id` 不是认证身份。
-- CORS 允许任意来源，API 默认仅监听 `127.0.0.1`，不适合直接作为生产部署。
-- 记忆压缩与追加只在单进程内互斥，不提供分布式锁。
-- 监控与评测已接入 API 启动流程；真实 webhook、Prometheus 外部抓取和完整集合的真实 Judge 验收尚未完成。
-
-## 多证据覆盖实验
-
-默认保留现有相关性排序。设置 `RETAIL_RETRIEVAL_STRATEGY=pool|coverage|targeted` 可显式试验受限候选池、需求覆盖与一次定向补检；实验检索不调用付费改写或生成式重排。普通 Agent 的最终生成仍沿原配置。该能力是可选实验，未采用为默认或证明整体质量提高；实验数据与报告留在本地。
+[MIT](LICENSE)。外部数据与模型遵守各自条款，见[第三方说明](THIRD_PARTY_NOTICES.md)。

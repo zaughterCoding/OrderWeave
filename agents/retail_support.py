@@ -56,7 +56,7 @@ class SupportAnalysis:
     human_request: bool = False
     # 当前这句话对进行中退货流程的动作；与 demand_kind 分开，避免把补充回答
     # 误当成新的技术排查诉求。取值：none、start、provide_info、
-    # related_question、conditional_return、cancel、switch_to_troubleshooting、human。
+    # related_question、independent_question、conditional_return、cancel、switch_to_troubleshooting、human。
     return_flow_action: str = "none"
     relevant: bool = False
     reason: str = ""
@@ -119,12 +119,13 @@ _REFUND_DESTINATION_WORDS = (
 )
 _CANCEL_RETURN_WORDS = (
     "取消退货", "取消退款", "撤销退货", "撤回退货", "取消申请", "不退了",
-    "暂时不退", "先不退", "先别退", "不申请退", "不是要退",
+    "暂时不退", "先不退", "先别退", "不申请退", "不是要退", "不想办了",
 )
 _SWITCH_TO_TROUBLESHOOTING_WORDS = (
     "继续排查", "继续排障", "回去排查", "回到排查", "先排查", "先继续排查",
     "先继续检查", "先继续", "先修", "先解决", "恢复排查",
     "再试连接", "再试试连接",
+    "看看配对", "检查配对", "排查配对",
 )
 _CONFIRMATION_WORDS = (
     "确认", "提交", "同意", "就按", "按这个", "按这些", "按上述", "没问题",
@@ -224,8 +225,26 @@ def _step_hits(message: str) -> List[Dict[str, str]]:
     return hits
 
 
+def _has_return_cancellation(message: str) -> bool:
+    """取消对象可以带指代词，紧邻否定的取消命令不能当作退出。"""
+    return any(
+        (_contains_any(clause, _CANCEL_RETURN_WORDS)
+         or re.search(r"(?:取消|撤销|撤回).{0,6}(?:退货|退款|申请)", clause))
+        and not re.search(r"(?:不要|不用|别|不想|不需要)(?:再)?(?:取消|撤销|撤回)", clause)
+        for clause in re.split(r"[，,。；;！!\n]", message)
+    )
+
+
 def _has_return_choice(message: str) -> bool:
-    return _contains_any(message, _RETURN_WORDS)
+    # 局部商品的否定不能抹掉另一分句的明确退货选择。
+    return any(
+        (_contains_any(clause, (*_RETURN_WORDS, *_DIRECT_CHOICE_WORDS))
+         or re.search(r"(?:只|都|给我|改成|改为)退|退的是", clause))
+        and not _contains_any(clause, _NEGATIVE_RETURN_WORDS)
+        and not _has_return_cancellation(clause)
+        and not _looks_like_independent_question(clause)
+        for clause in re.split(r"[，,。；;！!\n]", message)
+    )
 
 
 def _is_conditional_return(message: str) -> bool:
@@ -401,6 +420,9 @@ def _looks_like_independent_question(message: str) -> bool:
         (
             "什么时候", "多久", "怎么还", "为什么", "在哪", "哪里",
             "如何查询", "能不能查", "可以查", "查一下", "帮我查",
+            "到哪", "什么状态", "什么价", "多少钱", "运费", "政策",
+            "准备什么", "需要准备", "什么条件", "取消订单", "怎么", "如何",
+            "能退", "可以退", "需要什么",
         ),
     )
 
@@ -430,7 +452,10 @@ def analyze_message(
     product_ids = {m.group(1) for m in _PRODUCT_ID_RE.finditer(lower)
                    if m.span(1) not in item_spans or m.span(1) in product_spans}
     foreign_product_id = bool(product_ids - {SUPPORT_PRODUCT_ID})
-    human = _contains_any(lower, _HUMAN_WORDS)
+    human = _contains_any(lower, _HUMAN_WORDS) and not re.search(
+        r"(?:不想|不需要|不用|不要|别|不找|不转)"
+        r"(?:再|给我|帮我|转|找|要|联系){0,2}(?:人工|真人|转接|经理)", lower
+    )
     return_choice = _has_return_choice(lower)
     negative_return = _contains_any(lower, _NEGATIVE_RETURN_WORDS)
     conditional = _is_conditional_return(lower)
@@ -438,7 +463,9 @@ def analyze_message(
     unresolved = _contains_any(lower, _UNRESOLVED_WORDS)
     tried = _step_hits(text)
     destination = _contains_any(lower, _REFUND_DESTINATION_WORDS)
-    cancel_return = _contains_any(lower, _CANCEL_RETURN_WORDS)
+    cancel_return = _has_return_cancellation(lower)
+    if return_choice:
+        negative_return = cancel_return = False
     switch_troubleshooting = _contains_any(
         lower, _SWITCH_TO_TROUBLESHOOTING_WORDS
     )
@@ -447,7 +474,8 @@ def analyze_message(
         and str(record.get("product_id") or "") == SUPPORT_PRODUCT_ID
     )
     flow = _normalize_return_flow(record) if has_record else new_return_flow()
-    flow_active = bool(has_record and _return_flow_active(flow))
+    flow_active = bool(has_pending or (has_record and _return_flow_active(flow)))
+    independent = _looks_like_independent_question(lower) and not return_choice
     identity_reference = bool(
         _ORDER_ID_RE.search(lower)
         or _EMAIL_RE.search(text)
@@ -464,6 +492,8 @@ def analyze_message(
         flow_action = "switch_to_troubleshooting"
     elif conditional:
         flow_action = "conditional_return"
+    elif independent and not _looks_like_related_pairing_question(lower):
+        flow_action = "independent_question"
     elif flow_active:
         if has_pending and _contains_any(lower, _CONFIRMATION_WORDS):
             flow_action = "none"
@@ -474,7 +504,7 @@ def analyze_message(
         elif (
             flow.get("awaiting") in ("refund_destination", "return_information")
             and len(text) <= 120
-            and not _looks_like_independent_question(lower)
+            and not independent
         ):
             # 等待必要信息时，短回答视为当前退货任务的补充或澄清，
             # 由账单角色继续处理；是否提交只由服务端确认规则决定。
@@ -490,15 +520,13 @@ def analyze_message(
     # 不能把无关的独立问题继续注入退货上下文。
     flow_continuation = bool(
         flow_active
-        and (
-            flow.get("awaiting")
-            in ("refund_destination", "return_information", "confirmation")
-            or flow_action in ("provide_info", "related_question")
-        )
+        and flow_action != "independent_question"
+        and flow_action in ("provide_info", "related_question")
     )
     # 只有带明确续接线索的消息才复用旧支持记录，避免把无关订单问题误注入。
     continuation = bool(
         has_record
+        and flow_action != "independent_question"
         and (
             flow_continuation
             or return_choice
@@ -508,11 +536,18 @@ def analyze_message(
             or tried
             or has_pending
             or negative_return
+            or cancel_return
+            or switch_troubleshooting
             or identity_reference
             or pairing
         )
     )
     existing_active = bool(has_record and continuation)
+    # 已知耳机问题中换一台平板测试，不等于把支持对象改成平板。
+    companion_tablet = bool(
+        existing_active and explicit and re.search(r"(?:另一|其他|别的|换一).{0,3}平板", lower)
+        and not _contains_any(lower, (word for word in _OTHER_PRODUCT_WORDS if word != "平板"))
+    )
 
     result.product_explicit = explicit
     result.product_mentioned = explicit or bare
@@ -521,13 +556,13 @@ def analyze_message(
     result.return_flow_action = flow_action
     result.tried_steps = tried
 
-    if ambiguous_multi:
+    if ambiguous_multi and pairing and not flow_active and not return_choice:
         result.scope_state = "ambiguous"
         result.reason = "multiple_earbud_or_return_target_candidates"
     elif explicit and foreign_product_id:
         result.scope_state = "out_of_scope"
         result.reason = "unsupported_product_id"
-    elif explicit and other_product:
+    elif explicit and other_product and not companion_tablet:
         result.scope_state = "out_of_scope"
         result.reason = "other_product"
     elif explicit and unsupported_issue:
@@ -542,10 +577,10 @@ def analyze_message(
         result.scope_state = "active"
         result.issue = SUPPORT_ISSUE if pairing else ""
         result.reason = "explicit_product_with_return_or_handoff"
-    elif bare and not explicit and not existing_active:
+    elif bare and pairing and not explicit and not existing_active:
         result.scope_state = "ambiguous"
         result.reason = "bare_earbuds_requires_product_and_issue_clarification"
-    elif other_product:
+    elif other_product and (pairing or unsupported_issue):
         result.scope_state = "out_of_scope"
         result.reason = "other_product"
     elif unsupported_issue:
@@ -563,7 +598,7 @@ def analyze_message(
         result.reason = "no_support_scope"
 
     # 续接消息可以不带商品名，但不能把无关订单问题误注入支持记录。
-    if has_pending and existing_active:
+    if has_pending and existing_active and flow_action != "independent_question":
         result.scope_state = "active"
         result.issue = str(record.get("issue") or SUPPORT_ISSUE)
         result.reason = "pending_confirmation_continuation"
@@ -574,6 +609,8 @@ def analyze_message(
         result.demand_kind = "none"
     elif flow_action == "conditional_return":
         result.demand_kind = "conditional_return"
+    elif flow_action == "independent_question":
+        result.demand_kind = "none"
     elif flow_active and flow_action in ("provide_info", "none"):
         # 本轮没有新的独立诉求；保留旧 demand.kind=return，表示任务仍在进行。
         result.demand_kind = "none"

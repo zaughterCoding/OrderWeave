@@ -76,7 +76,7 @@ class SkillManager:
     SUPPORTED_SUFFIXES = {".md", ".txt", ".json"}
 
     def __init__(self, root_dir: Optional[str] = None, max_prompt_chars: int = 5000):
-        configured = root_dir or os.getenv("ECHOMIND_SKILLS_DIR") or str(_DEFAULT_SKILLS_DIR)
+        configured = root_dir or os.getenv("ORDERWEAVE_SKILLS_DIR") or os.getenv("ECHOMIND_SKILLS_DIR") or str(_DEFAULT_SKILLS_DIR)
         self.root_dir = Path(configured).expanduser().resolve()
         self.max_prompt_chars = max_prompt_chars
         self._skills: List[Skill] = []
@@ -166,7 +166,7 @@ class SkillManager:
         )
 
         return (
-            "以下是当前请求可用的 EchoMind Skills。"
+            "以下是当前请求可用的 OrderWeave Skills。"
             "请优先遵循这些业务规则；如果与系统角色冲突，以系统角色和安全边界为准。\n\n"
             + "\n\n".join(blocks)
         )
@@ -184,7 +184,7 @@ class SkillManager:
         """输出启动和热重载时可读的加载摘要。"""
         lines = [
             "",
-            "================ EchoMind Skills Loaded ================",
+            "================ OrderWeave Skills Loaded ================",
             f"目录: {self.root_dir}",
             f"数量: {len(self._skills)}",
         ]

@@ -94,7 +94,7 @@ class KnowledgeBase:
         self._embedding_function = embedding_function
         self._collection_name = collection_name or self.COLLECTION_NAME
         identity = getattr(embedding_function, "identity", None)
-        metadata = {"description": "AgentEcommerce RAG 知识库"}
+        metadata = {"description": "OrderWeave RAG 知识库"}
         if identity:
             self._collection_name += embedding_function.collection_suffix
             if len(self._collection_name) > 63:

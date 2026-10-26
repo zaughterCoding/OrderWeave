@@ -26,6 +26,31 @@ MODEL_FILES = {
 INSTRUCTION = "Given a customer support question in Chinese, retrieve relevant policy or help passages that answer the question"
 PREFIX = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
 SUFFIX = '<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n'
+
+
+def memory_peak() -> dict[str, float]:
+    """读取本进程Windows内存峰值，不依赖开发实验脚本。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage", "PrivateUsage",
+            )
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(Counters), wintypes.DWORD]
+    counters = Counters()
+    counters.cb = ctypes.sizeof(counters)
+    if not psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return {"rss_peak_mib": counters.PeakWorkingSetSize / 2**20,
+            "private_peak_mib": counters.PeakPagefileUsage / 2**20}
 SPEC = {"model": "Qwen/Qwen3-Reranker-0.6B", "revision": REVISION,
         "files": MODEL_FILES, "instruction": INSTRUCTION, "max_length": 1024,
         "dtype": "float32", "threads": 4, "batch_size": 1,
@@ -131,11 +156,7 @@ def serve(path: Path) -> None:
                     scores.append(torch.softmax(logits.float(), dim=0)[1].item())
             stats = {"truncated_pairs": truncated, "token_lengths": lengths}
             if sys.platform == "win32":
-                import importlib.util
-                spec = importlib.util.spec_from_file_location("u04_memory", ROOT / "evaluation/run_embedding_comparison.py")
-                module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(module)
-                stats.update(module.memory_peak())
+                stats.update(memory_peak())
             print(json.dumps({"scores": validate_scores(scores, len(request["passages"])), "stats": stats}), flush=True)
         except Exception as exc:
             print(json.dumps({"error": str(exc)}), flush=True)

@@ -712,11 +712,13 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
             config.support_collection, "RETAIL_SUPPORT_COLLECTION"
         )
 
-    for path, label in (
+    required_files = [
         (config.seed_path, "公开种子"),
         (config.policy_path, "固定政策"),
-        (config.knowledge_path, "冻结知识"),
-    ):
+    ]
+    if config.enable_knowledge:
+        required_files.append((config.knowledge_path, "冻结知识"))
+    for path, label in required_files:
         if not path.is_file():
             raise RuntimeError(f"{label}文件不存在: {path}")
 
@@ -725,12 +727,14 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         raise RuntimeError(
             f"固定政策哈希不一致: {policy_sha} != {EXPECTED_POLICY_SHA256}"
         )
-    knowledge_sha = _sha256_file(config.knowledge_path)
-    if knowledge_sha != EXPECTED_KNOWLEDGE_SHA256:
-        raise RuntimeError(
-            f"冻结知识哈希不一致: {knowledge_sha} != {EXPECTED_KNOWLEDGE_SHA256}"
-        )
-    knowledge_rows = _load_knowledge(config.knowledge_path)
+    knowledge_rows = []
+    if config.enable_knowledge:
+        knowledge_sha = _sha256_file(config.knowledge_path)
+        if knowledge_sha != EXPECTED_KNOWLEDGE_SHA256:
+            raise RuntimeError(
+                f"冻结知识哈希不一致: {knowledge_sha} != {EXPECTED_KNOWLEDGE_SHA256}"
+            )
+        knowledge_rows = _load_knowledge(config.knowledge_path)
 
     support_rows: List[Dict[str, Any]] = []
     if config.support_enabled:
@@ -911,12 +915,12 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         )
     else:
         skills_dir = _env_text(
-            "ECHOMIND_SKILLS_DIR", str(_PROJECT_ROOT / "skills")
+            "ORDERWEAVE_SKILLS_DIR", _env_text("ECHOMIND_SKILLS_DIR", str(_PROJECT_ROOT / "skills"))
         )
         skill_manager = SkillManager(
             root_dir=skills_dir,
             max_prompt_chars=int(
-                _env_text("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000")
+                _env_text("ORDERWEAVE_SKILLS_MAX_PROMPT_CHARS", _env_text("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", "5000"))
             ),
         )
         skill_manager.load()
@@ -928,7 +932,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
             skill_manager=skill_manager,
             policy_text=policy_text,
             policy_source=(
-                "evaluation/data/retail_sandbox/policy.md "
+                f"{config.policy_path} "
                 f"sha256={EXPECTED_POLICY_SHA256}"
             ),
             max_tokens=config.max_tokens,

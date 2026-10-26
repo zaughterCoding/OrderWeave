@@ -217,7 +217,13 @@ class RetailWorkflow:
         text = context["request"].message
         route = "normal"
         if pending:
-            action = analyze_message(text, has_pending=True).return_flow_action
+            analysis = context.get("analysis")
+            # 支持未启用时 Host 分析没有动作，仍需按待办消息本身判定退出。
+            action = (
+                analysis.return_flow_action
+                if analysis is not None and analysis.return_flow_action != "none"
+                else analyze_message(text, has_pending=True).return_flow_action
+            )
             if action == "cancel" or re.fullmatch(r"(?:cancel|cancel (?:the )?return)[.!]?", text, re.I):
                 route = "cancel"
             elif action == "human" or re.search(r"\b(?:human|live agent)\b", text, re.I):

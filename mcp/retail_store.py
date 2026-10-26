@@ -377,6 +377,9 @@ def _evaluate_confirmation_en(
     text = _normalize_text(message)
     if not text:
         return ConfirmationDecision(False, "none", "The confirmation is empty")
+    # 只消除详情定语中的过去时歧义，转述肯定与provided that仍不得授权。
+    text = re.sub(r"\b(details(?:\s+that)?\s+you)\s+provided\b(?!\s+that\b)",
+                  r"\1 supplied", text, flags=re.I)
     if len(text) > 400:
         return ConfirmationDecision(
             False, "none", "The confirmation is too long to judge safely"
@@ -402,7 +405,12 @@ def _evaluate_confirmation_en(
     mentioned = _order_ids_in(text)
     clauses = _clauses(text)
 
-    fillers = {"please", "thanks", "thank you", "great", "perfect", "fine", "good"}
+    fillers = {
+        "please", "thanks", "thank you", "great", "perfect", "fine", "good",
+        "thanks for your help", "thank you for your help",
+        "thanks for laying out the details", "thank you for confirming the details",
+        "thank you for preparing the details and for your help",
+    }
 
     def _positive_clauses(related: List[str]) -> bool:
         # 至少一个实质肯定子句，其余只能是“please/thanks”等礼貌填充。
@@ -428,7 +436,7 @@ def _evaluate_confirmation_en(
             if _EN_POSITIVE_RE.search(lowered) or compact in _EN_WEAK_CONFIRMATIONS:
                 saw_positive = True
                 continue
-            if compact in fillers or not scope_only:
+            if re.sub(r"\s+", " ", lowered) in fillers or not scope_only:
                 continue
             return False
         return saw_positive
@@ -790,6 +798,12 @@ class RetailStore:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (client_user_id, conv_id)
             );
+            CREATE TABLE IF NOT EXISTS retail_dialogue (
+                client_user_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (client_user_id, conv_id)
+            );
             """
         )
 
@@ -973,6 +987,37 @@ class RetailStore:
                 (client_user_id, conv_id),
             ).fetchone()
             return int(row["turn_count"])
+
+    def visible_history(self, client_user_id: str, conv_id: str) -> List[Dict[str, str]]:
+        """短对话独立于外部记忆，仅供消歧，不提供身份或交易授权。"""
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT payload_json FROM retail_dialogue WHERE client_user_id=? AND conv_id=?",
+                (client_user_id, conv_id)).fetchone()
+        pairs = json.loads(row["payload_json"]) if row else []
+        return [{"role": role, "content": str(pair[role])[:2000]} for pair in pairs[-2:]
+                for role in ("user", "assistant") if isinstance(pair.get(role), str) and pair[role].strip()]
+
+    def last_response_guard(self, client_user_id: str, conv_id: str) -> Dict[str, Any]:
+        """只读同会话上轮守卫计数；该元数据不进入模型历史或业务授权。"""
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT payload_json FROM retail_dialogue WHERE client_user_id=? AND conv_id=?",
+                (client_user_id, conv_id)).fetchone()
+        pairs = json.loads(row["payload_json"]) if row else []
+        return {**(pairs[-1].get("response_guard") or {}), "turn": pairs[-1].get("turn")} if pairs else {}
+
+    def save_visible_turn(self, client_user_id: str, conv_id: str, turn: int, message: str, reply: str,
+                          *, response_guard: Optional[Dict[str, Any]] = None) -> None:
+        """每会话只保留两轮，同一轮重复收口不追加历史。"""
+        with self._tx() as connection:
+            row = connection.execute("SELECT payload_json FROM retail_dialogue WHERE client_user_id=? AND conv_id=?",
+                (client_user_id, conv_id)).fetchone()
+            pairs = json.loads(row["payload_json"]) if row else []
+            pairs = [p for p in pairs if p.get("turn") != turn]
+            pairs.append({"turn": turn, "user": message[:2000], "assistant": reply[:2000],
+                          "response_guard": {key: response_guard[key] for key in ("recovery_signature", "recovery_count")
+                                             if response_guard and key in response_guard}})
+            connection.execute("INSERT INTO retail_dialogue VALUES (?,?,?) ON CONFLICT(client_user_id,conv_id) DO UPDATE SET payload_json=excluded.payload_json",
+                (client_user_id, conv_id, json.dumps(pairs[-2:], ensure_ascii=False)))
 
     def current_turn(self, client_user_id: str, conv_id: str) -> int:
         with closing(self._connect()) as connection:
@@ -1849,6 +1894,14 @@ class RetailStore:
                     f"{decision.reason}",
                 ),
                 "confirmation_scope": decision.scope,
+                "error_code": "confirmation_required",
+                "confirmation_hint": self._t(
+                    "退货尚未提交。请先解决疑问或修改详情；如确认按已展示内容办理，"
+                    f"请在下一条消息明确回复“确认，按已展示详情提交订单{normalized}的退货”。",
+                    "The return was not submitted. Resolve any questions or changes first. "
+                    "If you want the unchanged displayed details submitted, reply in a new message: "
+                    f"Yes, please submit this return for order {normalized} as listed.",
+                ),
             }
 
         try:

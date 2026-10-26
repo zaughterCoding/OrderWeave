@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
@@ -44,6 +44,7 @@ class RetailReservation:
     input_tokens_upper: int
     max_tokens: int
     reserved_cny: float
+    created_at: str = ""
 
 
 class RetailLedger:
@@ -57,6 +58,8 @@ class RetailLedger:
         output_price_cny_per_mtok: float,
         run_id: str = "",
         model: str = "",
+        *,
+        settlement_policy: str = "legacy",
     ):
         if budget_cny <= 0:
             raise LedgerError("预算必须大于 0")
@@ -65,6 +68,11 @@ class RetailLedger:
                 "真实调用价格必须大于 0；无法核实时不要启动付费运行"
             )
         self.path = Path(path).expanduser().resolve()
+        if settlement_policy not in {"legacy", "deepseek_flash_cache_20261024"}:
+            raise LedgerError("未知结算策略")
+        if settlement_policy != "legacy" and (model != "deepseek-flash" or input_price_cny_per_mtok != 2 or output_price_cny_per_mtok != 8):
+            raise LedgerError("缓存分价策略须固定deepseek-flash及峰时2／8预留上界")
+        self.settlement_policy = settlement_policy
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         # 最近一次在发送前被拒绝的原因；调用方据此区分预算停止与普通模型失败。
@@ -163,6 +171,7 @@ class RetailLedger:
                     "format_overhead_tokens": str(REQUEST_FORMAT_OVERHEAD_TOKENS),
                     "overrun_reason": "",
                     "created_at": _now(),
+                    "settlement_policy": self.settlement_policy,
                 }
                 connection.executemany(
                     "INSERT INTO meta(key, value) VALUES (?, ?)",
@@ -176,6 +185,8 @@ class RetailLedger:
                 return
 
             stored_budget = float(meta.get("budget_cny", "nan"))
+            if meta.get("settlement_policy", "legacy") != self.settlement_policy:
+                raise LedgerError("结算策略不一致，拒绝重用旧账本")
             stored_input = float(meta.get("input_cny_per_mtok", "nan"))
             stored_output = float(meta.get("output_cny_per_mtok", "nan"))
             if (
@@ -311,6 +322,7 @@ class RetailLedger:
                 )
                 raise BudgetStopExceeded(self._last_rejection_reason)
             request_id = f"req-{uuid.uuid4().hex[:12]}"
+            created_at = _now()
             connection.execute(
                 "INSERT INTO entries"
                 "(request_id, stage, model, status, reserved_cny, actual_cny,"
@@ -329,7 +341,7 @@ class RetailLedger:
                     max_tokens,
                     request_sha,
                     len(payload),
-                    _now(),
+                    created_at,
                 ),
             )
         return RetailReservation(
@@ -339,6 +351,7 @@ class RetailLedger:
             input_tokens_upper=input_upper,
             max_tokens=max_tokens,
             reserved_cny=upper,
+            created_at=created_at,
         )
 
     def settle_success(
@@ -350,6 +363,7 @@ class RetailLedger:
         input_main, output, cache_read, cache_write = self._usage_values(usage)
         usage_present = (
             input_main is not None and output is not None
+            and min(input_main, output, cache_read, cache_write) >= 0
         )
         if not usage_present:
             charged = reservation.reserved_cny
@@ -374,6 +388,13 @@ class RetailLedger:
             input_total * self._pricing["input_cny_per_mtok"] / 1_000_000
             + int(output) * self._pricing["output_cny_per_mtok"] / 1_000_000
         )
+        if self.settlement_policy == "deepseek_flash_cache_20261024":
+            # 按请求发起时刻估价；未知法定节假日仍按工作日高峰上界处理。
+            stamp = datetime.fromisoformat(reservation.created_at).astimezone(timezone(timedelta(hours=8)))
+            hour = stamp.hour + stamp.minute / 60
+            peak = stamp.weekday() < 5 and (9 <= hour < 12 or 14 <= hour < 18)
+            scale = 1.0 if peak else 0.5
+            actual = ((int(input_main) + int(cache_write)) * 2 + int(cache_read) * 0.04 + int(output) * 8) * scale / 1_000_000
         violation: Dict[str, Any] = {}
         if input_total > reservation.input_tokens_upper:
             violation["input_tokens"] = {
@@ -550,7 +571,10 @@ class RetailLedger:
             "pricing": {
                 "input_cny_per_mtok": self._pricing["input_cny_per_mtok"],
                 "output_cny_per_mtok": self._pricing["output_cny_per_mtok"],
+                "settlement_policy": self.settlement_policy,
             },
+            "spend_basis": ("usage_cache_time_estimate_holiday_upper" if self.settlement_policy != "legacy" else "legacy_conservative_bookkeeping"),
+            "provider_statement_verified": False,
             "model": meta.get("model", ""),
             "turn": self.turn_state(),
         }

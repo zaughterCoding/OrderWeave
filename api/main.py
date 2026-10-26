@@ -1,4 +1,4 @@
-"""AgentEcommerce 客服系统的 FastAPI 入口。
+"""OrderWeave 客服系统的 FastAPI 入口。
 
 核心组件在 lifespan 处理器中创建。导入本模块不会连接 Redis、
 ChromaDB 或付费模型端点。
@@ -24,7 +24,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
-load_dotenv()
+load_dotenv(pathlib.Path(_ROOT) / ".env")
 
 logging.basicConfig(
     level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 BANNER = r"""
   ==========================================
-   AgentEcommerce Customer Service Agent
+   OrderWeave Customer Service Agent
   ==========================================
 """
 
@@ -203,7 +203,7 @@ async def lifespan(app: FastAPI):
             _tool_manager = None
             _skill_manager = None
             _knowledge_base = None
-            logger.info("AgentEcommerce 零售模式已关闭")
+            logger.info("OrderWeave 零售模式已关闭")
         return
 
     try:
@@ -225,12 +225,12 @@ async def lifespan(app: FastAPI):
             model=cfg["model"],
         )
 
-        skills_dir = os.getenv("ECHOMIND_SKILLS_DIR", "").strip() or str(
+        skills_dir = (os.getenv("ORDERWEAVE_SKILLS_DIR") or os.getenv("ECHOMIND_SKILLS_DIR", "")).strip() or str(
             _project_path("skills")
         )
         _skill_manager = SkillManager(
             root_dir=skills_dir,
-            max_prompt_chars=_env_int("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", 5000),
+            max_prompt_chars=_env_int("ORDERWEAVE_SKILLS_MAX_PROMPT_CHARS", _env_int("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", 5000)),
         )
         _skill_manager.load()
 
@@ -306,7 +306,7 @@ async def lifespan(app: FastAPI):
             report_dir=report_dir,
         )
 
-        logger.info("AgentEcommerce 已就绪")
+        logger.info("OrderWeave 已就绪")
         yield
     finally:
         if _monitor is not None:
@@ -324,11 +324,11 @@ async def lifespan(app: FastAPI):
         _evaluator = None
         _skill_manager = None
         _knowledge_base = None
-        logger.info("AgentEcommerce 已关闭")
+        logger.info("OrderWeave 已关闭")
 
 
 app = FastAPI(
-    title="AgentEcommerce 智能客服",
+    title="OrderWeave 智能客服",
     version="0.1.0",
     lifespan=lifespan,
     docs_url="/docs",
@@ -829,14 +829,14 @@ async def _retail_cli() -> None:
                 print(f"\n系统: {ex}\n")
                 continue
             roles = ",".join(result.agent_types) or "retail"
-            print(f"\nAgentEcommerce [retail:{roles}]: {result.response}\n")
+            print(f"\nOrderWeave [retail:{roles}]: {result.response}\n")
     finally:
         await runtime.close()
 
 
 async def _cli() -> None:
     print(BANNER)
-    print("AgentEcommerce CLI — 输入 quit 退出\n")
+    print("OrderWeave CLI — 输入 quit 退出\n")
 
     if _retail_mode():
         await _retail_cli()
@@ -847,12 +847,12 @@ async def _cli() -> None:
     from memory.conversation_memory import MemoryManager, MsgRole
 
     cfg = _anthropic_cfg()
-    skills_dir = os.getenv("ECHOMIND_SKILLS_DIR", "").strip() or str(
+    skills_dir = (os.getenv("ORDERWEAVE_SKILLS_DIR") or os.getenv("ECHOMIND_SKILLS_DIR", "")).strip() or str(
         _project_path("skills")
     )
     skill_manager = SkillManager(
         root_dir=skills_dir,
-        max_prompt_chars=_env_int("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", 5000),
+        max_prompt_chars=_env_int("ORDERWEAVE_SKILLS_MAX_PROMPT_CHARS", _env_int("ECHOMIND_SKILLS_MAX_PROMPT_CHARS", 5000)),
     )
     skill_manager.load()
 
@@ -926,7 +926,7 @@ async def _cli() -> None:
                 user_id, conv_id, MsgRole.ASSISTANT, result.response
             )
             print(
-                f"\nAgentEcommerce [{result.agent_type.value}]: "
+                f"\nOrderWeave [{result.agent_type.value}]: "
                 f"{result.response}\n"
             )
     finally:

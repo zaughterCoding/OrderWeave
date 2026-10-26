@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import re
 import time
+import hashlib
+import json
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal
@@ -44,7 +46,7 @@ def _semantic_units(text: str) -> list[str]:
     """换行不终止语义；冒号引出的列表与上文限定一起处理。"""
     units: list[str] = []
     listing = False
-    for part in re.split(r"(?<=[。！？!?])", text):
+    for part in re.split(r"(?<=[。！？!?])|(?<=\.)(?=\s|$)", text):
         if not part:
             continue
         if listing and re.match(r"\s*(?:[-*]|\d+[.)、])\s+", part):
@@ -121,6 +123,60 @@ def _order_id(value: Any) -> str:
     return "#" + str(value).strip().lstrip("#").upper() if value else ""
 
 
+def _listed_estimate(text: str, order: dict[str, Any]) -> tuple[int, list[str]] | None:
+    """只核对本轮订单中的逐行单件清单，歧义数量或价格不作估算依据。"""
+    selected: list[str] = []
+    total = 0
+    for line in text.splitlines():
+        if not re.match(r"\s*(?:[-*]|\d+[.)、])\s+", line):
+            continue
+        if _AMOUNT.search(line):
+            continue
+        prices = re.findall(r"[$¥￥]\s*(\d[\d,]*(?:\.\d+)?)", line)
+        ids = set(re.findall(r"\b\d{7,}\b", line))
+        body = re.sub(r"^\s*(?:[-*]|\d+[.)、])\s+", "", line)
+        matches = [item for item in order.get("items", []) if (
+            str(item["item_id"]) in ids if ids else
+            re.match(r"[*`_]*" + re.escape(item["name"]) + r"(?!\w)", body, re.I)
+        )]
+        if not matches:
+            if prices or ids:
+                return None
+            continue
+        if len(prices) > 1 or re.search(r"(?:\b(?:x|qty|quantity)\s*[:=]?\s*\d+|×\s*\d+|\d+\s+units\b)", line, re.I):
+            return None
+        if prices:
+            price = Decimal(prices[0].replace(",", ""))
+            matches = [item for item in matches if Decimal(str(item["price"])) == price]
+        unique = {str(item["item_id"]): item for item in matches}
+        if len(unique) != 1:
+            return None
+        item_id, item = next(iter(unique.items()))
+        selected.append(item_id)
+        total += int(Decimal(str(item["price"])) * 100)
+    available = Counter(str(item["item_id"]) for item in order.get("items", []))
+    return (total, selected) if selected and not (Counter(selected) - available) else None
+
+
+def _order_clarification(orders: dict[str, Any], english: bool, bound: bool) -> str:
+    """仅展示已绑定用户的本轮查询结果，不代选退货商品或承诺金额。"""
+    text = ("I could not verify the requested details. " if english else "我暂时无法核实所请求的详情。")
+    if not bound:
+        return text + ("Please provide your own email, or your full name and zip code, so I can verify your identity."
+                       if english else "请提供本人的邮箱，或姓名和邮编，以便先核对身份。")
+    if orders:
+        text += ("Verified order information (partial):" if english else "已核实的部分订单信息：")
+        for order_id, order in sorted(orders.items())[:3]:
+            text += f"\n{order_id}: {order['status']}"
+            for item in order.get("items", [])[:8]:
+                cents = int(Decimal(str(item["price"])) * 100)
+                text += f"\n- {item['name']} ({item['item_id']}): {_money(cents, english)}"
+    text += ("\nPlease specify the order ID and exact items you want checked. "
+             "If you want a return, also specify its refund destination."
+             if english else "\n请提供要核对的订单号和具体商品；如需退货，也请说明退款去向。")
+    return text
+
+
 def constrain_response(
     text: str, *, traces: list[dict[str, Any]], events: list[dict[str, Any]],
     pending_before: list[dict[str, Any]], pending_after: list[dict[str, Any]],
@@ -133,6 +189,7 @@ def constrain_response(
     findings: list[str] = []
     facts: list[dict[str, Any]] = []
     blocks: list[str] = []
+    recovery_signature = ""
     prepared = [
         p for p in pending_after
         if p.get("status") == "prepared" and p.get("prepared_turn") == turn
@@ -233,8 +290,10 @@ def constrain_response(
         if known_failure:
             reason = str(result.get("error") or "").strip()
             blocks.append(
-                f"{label}: success was not confirmed. {reason} Please check the details or authorization."
-                if english else f"{label}：工具未确认操作成功。{reason} 请核对办理信息或确认授权。"
+                str(result["confirmation_hint"])
+                if result.get("error_code") == "confirmation_required" and result.get("confirmation_hint")
+                else (f"{label}: success was not confirmed. {reason} Please check the details or authorization."
+                      if english else f"{label}：工具未确认操作成功。{reason} 请核对办理信息或确认授权。")
             )
         else:
             blocks.append(
@@ -322,15 +381,25 @@ def constrain_response(
     amount_matches = [m for unit in units for m in _fact_matches(_AMOUNT, unit)]
     status_matches = [m for unit in units for m in _fact_matches(_STATUS, unit)]
     amounts = {p.get("amount_cents") for p in pending_after}
-    bad_amount = bool(amount_matches) and (
-        len(pending_after) != 1 or any(
-            Decimal(m.group(1).replace(",", "")) * 100 not in amounts for m in amount_matches
-        )
-    )
+    if not pending_after and amount_matches:
+        mentioned = {_order_id(m.group()) for m in _ORDER_ID.finditer(text)}
+        target = orders.get(next(iter(mentioned))) if len(mentioned) == 1 else (
+            next(iter(orders.values())) if not mentioned and len(orders) == 1 else None)
+        estimate = _listed_estimate(text, target) if target else None
+        amounts = {estimate[0]} if estimate else set()
+        if estimate:
+            facts.append({"kind": "consultation_estimate", "order_id": target["order_id"],
+                          "amount_cents": estimate[0], "item_ids": estimate[1], "source": "order_read_line_items"})
+    bad_amount = bool(amount_matches) and (len(pending_after) > 1 or any(
+        Decimal(m.group(1).replace(",", "")) * 100 not in amounts for m in amount_matches))
     if invalid_ids or (bad_amount and not blocks) or (status_matches and not orders and not blocks):
         findings.append("unverified_labeled_order_fact")
-        text = ("Please read the order with the business tools before confirming its details."
-                if english else "请先通过业务工具核对订单，再确认具体状态和金额。")
+        text = _order_clarification(orders, english, bool(bound_user_id))
+        if not blocks:
+            recovery_signature = hashlib.sha256(json.dumps({
+                "reason": "unverified_labeled_order_fact", "bound_user": bound_user_id,
+                "orders": orders, "pending": pending_after,
+            }, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
     if orders and status_matches and not blocks:
         def checked_status(match: re.Match) -> str:
             # 只替换对应状态字段，不能覆盖后续退款去向等待补询问。
@@ -367,10 +436,11 @@ def constrain_response(
         if display and (item in prepared or display in candidate):
             text = (text + "\n\n" + display).strip()
     return GuardedResponse(text=text, record={
-        "version": "u09.2", "changed": text != candidate,
+        "version": "u09.3", "changed": text != candidate,
         "mode": "controlled" if blocks else "checked",
         "findings": sorted(set(findings)), "facts": facts,
         "candidate_text": candidate,
+        "recovery_signature": recovery_signature,
         "latency_ms": round((time.perf_counter() - started) * 1000, 3),
         "model_calls": 0,
     })
