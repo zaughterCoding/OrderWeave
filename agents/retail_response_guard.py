@@ -10,11 +10,21 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
+from mcp_tools.retail_domain import WRITE_KINDS
 
-_ACTIONS = {
-    "prepare_return": "return_prepared",
-    "return_delivered_order_items": "return_requested",
-    "transfer_to_human_agents": "handoff_requested",
+
+# 写工具成功执行时对应的事务事件；退货沿用原事件名。
+_ACTIONS = {name: ("return_requested" if kind == "return" else f"{kind}_executed")
+            for name, kind in WRITE_KINDS.items()}
+_ACTIONS["transfer_to_human_agents"] = "handoff_requested"
+_LABELS = {
+    "return_delivered_order_items": ("Return", "退货"), "exchange_delivered_order_items": ("Exchange", "换货"),
+    "cancel_pending_order": ("Order cancellation", "取消订单"),
+    "modify_pending_order_items": ("Order item change", "修改订单商品"),
+    "modify_pending_order_address": ("Order address change", "修改订单地址"),
+    "modify_pending_order_payment": ("Order payment change", "修改订单支付方式"),
+    "modify_user_address": ("Account address change", "修改账户地址"),
+    "transfer_to_human_agents": ("Simulated handoff", "模拟人工交接"),
 }
 _QUESTIONS = re.compile(r"[？?]|(?:是否|有没有|能否|吗)(?:[，。！；\s]|$)|^(?:can|could|has|have|is|are|did)\b", re.I)
 _UNOBSERVED = re.compile(
@@ -34,7 +44,6 @@ _HANDOFF = re.compile(
     r"(?:live agent.{0,12}(?:connected|taken over)|handoff.{0,12}(?:recorded|completed))", re.I,
 )
 _IDENTITY = re.compile(r"身份.{0,5}(?:已核实|已验证|核对成功)|已.{0,4}(?:核实|验证).{0,4}身份|identity.{0,10}(?:verified|confirmed)", re.I)
-_EXCHANGE = re.compile(r"(?:可以|可为您|建议|支持|帮您|为您办理).{0,12}换货|后续如需.{0,15}换货.{0,20}(?:交易流程|原有流程)|(?:can|recommend|offer|arrange).{0,20}(?:exchange|replacement)", re.I)
 _GIFT_REFUSAL = re.compile(r"礼品卡.{0,18}(?:余额不足|没有余额|余额为\s*0|余额是\s*0).{0,18}(?:不能|无法|不支持|不可).{0,10}(?:退款|退货)|礼品卡.{0,100}余额.{0,30}低于.{0,20}无法覆盖|gift card.{0,20}(?:insufficient|zero|no balance).{0,25}(?:cannot|can't|unable)", re.I)
 _CHANGE_DESTINATION = re.compile(r"(?:之后|后续|提交后|稍后|随时).{0,12}(?:更改|修改|更换|调整).{0,8}(?:退款去向|支付方式)|(?:can|may).{0,15}change.{0,15}(?:refund destination|payment method).{0,15}(?:later|after)", re.I)
 _ORDER_ID = re.compile(r"#?W\d+", re.I)
@@ -237,6 +246,18 @@ def constrain_response(
             "and no real support ticket was created."
             if english else f"已记录模拟人工交接（{event['op_id']}）；未连接真实坐席，未创建真实工单。"
         )
+    executed = [e for e in events if str(e.get("event_type", "")).endswith("_executed")]
+    for event in executed:
+        kind = event["payload"].get("kind", "")
+        facts.append({"kind": "executed", "action": kind, "order_id": event.get("order_id"), "op_id": event["op_id"],
+                      "source": "event", "event_id": event["event_id"]})
+        label = next((v for k, v in _LABELS.items() if WRITE_KINDS.get(k) == kind), (kind, kind))
+        target = f" for order {event['order_id']}" if english and event.get("order_id") else (
+            f"（订单 {event['order_id']}）" if event.get("order_id") else "")
+        blocks.append(f"{label[0]}{target} was carried out as confirmed (operation {event['op_id']}). "
+                      "Refund arrival and email delivery have not been verified."
+                      if english else f"{label[1]}{target}已按确认的详情执行（操作编号 {event['op_id']}）。"
+                      "退款到账与邮件发送尚未核实。")
     for item in pending_after:
         facts.append({"kind": "prepared" if item in prepared else "awaiting_confirmation",
                       "order_id": item["order_id"], "op_id": item["op_id"],
@@ -245,10 +266,10 @@ def constrain_response(
                       "payment_method_id": item.get("payment_method_id")})
     if prepared:
         blocks.append(
-            "I have prepared the return details for your confirmation. No return was submitted "
-            "for these details; please review them and confirm in a later reply."
-            if english else "我已整理好待确认的退货详情，请核对以下内容；这些详情尚未提交，"
-            "如确认无误，请在下一轮明确回复“确认，就按这些申请退货”。"
+            "I have prepared the details below for your confirmation. Nothing has been changed yet; "
+            "please review them and confirm in a later reply."
+            if english else "我已整理好以下待确认详情，目前尚未做任何修改；"
+            "如确认无误，请在下一轮明确回复“确认，按这些办理”。"
         )
 
     for index, trace in enumerate(traces):
@@ -275,7 +296,8 @@ def constrain_response(
                     or result.get("return_payment_method_id") != payload["payment_method_id"]):
                     findings.append("tool_event_conflict")
             continue
-        if not blocked and name == "prepare_return" and any(p["op_id"] == op_id for p in prepared):
+        if not blocked and result.get("action_status") == "pending_confirmation" and any(
+                p["op_id"] == op_id for p in prepared):
             continue
         known_failure = blocked or (
             trace.get("success") is not False and result.get("success") is False
@@ -283,10 +305,7 @@ def constrain_response(
         status = "failed" if known_failure else "unknown"
         facts.append({"kind": status, "tool": name, "order_id": order_id,
                       "op_id": op_id, "source": "tool_trace", "trace_index": index})
-        label = ({"prepare_return": "Return preparation" if english else "准备退货",
-                  "return_delivered_order_items": "Return submission" if english else "提交退货",
-                  "transfer_to_human_agents": "Simulated handoff" if english else "模拟人工交接"}[name]
-                 + (f" ({order_id})" if order_id else ""))
+        label = _LABELS[name][0 if english else 1] + (f" ({order_id})" if order_id else "")
         if known_failure:
             reason = str(result.get("error") or "").strip()
             blocks.append(
@@ -320,10 +339,6 @@ def constrain_response(
                 "eligibility must be checked with the business tools."
                 if english else "本人已有礼品卡可作为退款去向；是否可办理须以业务工具校验为准。"
             )
-        elif _EXCHANGE.search(clause) and not _QUESTIONS.search(clause) and not re.search(r"不(?:能|支持|可)|cannot|can't|not support", clause, re.I):
-            issue = "unsupported_exchange_advice"
-            replacement = ("This sandbox does not support exchanges." if english
-                           else "本沙箱不支持换货办理。")
         elif _CHANGE_DESTINATION.search(clause) and (submitted or already_submitted or "提交后" in clause) and not re.search(r"不支持|不能|cannot|not support", clause, re.I):
             issue = "post_submission_destination_change"
             replacement = ("This sandbox does not support changing the destination after submission."

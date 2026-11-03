@@ -14,6 +14,7 @@ from agents.tools import (
     make_tool,
 )
 from agents.retail_support import support_evidence_applicable
+from mcp_tools.retail_domain import WRITE_KINDS, DomainError, canonical_args
 from mcp_tools.retail_store import RetailStore, safe_calculate
 
 _RETAIL_KNOWLEDGE_DESCRIPTION = (
@@ -27,13 +28,16 @@ RETAIL_READ_ONLY_TOOLS = (
     "get_user_details",
     "get_order_details",
     "get_product_details",
+    "get_item_details",
+    "list_all_product_types",
     "calculate",
 )
+# 七类写工具均为两阶段：首次调用只生成待确认详情，展示并经确认后同参数再次调用才执行。
+RETAIL_WRITE_TOOLS = tuple(WRITE_KINDS)
 RETAIL_STATE_TOOLS = (
     "find_user_id_by_email",
     "find_user_id_by_name_zip",
-    "prepare_return",
-    "return_delivered_order_items",
+    *RETAIL_WRITE_TOOLS,
     "transfer_to_human_agents",
 )
 RETAIL_ALL_TOOLS = RETAIL_STATE_TOOLS + RETAIL_READ_ONLY_TOOLS
@@ -119,6 +123,97 @@ def _desc(language: str, zh: str, en: str) -> str:
     return en if str(language).lower() == "en" else zh
 
 
+_WRITE_PURPOSE = {
+    "return_delivered_order_items": ("退回已送达订单中的部分商品；退款只能到原支付方式或本人已有礼品卡。",
+                                     "Return some items of a delivered order. The refund can only go to the original "
+                                     "payment method or an existing gift card of the user."),
+    "exchange_delivered_order_items": ("把已送达订单中的商品换成同一商品的其他规格；差价用指定支付方式支付或退还。",
+                                       "Exchange items of a delivered order for other variants of the same product; "
+                                       "the price difference is paid or refunded with the given payment method."),
+    "cancel_pending_order": ("取消待处理（pending）订单，原因只能是 no longer needed 或 ordered by mistake。",
+                             "Cancel a pending order. The reason must be 'no longer needed' or 'ordered by mistake'."),
+    "modify_pending_order_items": ("把待处理订单中的商品改成同一商品的其他规格；每笔订单只能改一次，须一次列全。",
+                                   "Change items of a pending order to other variants of the same product. This can "
+                                   "only be done once per order, so collect every item to change first."),
+    "modify_pending_order_address": ("修改待处理订单的收货地址。", "Change the shipping address of a pending order."),
+    "modify_pending_order_payment": ("把待处理订单的支付方式换成用户的另一种支付方式。",
+                                     "Change the payment method of a pending order to another method of the user."),
+    "modify_user_address": ("修改当前已核实用户的默认地址。", "Change the default address of the verified current user."),
+}
+
+
+def _write_description(name: str, lang: str) -> str:
+    zh, en = _WRITE_PURPOSE[name]
+    return _desc(
+        lang,
+        zh + "两阶段执行：首次调用只校验并返回待确认详情 display_text，不修改任何数据；必须把它原样展示给用户。"
+        "用户在之后的消息中明确确认后，用完全相同的参数再次调用才会执行。服务端依据真实用户消息判断确认，"
+        "参数变化会生成新的待确认详情。",
+        en + " Two-phase: the first call only validates and returns pending details (display_text) without "
+        "changing anything; show display_text to the user exactly. After the user explicitly confirms in a later "
+        "message, call this tool again with identical arguments to carry it out. The server judges confirmation "
+        "from the real user message; different arguments create new pending details.")
+
+
+def _string(lang: str, zh: str, en: str) -> Dict[str, Any]:
+    return {"type": "string", "description": _desc(lang, zh, en)}
+
+
+def _id_list(lang: str, zh: str, en: str) -> Dict[str, Any]:
+    return {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20,
+            "description": _desc(lang, zh, en)}
+
+
+def _address(lang: str) -> Dict[str, Any]:
+    return {field: _string(lang, label, field) for field, label in (
+        ("address1", "地址第一行"), ("address2", "地址第二行，可为空"), ("city", "城市"),
+        ("state", "州／省"), ("country", "国家"), ("zip", "邮编"))}
+
+
+def _order(lang: str) -> Dict[str, Any]:
+    return {"order_id": _string(lang, "订单号，如 #W0000000", "Order id such as '#W0000000'")}
+
+
+def _payment(lang: str, zh: str, en: str) -> Dict[str, Any]:
+    return {"payment_method_id": _string(lang, zh, en)}
+
+
+_DIFF_ZH, _DIFF_EN = "支付或接收差价的支付方式 ID", "Payment method id for the price difference"
+_WRITE_SCHEMAS = {
+    "return_delivered_order_items": lambda lang: {
+        **_order(lang),
+        "item_ids": _id_list(lang, "要退的 item_id；同一 item_id 重复表示多件", "Item ids to return; repeat for multiple units"),
+        **_payment(lang, "原支付方式或本人礼品卡 ID", "Original payment method or the user's gift card id")},
+    "exchange_delivered_order_items": lambda lang: {
+        **_order(lang),
+        "item_ids": _id_list(lang, "要换的 item_id", "Item ids to exchange"),
+        "new_item_ids": _id_list(lang, "按位置对应的同商品新 item_id", "New item ids of the same product, by position"),
+        **_payment(lang, _DIFF_ZH, _DIFF_EN)},
+    "cancel_pending_order": lambda lang: {
+        **_order(lang),
+        "reason": _string(lang, "no longer needed 或 ordered by mistake", "'no longer needed' or 'ordered by mistake'")},
+    "modify_pending_order_items": lambda lang: {
+        **_order(lang),
+        "item_ids": _id_list(lang, "要修改的 item_id", "Item ids to modify"),
+        "new_item_ids": _id_list(lang, "按位置对应的同商品新 item_id", "New item ids of the same product, by position"),
+        **_payment(lang, _DIFF_ZH, _DIFF_EN)},
+    "modify_pending_order_address": lambda lang: {**_order(lang), **_address(lang)},
+    "modify_pending_order_payment": lambda lang: {**_order(lang), **_payment(lang, "新的支付方式 ID", "New payment method id")},
+    "modify_user_address": lambda lang: {"user_id": _string(lang, "当前已核实用户 ID", "The verified user's id"),
+                                         **_address(lang)},
+}
+_ADDRESS_REQUIRED = ["address1", "address2", "city", "state", "country", "zip"]
+_WRITE_REQUIRED = {
+    "return_delivered_order_items": ["order_id", "item_ids", "payment_method_id"],
+    "exchange_delivered_order_items": ["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+    "cancel_pending_order": ["order_id", "reason"],
+    "modify_pending_order_items": ["order_id", "item_ids", "new_item_ids", "payment_method_id"],
+    "modify_pending_order_address": ["order_id", *_ADDRESS_REQUIRED],
+    "modify_pending_order_payment": ["order_id", "payment_method_id"],
+    "modify_user_address": ["user_id", *_ADDRESS_REQUIRED],
+}
+
+
 def retail_tools(
     store: RetailStore,
     tool_manager: Any = None,
@@ -162,26 +257,16 @@ def retail_tools(
             str(args.get("expression", "")), language=lang
         )
 
-    def prepare_return(req: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-        return store.prepare_return(
-            req.user_id,
-            req.conv_id,
-            str(args.get("order_id", "")),
-            args.get("item_ids"),
-            args.get("payment_method_id"),
-        )
+    def get_item_details(req: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+        return store.get_item_details(req.user_id, req.conv_id, str(args.get("item_id", "")))
 
-    def return_delivered_order_items(
-        req: Any, args: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        return store.submit_return(
-            req.user_id,
-            req.conv_id,
-            str(args.get("order_id", "")),
-            args.get("item_ids"),
-            args.get("payment_method_id"),
-            req.message,
-        )
+    def list_all_product_types(req: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+        return store.list_all_product_types(req.user_id, req.conv_id)
+
+    def write_handler(name: str):
+        def handler(req: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+            return store.write_action(req.user_id, req.conv_id, name, dict(args), req.message)
+        return handler
 
     def transfer_to_human_agents(
         req: Any, args: Dict[str, Any]
@@ -326,92 +411,22 @@ def retail_tools(
             calculate,
             required=["expression"],
         ),
-        "prepare_return": make_tool(
-            "prepare_return",
-            _desc(
-                lang,
-                "校验一笔已送达订单的退货商品和退款去向，生成完整待确认详情；"
-                "本工具不修改订单。调用后必须在回复中原样展示 display_text，"
-                "并在同一轮停止其他业务操作，等待用户明确确认。",
-                "Validate the return items and refund destination for a delivered "
-                "order and produce the complete pending-confirmation details. "
-                "This tool does not change the order. After calling it, show "
-                "display_text exactly in the reply, stop other business actions "
-                "in the same turn, and wait for the user's explicit confirmation.",
-            ),
-            {
-                "order_id": {
-                    "type": "string",
-                    "description": _desc(lang, "订单号", "Order id"),
-                },
-                "item_ids": {
-                    "type": "array",
-                    "description": _desc(
-                        lang,
-                        "要退的订单商品行 item_id；同一 item_id 重复一次表示退一件",
-                        "Item ids to return from this order; repeat an item_id "
-                        "once for each unit returned",
-                    ),
-                    "items": {"type": "string"},
-                    "minItems": 1,
-                    "maxItems": 20,
-                },
-                "payment_method_id": {
-                    "type": "string",
-                    "description": _desc(
-                        lang,
-                        "订单原支付方式 ID，或当前用户已有的礼品卡 ID",
-                        "The order's original payment method id, or one of the "
-                        "current user's existing gift card ids",
-                    ),
-                },
-            },
-            prepare_return,
-            required=["order_id", "item_ids", "payment_method_id"],
+        "get_item_details": make_tool(
+            "get_item_details",
+            _desc(lang, "按 item_id 查询公开商品规格（选项、价格、是否可售）。",
+                  "Look up a catalog item by item_id: options, price, and availability."),
+            {"item_id": {"type": "string", "description": _desc(lang, "商品规格编号", "Item id"), "minLength": 1}},
+            get_item_details,
+            required=["item_id"],
         ),
-        "return_delivered_order_items": make_tool(
-            "return_delivered_order_items",
-            _desc(
-                lang,
-                "提交已展示并获当前用户明确确认的退货申请。参数必须与已展示详情完全一致；"
-                "服务端根据真实用户消息判断确认，模型无法通过参数或文本自行授权。"
-                "成功只表示 return requested，不代表退款到账、邮件发送或仓库收货。",
-                "Submit a return request that was shown to the user and "
-                "explicitly confirmed by the current user. Arguments must match "
-                "the displayed details exactly; the server judges confirmation "
-                "from the real user message, and the model cannot authorize a "
-                "return through arguments or its own text. Success only means "
-                "return requested, not that a refund was issued, an email was "
-                "sent, or the warehouse received the items.",
-            ),
-            {
-                "order_id": {
-                    "type": "string",
-                    "description": _desc(lang, "订单号", "Order id"),
-                },
-                "item_ids": {
-                    "type": "array",
-                    "description": _desc(
-                        lang,
-                        "已确认的订单商品行 item_id",
-                        "Confirmed item ids from the order",
-                    ),
-                    "items": {"type": "string"},
-                    "minItems": 1,
-                    "maxItems": 20,
-                },
-                "payment_method_id": {
-                    "type": "string",
-                    "description": _desc(
-                        lang,
-                        "已展示并确认的退款去向 ID",
-                        "The displayed and confirmed refund destination id",
-                    ),
-                },
-            },
-            return_delivered_order_items,
-            required=["order_id", "item_ids", "payment_method_id"],
+        "list_all_product_types": make_tool(
+            "list_all_product_types",
+            _desc(lang, "列出全部商品类型名称与 product_id。", "List the name and product_id of every product type."),
+            {},
+            list_all_product_types,
         ),
+        **{name: make_tool(name, _write_description(name, lang), _WRITE_SCHEMAS[name](lang), write_handler(name),
+                           required=_WRITE_REQUIRED[name]) for name in RETAIL_WRITE_TOOLS},
         "transfer_to_human_agents": make_tool(
             "transfer_to_human_agents",
             _desc(
@@ -449,17 +464,25 @@ def retail_tools(
     return tools
 
 
+def is_execution_attempt(name: str, args: Dict[str, Any], pending: Any) -> bool:
+    """参数与已展示详情一致的写调用会被执行；同一轮刚生成详情时须拦截这类调用。"""
+    if name not in WRITE_KINDS:
+        return False
+    try:
+        canonical = canonical_args(WRITE_KINDS[name], dict(args or {}))
+    except DomainError:
+        return False
+    return any(p.get("kind") == WRITE_KINDS[name] and p.get("status") == "displayed" and p.get("args") == canonical
+               for p in pending or [])
+
+
 def retail_tool_scope(has_knowledge: bool = True) -> tuple[str, ...]:
     """供角色契约展示的可用工具范围。"""
     names = [
         "find_user_id_by_email",
         "find_user_id_by_name_zip",
-        "get_user_details",
-        "get_order_details",
-        "get_product_details",
-        "calculate",
-        "prepare_return",
-        "return_delivered_order_items",
+        *RETAIL_READ_ONLY_TOOLS,
+        *RETAIL_WRITE_TOOLS,
         "transfer_to_human_agents",
     ]
     if has_knowledge:

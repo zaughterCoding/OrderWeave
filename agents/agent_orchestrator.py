@@ -35,6 +35,7 @@ from agents.tools import (
 )
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
+from mcp_tools.retail_domain import WRITE_KINDS
 
 logger = logging.getLogger(__name__)
 
@@ -818,8 +819,7 @@ class ComposerResult:
 _COMPOSER_STATE_TOOLS = {
     "find_user_id_by_email",
     "find_user_id_by_name_zip",
-    "prepare_return",
-    "return_delivered_order_items",
+    *WRITE_KINDS,
     "transfer_to_human_agents",
 }
 

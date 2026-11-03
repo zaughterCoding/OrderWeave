@@ -963,6 +963,8 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         support_max_chars=config.support_max_chars,
         workflow_mode=config.workflow_mode,
         checkpoint_path=config.checkpoint_path,
+        confirmation_client=client.for_stage("confirm", count_turn=True),
+        confirmation_model=config.model,
     )
 
     return RetailRuntime(

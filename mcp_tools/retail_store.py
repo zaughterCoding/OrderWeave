@@ -21,6 +21,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+from mcp_tools.retail_domain import WRITE_KINDS, DomainError, apply_write, canonical_args
+
 SCHEMA_VERSION = "1"
 SUPPORT_STATE_FORMAT_VERSION = 1
 MAX_SUPPORT_STATE_BYTES = 256 * 1024
@@ -804,6 +806,52 @@ class RetailStore:
                 payload_json TEXT NOT NULL,
                 PRIMARY KEY (client_user_id, conv_id)
             );
+            CREATE TABLE IF NOT EXISTS pending_actions (
+                op_id TEXT PRIMARY KEY,
+                client_user_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                retail_user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                target_key TEXT NOT NULL,
+                order_id TEXT,
+                args_json TEXT NOT NULL,
+                preview_json TEXT NOT NULL,
+                amount_cents INTEGER,
+                display_text TEXT NOT NULL,
+                status TEXT NOT NULL,
+                prepared_turn INTEGER NOT NULL,
+                displayed_turn INTEGER,
+                display_appended INTEGER NOT NULL DEFAULT 0,
+                base_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                consumed_at TEXT,
+                superseded_by TEXT,
+                note TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_actions_session
+                ON pending_actions(client_user_id, conv_id, status);
+            CREATE TABLE IF NOT EXISTS action_operations (
+                op_id TEXT PRIMARY KEY,
+                client_user_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                retail_user_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                order_id TEXT,
+                args_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS confirmation_decisions (
+                client_user_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                turn INTEGER NOT NULL,
+                op_id TEXT NOT NULL,
+                approved INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (client_user_id, conv_id, turn, op_id)
+            );
             """
         )
 
@@ -1367,765 +1415,393 @@ class RetailStore:
             return {"item_ids": [], "lines": []}
         return parsed if isinstance(parsed, dict) else {"item_ids": [], "lines": []}
 
-    def active_pending(
-        self,
-        client_user_id: str,
-        conv_id: str,
-    ) -> List[Dict[str, Any]]:
+    # ── 写操作：两阶段待确认动作 ─────────────────────────────────────────
+
+    _EVENT_PREFIX = {"return": "return", "exchange": "exchange", "cancel": "cancel",
+                     "modify_items": "modify_items", "modify_address": "modify_address",
+                     "modify_payment": "modify_payment", "modify_user_address": "modify_user_address"}
+
+    @classmethod
+    def executed_event(cls, kind: str) -> str:
+        # 退货沿用原事件名，便于既有恢复核对和评测统计。
+        return "return_requested" if kind == "return" else f"{cls._EVENT_PREFIX[kind]}_executed"
+
+    @staticmethod
+    def _fingerprint(order: Optional[Dict[str, Any]], user: Dict[str, Any]) -> str:
+        data = json.dumps([order, user], ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+    def _action_target(self, connection: sqlite3.Connection, kind: str, args: Dict[str, Any],
+                       user_id: str) -> Tuple[Optional[sqlite3.Row], Optional[Dict[str, Any]], Dict[str, Any]]:
+        user = self._user_record(connection, user_id)
+        if kind == "modify_user_address":
+            return None, None, user
+        row = self._order_row(connection, args["order_id"], user_id)
+        if row is None:
+            raise RetailStoreError(self._t(
+                "未找到属于当前用户的该订单；请核对订单号。",
+                "No order with that number belongs to the current user; check the order number."))
+        return row, json.loads(row["payload"]), user
+
+    def _products(self, connection: sqlite3.Connection) -> Dict[str, Any]:
+        rows = connection.execute("SELECT product_id, payload FROM products").fetchall()
+        return {str(r["product_id"]): json.loads(r["payload"]) for r in rows}
+
+    def _action_display(self, kind: str, args: Dict[str, Any], order: Optional[Dict[str, Any]],
+                        user: Dict[str, Any], preview: Dict[str, Any], op_id: str) -> str:
+        """服务端生成的完整待确认详情；模型必须原样展示，用户据此确认。"""
+        english = self.language == "en"
+        methods = user.get("payment_methods") or {}
+
+        def method(payment_id: str) -> str:
+            return _payment_label(methods.get(payment_id), payment_id, self.language)
+
+        def item_line(item: Dict[str, Any]) -> str:
+            return (f"- {item.get('name')} (item_id: {item.get('item_id')}, {_options_text(item.get('options'), 'en')}),"
+                    f" price {_fmt_usd(_to_cents(item.get('price')))}" if english else
+                    f"- {item.get('name')}（item_id: {item.get('item_id')}，{_options_text(item.get('options'))}），"
+                    f"价格 ¥{_fmt_cents(_to_cents(item.get('price')))}")
+
+        def by_id(item_id: str) -> Dict[str, Any]:
+            return next((i for i in (order or {}).get("items", []) if i.get("item_id") == item_id), {"item_id": item_id})
+
+        def address(a: Dict[str, Any]) -> str:
+            return ", ".join(str(a[f]) for f in ("address1", "address2", "city", "state", "zip", "country") if a.get(f))
+
+        lines: List[str] = []
+        if kind in {"return", "exchange", "modify_items"}:
+            lines.append("Items:" if english else "商品：")
+            lines += [item_line(by_id(i)) for i in args["item_ids"]]
+        if kind in {"exchange", "modify_items"}:
+            products = preview.get("new_items") or []
+            lines.append("New items:" if english else "新商品：")
+            lines += [item_line(i) for i in products]
+            diff = preview.get("price_difference", 0)
+            lines.append((f"Price difference: {_fmt_usd(_to_cents(abs(diff)))} "
+                          + ("to pay" if diff > 0 else "to refund" if diff < 0 else "")) if english else
+                         f"差价：¥{_fmt_cents(_to_cents(abs(diff)))}" + ("（需补付）" if diff > 0 else "（将退还）" if diff < 0 else ""))
+            lines.append(("Payment method for the difference: " if english else "差价支付／退还方式：")
+                         + method(args["payment_method_id"]))
+        if kind == "return":
+            lines.append((f"Estimated refund amount: {_fmt_usd(_to_cents(preview['refund_amount']))} "
+                          "(based on the order price; this is not a completed refund)") if english else
+                         f"预计申请金额：¥{_fmt_cents(_to_cents(preview['refund_amount']))}（按订单成交价计算，不代表已到账）")
+            lines.append(("Refund destination: " if english else "退款去向：") + method(args["payment_method_id"]))
+        if kind == "cancel":
+            lines.append(("Reason: " if english else "取消原因：") + args["reason"])
+            lines.append((f"Refund amount: {_fmt_usd(_to_cents(preview['refund_amount']))} to the original payment methods"
+                          if english else f"退款金额：¥{_fmt_cents(_to_cents(preview['refund_amount']))}，退回原支付方式"))
+        if kind in {"modify_address", "modify_user_address"}:
+            old = (order or {}).get("address") if kind == "modify_address" else user.get("address")
+            lines.append(("Current address: " if english else "当前地址：") + address(old or {}))
+            lines.append(("New address: " if english else "新地址：") + address(args))
+        if kind == "modify_payment":
+            current = (order or {}).get("payment_history", [{}])[0].get("payment_method_id", "")
+            lines.append(("Current payment method: " if english else "当前支付方式：") + method(current))
+            lines.append(("New payment method: " if english else "新支付方式：") + method(args["payment_method_id"]))
+        titles = {
+            "return": ("RETURN REQUEST DETAILS", "退货申请详情"),
+            "exchange": ("EXCHANGE REQUEST DETAILS", "换货申请详情"),
+            "cancel": ("ORDER CANCELLATION DETAILS", "取消订单详情"),
+            "modify_items": ("ORDER ITEM CHANGE DETAILS", "修改订单商品详情"),
+            "modify_address": ("ORDER ADDRESS CHANGE DETAILS", "修改订单地址详情"),
+            "modify_payment": ("ORDER PAYMENT CHANGE DETAILS", "修改订单支付方式详情"),
+            "modify_user_address": ("ACCOUNT ADDRESS CHANGE DETAILS", "修改账户默认地址详情"),
+        }
+        title = titles[kind][0 if english else 1]
+        head = ([f"{title} (PENDING CONFIRMATION)", f"Operation ID: {op_id}"] if english else
+                [f"【{title}（待确认）】", f"操作编号：{op_id}"])
+        if order is not None:
+            head.append((f"Order: {order['order_id']} (status: {order['status']})") if english else
+                        f"订单号：{order['order_id']}（状态：{order['status']}）")
+        tail = ("Nothing has been changed yet. Reply with an explicit confirmation, such as \"Yes, please proceed\", "
+                "to carry out exactly these details." if english else
+                "目前尚未做任何修改。请明确回复“确认，按这些办理”以按上述详情执行。")
+        return "\n".join(head + lines + [tail])
+
+    def active_pending(self, client_user_id: str, conv_id: str) -> List[Dict[str, Any]]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                "SELECT * FROM pending_returns"
-                " WHERE client_user_id=? AND conv_id=?"
-                " AND status IN ('prepared', 'displayed')"
-                " ORDER BY created_at, op_id",
-                (client_user_id, conv_id),
-            ).fetchall()
-        return [
-            {
-                **{key: row[key] for key in row.keys()},
-                "items": self._parse_items(row["items_json"]),
-                "amount": _fmt_cents(int(row["amount_cents"])),
-            }
-            for row in rows
-        ]
+                "SELECT * FROM pending_actions WHERE client_user_id=? AND conv_id=?"
+                " AND status IN ('prepared', 'displayed') ORDER BY created_at, op_id",
+                (client_user_id, conv_id)).fetchall()
+        result = []
+        for row in rows:
+            args = json.loads(row["args_json"])
+            item = {key: row[key] for key in row.keys()}
+            item.update(args=args, order_id=row["order_id"] or "",
+                        payment_method_id=args.get("payment_method_id"),
+                        items={"item_ids": args.get("item_ids", [])},
+                        amount=_fmt_cents(int(row["amount_cents"])) if row["amount_cents"] is not None else None)
+            result.append(item)
+        return result
 
-    def cancel_pending(
-        self,
-        client_user_id: str,
-        conv_id: str,
-        reason: str = "user_cancelled",
-    ) -> int:
-        """取消本会话尚未提交的待确认详情；不修改订单或退货申请。"""
+    def cancel_pending(self, client_user_id: str, conv_id: str, reason: str = "user_cancelled") -> int:
+        """取消本会话尚未执行的待确认动作；不修改订单或用户资料。"""
         now = _now()
         try:
             with self._tx() as connection:
                 rows = connection.execute(
-                    "SELECT op_id, retail_user_id, order_id FROM pending_returns"
-                    " WHERE client_user_id=? AND conv_id=?"
-                    " AND status IN ('prepared', 'displayed')",
-                    (client_user_id, conv_id),
-                ).fetchall()
+                    "SELECT op_id, retail_user_id, order_id, kind FROM pending_actions"
+                    " WHERE client_user_id=? AND conv_id=? AND status IN ('prepared', 'displayed')",
+                    (client_user_id, conv_id)).fetchall()
                 if not rows:
                     return 0
                 connection.execute(
-                    "UPDATE pending_returns SET status='cancelled', updated_at=?,"
-                    " note=? WHERE client_user_id=? AND conv_id=?"
-                    " AND status IN ('prepared', 'displayed')",
-                    (
-                        now,
-                        f"cancelled: {str(reason or 'user_cancelled')[:120]}",
-                        client_user_id,
-                        conv_id,
-                    ),
-                )
+                    "UPDATE pending_actions SET status='cancelled', updated_at=?, note=?"
+                    " WHERE client_user_id=? AND conv_id=? AND status IN ('prepared', 'displayed')",
+                    (now, f"cancelled: {str(reason or 'user_cancelled')[:120]}", client_user_id, conv_id))
                 for row in rows:
-                    self._event(
-                        connection,
-                        client_user_id,
-                        conv_id,
-                        row["retail_user_id"],
-                        "return_cancelled",
-                        {"reason": str(reason or "user_cancelled")[:120]},
-                        order_id=row["order_id"],
-                        op_id=row["op_id"],
-                    )
+                    self._event(connection, client_user_id, conv_id, row["retail_user_id"],
+                                f"{self._EVENT_PREFIX[row['kind']]}_cancelled",
+                                {"reason": str(reason or "user_cancelled")[:120]},
+                                order_id=row["order_id"], op_id=row["op_id"])
                 return len(rows)
         except sqlite3.Error as ex:
-            raise SupportStateError(f"取消待确认退货失败: {ex}") from ex
+            raise SupportStateError(f"取消待确认动作失败: {ex}") from ex
 
-    def _validate_item_request(
-        self,
-        order: Dict[str, Any],
-        item_ids: Any,
-    ) -> Tuple[List[str], List[Dict[str, Any]], int]:
-        if not isinstance(item_ids, list):
-            raise RetailStoreError(
-                self._t("item_ids 必须是数组", "item_ids must be an array")
-            )
-        if not item_ids:
-            raise RetailStoreError(
-                self._t(
-                    "item_ids 不能为空；空列表不能提交退货",
-                    "item_ids cannot be empty; an empty list cannot be returned",
-                )
-            )
-        if len(item_ids) > 20:
-            raise RetailStoreError(
-                self._t(
-                    "一次最多提交 20 件退货商品",
-                    "At most 20 return items can be submitted at once",
-                )
-            )
-        requested: List[str] = []
-        for item_id in item_ids:
-            if not isinstance(item_id, str) or not item_id.strip():
-                raise RetailStoreError(
-                    self._t(
-                        "item_ids 中的每一项都必须是非空字符串",
-                        "Each entry in item_ids must be a non-empty string",
-                    )
-                )
-            requested.append(item_id.strip())
+    def mark_pending_displayed(self, client_user_id: str, conv_id: str, op_id: str, turn: int,
+                               appended: bool) -> bool:
+        with self._tx() as connection:
+            row = connection.execute("SELECT * FROM pending_actions WHERE op_id=?", (op_id,)).fetchone()
+            if (row is None or row["client_user_id"] != client_user_id or row["conv_id"] != conv_id
+                    or row["status"] != "prepared" or int(row["prepared_turn"]) != int(turn)):
+                return False
+            connection.execute(
+                "UPDATE pending_actions SET status='displayed', displayed_turn=?, display_appended=?,"
+                " updated_at=? WHERE op_id=? AND status='prepared'",
+                (turn, 1 if appended else 0, _now(), op_id))
+            self._event(connection, client_user_id, conv_id, str(row["retail_user_id"]),
+                        f"{self._EVENT_PREFIX[row['kind']]}_displayed",
+                        {"appended": bool(appended), "turn": int(turn)},
+                        order_id=row["order_id"], op_id=op_id)
+            return True
 
-        available = Counter(
-            str(item.get("item_id")) for item in (order.get("items") or [])
-        )
-        wanted = Counter(requested)
-        for item_id, count in wanted.items():
-            if available.get(item_id, 0) == 0:
-                raise RetailStoreError(
-                    self._t(
-                        f"商品 {item_id} 不属于该订单；请使用订单中的具体 item_id。",
-                        f"Item {item_id} is not in this order; use the exact "
-                        "item_id from the order.",
-                    )
-                )
-            if count > available[item_id]:
-                raise RetailStoreError(
-                    self._t(
-                        f"商品 {item_id} 申请 {count} 件，超过订单中的 {available[item_id]} 件。",
-                        f"Requested {count} of item {item_id}, but the order "
-                        f"contains {available[item_id]}.",
-                    )
-                )
+    def record_confirmation_decisions(self, client_user_id: str, conv_id: str, turn: int,
+                                      decisions: List[Dict[str, Any]], source: str) -> None:
+        """保存本轮由真实用户消息得出的确认判定；执行时只认同一轮的判定。"""
+        with self._tx() as connection:
+            for decision in decisions:
+                connection.execute(
+                    "INSERT OR REPLACE INTO confirmation_decisions"
+                    "(client_user_id, conv_id, turn, op_id, approved, source, reason, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (client_user_id, conv_id, int(turn), str(decision["op_id"]),
+                     1 if decision.get("approved") else 0, source, str(decision.get("reason") or "")[:300], _now()))
 
-        order_items = order.get("items") or []
-        lines: List[Dict[str, Any]] = []
-        total_cents = 0
-        for item_id, count in wanted.items():
-            source = next(
-                item for item in order_items if str(item.get("item_id")) == item_id
-            )
-            unit_cents = _to_cents(source.get("price"))
-            line_cents = unit_cents * count
-            total_cents += line_cents
-            lines.append(
-                {
-                    "item_id": item_id,
-                    "product_id": str(source.get("product_id", "")),
-                    "name": str(source.get("name", "")),
-                    "options": source.get("options") or {},
-                    "unit_price": _fmt_cents(unit_cents),
-                    "quantity": count,
-                    "line_amount": _fmt_cents(line_cents),
-                }
-            )
-        if total_cents <= 0:
-            raise RetailStoreError(
-                self._t(
-                    "退货金额必须大于 0",
-                    "The return amount must be greater than 0",
-                )
-            )
-        return requested, lines, total_cents
+    def confirmation_decision(self, client_user_id: str, conv_id: str, turn: int,
+                              op_id: str) -> Optional[Dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM confirmation_decisions WHERE client_user_id=? AND conv_id=? AND turn=? AND op_id=?",
+                (client_user_id, conv_id, int(turn), op_id)).fetchone()
+        return dict(row) if row else None
 
-    @staticmethod
-    def _original_payment_id(order: Dict[str, Any]) -> str:
-        for item in order.get("payment_history") or []:
-            payment_id = str(item.get("payment_method_id") or "").strip()
-            if payment_id:
-                return payment_id
-        return ""
-
-    def _resolve_payment(
-        self,
-        user: Dict[str, Any],
-        order: Dict[str, Any],
-        payment_method_id: Any,
-    ) -> Tuple[str, Dict[str, Any], bool]:
-        payment_id = str(payment_method_id or "").strip()
-        if not payment_id:
-            raise RetailStoreError(
-                self._t("payment_method_id 不能为空", "payment_method_id cannot be empty")
-            )
-        payments = user.get("payment_methods") or {}
-        payment = payments.get(payment_id)
-        original_id = self._original_payment_id(order)
-        is_original = bool(original_id) and payment_id == original_id
-        if is_original:
-            return payment_id, payment or {}, True
-        if payment is None:
-            raise RetailStoreError(
-                self._t(
-                    "退款去向不属于当前用户的支付资料；只能使用原支付方式或本人已有礼品卡。",
-                    "The refund destination is not among the current user's "
-                    "payment methods; use the original payment method or one "
-                    "of the user's gift cards.",
-                )
-            )
-        if str(payment.get("source")) != "gift_card":
-            raise RetailStoreError(
-                self._t(
-                    "退款去向必须是原支付方式或当前用户已有的礼品卡；"
-                    "不能改到其他信用卡、PayPal 或他人支付方式。",
-                    "The refund destination must be the original payment "
-                    "method or one of the user's gift cards; it cannot be "
-                    "another credit card, PayPal, or someone else's method.",
-                )
-            )
-        return payment_id, payment, False
-
-    def prepare_return(
-        self,
-        client_user_id: str,
-        conv_id: str,
-        order_id: str,
-        item_ids: Any,
-        payment_method_id: Any,
-    ) -> Dict[str, Any]:
-        normalized = normalize_order_id(order_id)
+    def write_action(self, client_user_id: str, conv_id: str, tool_name: str, raw_args: Dict[str, Any],
+                     user_message: str, *, allow_execute: bool = True) -> Dict[str, Any]:
+        """写工具统一入口：首次调用生成待确认详情；展示后经本轮确认、参数一致的再次调用才执行。"""
+        kind = WRITE_KINDS[tool_name]
         turn = self.current_turn(client_user_id, conv_id)
+        try:
+            args = canonical_args(kind, raw_args or {})
+            with closing(self._connect()) as connection:
+                user_id = self._require_binding(connection, client_user_id, conv_id)
+                if kind == "modify_user_address" and str(raw_args.get("user_id") or user_id) != user_id:
+                    raise RetailStoreError(self._t("只能修改当前已核实用户的地址。",
+                                                   "Only the verified current user's address can be changed."))
+                args_json = json.dumps(args, ensure_ascii=False, sort_keys=True)
+                displayed = connection.execute(
+                    "SELECT * FROM pending_actions WHERE client_user_id=? AND conv_id=? AND kind=?"
+                    " AND args_json=? AND status='displayed' ORDER BY created_at DESC LIMIT 1",
+                    (client_user_id, conv_id, kind, args_json)).fetchone()
+        except (RetailStoreError, DomainError) as ex:
+            return {"success": False, "error": str(ex)}
+        if displayed is not None and allow_execute and int(displayed["displayed_turn"] or turn) < turn:
+            return self._execute_action(client_user_id, conv_id, kind, dict(displayed), user_message, turn)
+        return self._prepare_action(client_user_id, conv_id, kind, args, turn)
+
+    def _prepare_action(self, client_user_id: str, conv_id: str, kind: str, args: Dict[str, Any],
+                        turn: int) -> Dict[str, Any]:
         try:
             with closing(self._connect()) as connection:
                 user_id = self._require_binding(connection, client_user_id, conv_id)
-                row = self._order_row(connection, normalized, user_id)
-                if row is None:
-                    return {
-                        "success": False,
-                        "error": self._t(
-                            "未找到属于当前用户的该订单；请核对订单号。",
-                            "No order with that number belongs to the current "
-                            "user; check the order number.",
-                        ),
-                    }
-                order = json.loads(row["payload"])
-                user = self._user_record(connection, user_id)
-                status = str(order.get("status", ""))
-                if status != "delivered":
-                    return {
-                        "success": False,
-                        "error": self._t(
-                            f"订单 {normalized} 当前状态为 {status}；"
-                            "只有 delivered（已送达）订单可以提交退货申请。",
-                            f"Order {normalized} is currently {status}; only "
-                            "delivered orders can be returned.",
-                        ),
-                    }
-                requested, lines, total_cents = self._validate_item_request(
-                    order, item_ids
-                )
-                payment_id, payment, is_original = self._resolve_payment(
-                    user, order, payment_method_id
-                )
-                order_version = int(row["version"])
-        except RetailStoreError as ex:
+                _, order, user = self._action_target(connection, kind, args, user_id)
+                products = self._products(connection)
+                new_order, _, preview = apply_write(kind, args, order, user, products)
+        except (RetailStoreError, DomainError) as ex:
             return {"success": False, "error": str(ex)}
-
-        op_id = f"RT-{uuid.uuid4().hex[:12]}"
-        payment_description = _payment_label(payment, payment_id, self.language)
-        if self.language == "en":
-            payment_note = "original payment method" if is_original else "existing gift card"
-            display_lines = "\n".join(
-                f"- {line['name']} (item_id: {line['item_id']}, "
-                f"{_options_text(line['options'], 'en')}) x {line['quantity']}, "
-                f"unit price {_fmt_usd(_to_cents(line['unit_price']))}, "
-                f"line total {_fmt_usd(_to_cents(line['line_amount']))}"
-                for line in lines
-            )
-            display_text = (
-                "RETURN REQUEST DETAILS (PENDING CONFIRMATION)\n"
-                f"Operation ID: {op_id}\n"
-                f"Order: {normalized}\n"
-                "Order status: delivered\n"
-                f"Items to return:\n{display_lines}\n"
-                f"Number of items: {len(requested)}\n"
-                f"Estimated refund amount: {_fmt_usd(total_cents)} "
-                "(based on the order price; this is not a completed refund)\n"
-                f"Refund destination: {payment_description} ({payment_note})\n"
-                "Reply with an explicit confirmation, such as \"Yes, please "
-                "submit this return\", to proceed. After submission the order "
-                "status becomes return requested. This does not mean the refund "
-                "has been issued, an email has been sent, or the warehouse has "
-                "received the items."
-            )
-        else:
-            payment_note = "原支付方式" if is_original else "本人已有礼品卡"
-            display_lines = "\n".join(
-                f"- {line['name']}（item_id: {line['item_id']}，{_options_text(line['options'])}）"
-                f" × {line['quantity']}，单价 ¥{line['unit_price']}，"
-                f"小计 ¥{line['line_amount']}"
-                for line in lines
-            )
-            display_text = (
-                "【退货申请详情（待确认）】\n"
-                f"操作编号：{op_id}\n"
-                f"订单号：{normalized}\n"
-                f"订单状态：delivered（已送达）\n"
-                f"退货商品：\n{display_lines}\n"
-                f"退货件数：{len(requested)} 件\n"
-                f"预计申请金额：¥{_fmt_cents(total_cents)}（按订单成交价计算，不代表已到账）\n"
-                f"退款去向：{payment_description}（{payment_note}）\n"
-                "请回复“确认，就按这些申请退货”以提交。提交后订单状态将变为 "
-                "return requested（已申请退货），不代表退款已到账、邮件已发送或仓库已收货。"
-            )
-        items_payload = {"item_ids": requested, "lines": lines}
+        if kind in {"exchange", "modify_items"}:
+            preview["new_items"] = []
+            for old_id, new_id in zip(args["item_ids"], args["new_item_ids"]):
+                product_id = next(i["product_id"] for i in order["items"] if i["item_id"] == old_id)
+                variant = products[product_id]["variants"][new_id]
+                preview["new_items"].append({"name": products[product_id].get("name"), "item_id": new_id,
+                                             "options": variant.get("options"), "price": variant.get("price")})
+        op_id = f"OP-{uuid.uuid4().hex[:12]}"
+        display_text = self._action_display(kind, args, order, user, preview, op_id)
+        amount = preview.get("refund_amount")
+        amount_cents = _to_cents(amount) if amount is not None else None
+        target_key = args.get("order_id") or f"user:{user_id}"
         now = _now()
         with self._tx() as connection:
             self._ensure_session(connection, client_user_id, conv_id)
             previous = connection.execute(
-                "SELECT op_id FROM pending_returns"
-                " WHERE client_user_id=? AND conv_id=? AND order_id=?"
-                " AND status IN ('prepared', 'displayed')",
-                (client_user_id, conv_id, normalized),
-            ).fetchall()
+                "SELECT op_id FROM pending_actions WHERE client_user_id=? AND conv_id=? AND target_key=?"
+                " AND status IN ('prepared', 'displayed')", (client_user_id, conv_id, target_key)).fetchall()
+            # 同一订单／账户只保留最新详情，旧详情失效后不能再被确认。
             connection.execute(
-                "UPDATE pending_returns SET status='superseded', superseded_by=?,"
-                " updated_at=? WHERE client_user_id=? AND conv_id=? AND order_id=?"
-                " AND status IN ('prepared', 'displayed')",
-                (op_id, now, client_user_id, conv_id, normalized),
-            )
+                "UPDATE pending_actions SET status='superseded', superseded_by=?, updated_at=?"
+                " WHERE client_user_id=? AND conv_id=? AND target_key=? AND status IN ('prepared', 'displayed')",
+                (op_id, now, client_user_id, conv_id, target_key))
             connection.execute(
-                "INSERT INTO pending_returns"
-                "(op_id, client_user_id, conv_id, retail_user_id, order_id,"
-                " items_json, payment_method_id, amount_cents, display_text, status,"
-                " prepared_turn, displayed_turn, display_appended, order_version,"
-                " created_at, updated_at, consumed_at, superseded_by, note)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, NULL, 0, ?, ?, ?, NULL, NULL, ?)",
-                (
-                    op_id,
-                    client_user_id,
-                    conv_id,
-                    user_id,
-                    normalized,
-                    json.dumps(items_payload, ensure_ascii=False, sort_keys=True),
-                    payment_id,
-                    total_cents,
-                    display_text,
-                    turn,
-                    order_version,
-                    now,
-                    now,
-                    "pending details must be shown to the current user",
-                ),
-            )
-            self._event(
-                connection,
-                client_user_id,
-                conv_id,
-                user_id,
-                "return_prepared",
-                {
-                    "item_ids": requested,
-                    "payment_method_id": payment_id,
-                    "amount_cents": total_cents,
-                    "superseded": [str(item["op_id"]) for item in previous],
-                },
-                order_id=normalized,
-                op_id=op_id,
-            )
-        return {
-            "success": True,
-            "op_id": op_id,
-            "order_id": normalized,
-            "items": lines,
-            "item_ids": requested,
-            "payment_method_id": payment_id,
-            "payment_description": payment_description,
-            "estimated_amount": (
-                _fmt_usd(total_cents)
-                if self.language == "en"
-                else _fmt_cents(total_cents)
-            ),
-            "amount_cents": total_cents,
-            "display_text": display_text,
-            "status": "prepared",
-            "note": self._t(
-                "详情尚未展示；必须把 display_text 原样展示给当前用户，并等待下一轮明确确认。",
-                "The details have not been shown yet; show display_text exactly "
-                "to the current user and wait for an explicit confirmation in "
-                "the next turn.",
-            ),
-        }
+                "INSERT INTO pending_actions(op_id, client_user_id, conv_id, retail_user_id, kind, target_key,"
+                " order_id, args_json, preview_json, amount_cents, display_text, status, prepared_turn,"
+                " displayed_turn, display_appended, base_fingerprint, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', ?, NULL, 0, ?, ?, ?)",
+                (op_id, client_user_id, conv_id, user_id, kind, target_key, args.get("order_id"),
+                 json.dumps(args, ensure_ascii=False, sort_keys=True), json.dumps(preview, ensure_ascii=False),
+                 amount_cents, display_text, turn, self._fingerprint(order, user), now, now))
+            self._event(connection, client_user_id, conv_id, user_id, f"{self._EVENT_PREFIX[kind]}_prepared",
+                        {"args": args, "superseded": [str(r["op_id"]) for r in previous]},
+                        order_id=args.get("order_id"), op_id=op_id)
+        return {"success": True, "action_status": "pending_confirmation", "status": "prepared", "op_id": op_id,
+                "kind": kind, "order_id": args.get("order_id"), "display_text": display_text, "preview": preview,
+                "note": self._t(
+                    "尚未执行任何修改。必须把 display_text 原样展示给用户，等待用户在下一条消息明确确认后，"
+                    "再用完全相同的参数调用本工具执行。",
+                    "Nothing has been changed yet. Show display_text exactly to the user, wait for the user's "
+                    "explicit confirmation in a later message, then call this tool again with identical "
+                    "arguments to carry it out.")}
 
-    def mark_pending_displayed(
-        self,
-        client_user_id: str,
-        conv_id: str,
-        op_id: str,
-        turn: int,
-        appended: bool,
-    ) -> bool:
-        with self._tx() as connection:
-            row = connection.execute(
-                "SELECT * FROM pending_returns WHERE op_id=?", (op_id,)
-            ).fetchone()
-            if (
-                row is None
-                or row["client_user_id"] != client_user_id
-                or row["conv_id"] != conv_id
-                or row["status"] != "prepared"
-                or int(row["prepared_turn"]) != int(turn)
-            ):
-                return False
-            connection.execute(
-                "UPDATE pending_returns SET status='displayed', displayed_turn=?,"
-                " display_appended=?, updated_at=? WHERE op_id=? AND status='prepared'",
-                (turn, 1 if appended else 0, _now(), op_id),
-            )
-            self._event(
-                connection,
-                client_user_id,
-                conv_id,
-                str(row["retail_user_id"]),
-                "return_displayed",
-                {"appended": bool(appended), "turn": int(turn)},
-                order_id=str(row["order_id"]),
-                op_id=op_id,
-            )
-            return True
-
-    def submit_return(
-        self,
-        client_user_id: str,
-        conv_id: str,
-        order_id: str,
-        item_ids: Any,
-        payment_method_id: Any,
-        user_message: str,
-    ) -> Dict[str, Any]:
-        normalized = normalize_order_id(order_id)
-        turn = self.current_turn(client_user_id, conv_id)
-        try:
-            wanted_ids, _, _ = self._validate_item_request_shape(item_ids)
-            payment_id = str(payment_method_id or "").strip()
-            if not payment_id:
-                raise RetailStoreError("payment_method_id 不能为空")
-            with closing(self._connect()) as connection:
-                user_id = self._require_binding(connection, client_user_id, conv_id)
-                displayed_rows = connection.execute(
-                    "SELECT * FROM pending_returns"
-                    " WHERE client_user_id=? AND conv_id=? AND status='displayed'"
-                    " ORDER BY created_at, op_id",
-                    (client_user_id, conv_id),
-                ).fetchall()
-                prepared_rows = connection.execute(
-                    "SELECT * FROM pending_returns"
-                    " WHERE client_user_id=? AND conv_id=? AND status='prepared'",
-                    (client_user_id, conv_id),
-                ).fetchall()
-        except RetailStoreError as ex:
-            return {"success": False, "error": str(ex)}
-
-        if not displayed_rows:
-            if prepared_rows:
-                return {
-                    "success": False,
-                    "error": self._t(
-                        "退货详情尚未展示给用户，不能提交；请先展示并等待下一轮明确确认。",
-                        "The return details have not been shown to the user; "
-                        "show them first and wait for an explicit confirmation "
-                        "in the next turn.",
-                    ),
-                }
-            return {
-                "success": False,
-                "error": self._t(
-                    "没有已展示的待确认详情；请先准备并展示退货详情。",
-                    "There are no displayed pending details; prepare and show "
-                    "the return details first.",
-                ),
-            }
-
-        displayed = [
-            {
-                **{key: row[key] for key in row.keys()},
-                "items": self._parse_items(row["items_json"]),
-            }
-            for row in displayed_rows
-        ]
-        match = None
-        for candidate in displayed:
-            signature = Counter(
-                str(item) for item in candidate["items"].get("item_ids", [])
-            )
-            if (
-                candidate["order_id"] == normalized
-                and signature == Counter(wanted_ids)
-                and candidate["payment_method_id"] == payment_id
-            ):
-                match = candidate
-                break
-        if match is None:
-            return {
-                "success": False,
-                "error": self._t(
-                    "提交参数与已展示的详情不一致；请重新准备、展示并确认新详情。",
-                    "The submission does not match the displayed details; "
-                    "prepare, show, and confirm the new details again.",
-                ),
-            }
-        if int(match["prepared_turn"]) == turn:
-            return {
-                "success": False,
-                "error": self._t(
-                    "准备详情的同一轮不能提交；请先向用户展示并等待明确确认。",
-                    "Details cannot be submitted in the same turn they are "
-                    "prepared; show them and wait for an explicit confirmation.",
-                ),
-            }
-        if match["displayed_turn"] is None or int(match["displayed_turn"]) >= turn:
-            return {
-                "success": False,
-                "error": self._t(
-                    "确认必须发生在详情实际展示之后；请重新展示全部详情后再确认。",
-                    "Confirmation must come after the details were actually "
-                    "shown; show all details again before confirming.",
-                ),
-            }
-
-        decision = evaluate_confirmation(
-            user_message, match, displayed, language=self.language
-        )
-        if not decision.approved:
-            self._record_rejection(
-                client_user_id,
-                conv_id,
-                str(match["retail_user_id"]),
-                normalized,
-                str(match["op_id"]),
-                decision.reason,
-                {"item_ids": wanted_ids, "payment_method_id": payment_id},
-            )
-            return {
-                "success": False,
-                "error": self._t(
-                    f"未获得当前用户的明确确认：{decision.reason}",
-                    "The current user has not given explicit confirmation: "
-                    f"{decision.reason}",
-                ),
-                "confirmation_scope": decision.scope,
-                "error_code": "confirmation_required",
-                "confirmation_hint": self._t(
-                    "退货尚未提交。请先解决疑问或修改详情；如确认按已展示内容办理，"
-                    f"请在下一条消息明确回复“确认，按已展示详情提交订单{normalized}的退货”。",
-                    "The return was not submitted. Resolve any questions or changes first. "
-                    "If you want the unchanged displayed details submitted, reply in a new message: "
-                    f"Yes, please submit this return for order {normalized} as listed.",
-                ),
-            }
-
+    def _execute_action(self, client_user_id: str, conv_id: str, kind: str, pending: Dict[str, Any],
+                        user_message: str, turn: int) -> Dict[str, Any]:
+        op_id = str(pending["op_id"])
+        if int(pending["prepared_turn"]) >= turn:
+            return {"success": False, "error": self._t("准备详情的同一轮不能执行；请等待用户确认。",
+                                                       "Details cannot be carried out in the turn they were prepared.")}
+        decision = self.confirmation_decision(client_user_id, conv_id, turn, op_id)
+        if decision is not None:
+            approved, reason, scope = bool(decision["approved"]), str(decision["reason"]), str(decision["source"])
+        else:
+            displayed = [p for p in self.active_pending(client_user_id, conv_id) if p["status"] == "displayed"]
+            current = next((p for p in displayed if p["op_id"] == op_id), {**pending, "order_id": pending["order_id"] or ""})
+            rule = evaluate_confirmation(user_message, current, displayed, language=self.language)
+            approved, reason, scope = rule.approved, rule.reason, rule.scope
+        args = json.loads(pending["args_json"])
+        if not approved:
+            self._record_rejection(client_user_id, conv_id, str(pending["retail_user_id"]),
+                                   pending["order_id"], op_id, reason, {"kind": kind, "args": args})
+            target = f" {pending['order_id']}" if pending["order_id"] else ""
+            return {"success": False, "error_code": "confirmation_required",
+                    "error": self._t(f"未获得当前用户的明确确认：{reason}",
+                                     f"The current user has not given explicit confirmation: {reason}"),
+                    "confirmation_hint": self._t(
+                        f"尚未执行。请先解决疑问或修改详情；如确认按已展示内容办理{target}，请在下一条消息明确回复“确认，按已展示详情办理”。",
+                        f"Nothing was carried out. Resolve any questions or changes first. If you want the displayed "
+                        f"details{target} carried out unchanged, reply in a new message: Yes, please proceed as listed.")}
         try:
             with self._tx() as connection:
-                pending_row = connection.execute(
-                    "SELECT * FROM pending_returns WHERE op_id=?",
-                    (match["op_id"],),
-                ).fetchone()
-                if (
-                    pending_row is None
-                    or pending_row["status"] != "displayed"
-                    or pending_row["client_user_id"] != client_user_id
-                    or pending_row["conv_id"] != conv_id
-                ):
-                    raise RetailStoreError(
-                        self._t(
-                            "该确认已使用或待确认状态已变化",
-                            "This confirmation was already used or its pending "
-                            "state has changed",
-                        )
-                    )
+                row = connection.execute("SELECT * FROM pending_actions WHERE op_id=?", (op_id,)).fetchone()
+                if row is None or row["status"] != "displayed":
+                    raise RetailStoreError(self._t("该确认已使用或待确认状态已变化",
+                                                   "This confirmation was already used or its pending state changed"))
                 user_id = self._require_binding(connection, client_user_id, conv_id)
-                if str(pending_row["retail_user_id"]) != user_id:
-                    raise RetailStoreError(
-                        self._t(
-                            "会话绑定用户与待确认记录不一致",
-                            "The session-bound user does not match the pending "
-                            "confirmation record",
-                        )
-                    )
-
-                order_row = self._order_row(connection, normalized, user_id)
-                if order_row is None:
-                    raise RetailStoreError(
-                        self._t(
-                            "订单不属于当前用户或已不存在",
-                            "The order does not belong to the current user or "
-                            "no longer exists",
-                        )
-                    )
-                order_version = int(order_row["version"])
-                if order_version != int(pending_row["order_version"]):
-                    raise RetailStoreError(
-                        self._t(
-                            "订单在展示后已发生变化；请重新查询、展示并确认。",
-                            "The order changed after the details were shown; "
-                            "look it up, show the details, and confirm again.",
-                        )
-                    )
-                order = json.loads(order_row["payload"])
-                if str(order.get("status")) != "delivered":
-                    raise RetailStoreError(
-                        self._t(
-                            f"订单当前状态为 {order.get('status')}；只有 delivered 可提交退货。",
-                            f"The order is currently {order.get('status')}; only "
-                            "delivered orders can be returned.",
-                        )
-                    )
-                requested, _, total_cents = self._validate_item_request(
-                    order, json.loads(pending_row["items_json"]).get("item_ids")
-                )
-                if total_cents != int(pending_row["amount_cents"]):
-                    raise RetailStoreError(
-                        self._t(
-                            "订单金额已变化；请重新展示并确认。",
-                            "The order amount changed; show the details and "
-                            "confirm again.",
-                        )
-                    )
-                user = self._user_record(connection, user_id)
-                resolved_id, _, _ = self._resolve_payment(
-                    user, order, pending_row["payment_method_id"]
-                )
-                if resolved_id != pending_row["payment_method_id"]:
-                    raise RetailStoreError(
-                        self._t(
-                            "退款去向已变化；请重新展示并确认。",
-                            "The refund destination changed; show the details "
-                            "and confirm again.",
-                        )
-                    )
-
+                if str(row["retail_user_id"]) != user_id:
+                    raise RetailStoreError(self._t("会话绑定用户与待确认记录不一致",
+                                                   "The session-bound user does not match the pending record"))
+                order_row, order, user = self._action_target(connection, kind, args, user_id)
+                if self._fingerprint(order, user) != row["base_fingerprint"]:
+                    raise RetailStoreError(self._t("订单或账户在展示后已变化；请重新查询、展示并确认。",
+                                                   "The order or account changed after the details were shown; "
+                                                   "look it up, show the details, and confirm again."))
+                new_order, new_user, _ = apply_write(kind, args, order, user, self._products(connection))
                 consumed = connection.execute(
-                    "UPDATE pending_returns SET status='consumed', consumed_at=?,"
-                    " updated_at=? WHERE op_id=? AND status='displayed'",
-                    (_now(), _now(), match["op_id"]),
-                )
+                    "UPDATE pending_actions SET status='consumed', consumed_at=?, updated_at=?"
+                    " WHERE op_id=? AND status='displayed'", (_now(), _now(), op_id))
                 if consumed.rowcount != 1:
-                    raise RetailStoreError("该确认已被使用，不能重复提交")
-
-                updated_order = copy.deepcopy(order)
-                updated_order["status"] = "return requested"
-                # 与官方工具一致，订单中的 return_items 按 item_id 排序保存。
-                updated_order["return_items"] = sorted(requested)
-                updated_order["return_payment_method_id"] = resolved_id
-                result = connection.execute(
-                    "UPDATE orders SET status=?, version=version+1, payload=?"
-                    " WHERE order_id=? AND version=? AND status='delivered'",
-                    (
-                        "return requested",
-                        json.dumps(updated_order, ensure_ascii=False, sort_keys=True),
-                        normalized,
-                        order_version,
-                    ),
-                )
-                if result.rowcount != 1:
-                    raise RetailStoreError(
-                        self._t(
-                            "订单状态已变化，退货写入未生效",
-                            "The order status changed; the return was not written",
-                        )
-                    )
+                    raise RetailStoreError("该确认已被使用，不能重复执行")
+                if new_order is not None:
+                    written = connection.execute(
+                        "UPDATE orders SET status=?, version=version+1, payload=? WHERE order_id=? AND version=?",
+                        (new_order["status"], json.dumps(new_order, ensure_ascii=False, sort_keys=True),
+                         new_order["order_id"], int(order_row["version"])))
+                    if written.rowcount != 1:
+                        raise RetailStoreError(self._t("订单状态已变化，写入未生效",
+                                                       "The order changed; the write did not take effect"))
+                if new_user != user:
+                    connection.execute("UPDATE users SET zip=?, payload=? WHERE user_id=?",
+                                       (str(new_user["address"]["zip"]),
+                                        json.dumps(new_user, ensure_ascii=False, sort_keys=True), user_id))
                 connection.execute(
-                    "INSERT INTO return_operations"
-                    "(op_id, client_user_id, conv_id, retail_user_id, order_id,"
-                    " items_json, payment_method_id, amount_cents, status, created_at)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'return requested', ?)",
-                    (
-                        match["op_id"],
-                        client_user_id,
-                        conv_id,
-                        user_id,
-                        normalized,
-                        pending_row["items_json"],
-                        resolved_id,
-                        int(pending_row["amount_cents"]),
-                        _now(),
-                    ),
-                )
-                self._event(
-                    connection,
-                    client_user_id,
-                    conv_id,
-                    user_id,
-                    "return_requested",
-                    {
-                        "item_ids": requested,
-                        "payment_method_id": resolved_id,
-                        "amount_cents": int(pending_row["amount_cents"]),
-                        "confirmation_scope": decision.scope,
-                    },
-                    order_id=normalized,
-                    op_id=match["op_id"],
-                )
-        except RetailStoreError as ex:
-            self._record_rejection(
-                client_user_id,
-                conv_id,
-                str(match["retail_user_id"]),
-                normalized,
-                str(match["op_id"]),
-                str(ex),
-                {"item_ids": wanted_ids, "payment_method_id": payment_id},
-            )
+                    "INSERT INTO action_operations(op_id, client_user_id, conv_id, retail_user_id, kind,"
+                    " order_id, args_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (op_id, client_user_id, conv_id, user_id, kind, pending["order_id"],
+                     pending["args_json"], _now()))
+                payload = {"kind": kind, "args": args, "confirmation_scope": scope}
+                if kind == "return":
+                    payload.update(item_ids=args["item_ids"], payment_method_id=args["payment_method_id"],
+                                   amount_cents=pending["amount_cents"])
+                self._event(connection, client_user_id, conv_id, user_id, self.executed_event(kind), payload,
+                            order_id=pending["order_id"], op_id=op_id)
+        except (RetailStoreError, DomainError) as ex:
+            self._record_rejection(client_user_id, conv_id, str(pending["retail_user_id"]),
+                                   pending["order_id"], op_id, str(ex), {"kind": kind, "args": args})
             return {"success": False, "error": str(ex)}
-        except Exception as ex:
-            self._record_rejection(
-                client_user_id,
-                conv_id,
-                str(match["retail_user_id"]),
-                normalized,
-                str(match["op_id"]),
-                f"unexpected: {ex}",
-                {"item_ids": wanted_ids, "payment_method_id": payment_id},
-            )
-            return {
-                "success": False,
-                "error": self._t(
-                    f"退货写入失败: {ex}",
-                    f"The return could not be written: {ex}",
-                ),
-            }
+        result: Dict[str, Any] = {"success": True, "action_status": "executed", "op_id": op_id, "kind": kind,
+                                  "note": self._t("已按确认的详情执行。不代表退款已到账、邮件已发送或仓库已收货。",
+                                                  "Carried out as confirmed. This does not mean a refund has arrived, "
+                                                  "an email was sent, or the warehouse received anything.")}
+        if new_order is not None:
+            result.update(order_id=new_order["order_id"], status=new_order["status"], order=new_order)
+            if kind == "return":
+                result.update(return_items=new_order["return_items"],
+                              return_payment_method_id=new_order["return_payment_method_id"])
+        else:
+            result.update(user_id=user_id, address=new_user["address"])
+        return result
 
-        return {
-            "success": True,
-            "op_id": match["op_id"],
-            "order_id": normalized,
-            "status": "return requested",
-            "return_items": sorted(requested),
-            "return_payment_method_id": resolved_id,
-            "estimated_amount": (
-                _fmt_usd(int(match["amount_cents"]))
-                if self.language == "en"
-                else _fmt_cents(int(match["amount_cents"]))
-            ),
-            "note": self._t(
-                "已提交退货申请，订单状态为 return requested。"
-                "这不表示退款已到账、仓库已收货、邮件已发送或已创建真实工单。",
-                "The return request was submitted and the order status is "
-                "return requested. This does not mean the refund has been "
-                "issued, the warehouse received the items, an email was sent, "
-                "or a real support ticket was created.",
-            ),
-        }
+    def prepare_return(self, client_user_id: str, conv_id: str, order_id: str, item_ids: Any,
+                       payment_method_id: Any) -> Dict[str, Any]:
+        """兼容旧调用：只生成退货待确认详情。"""
+        return self.write_action(client_user_id, conv_id, "return_delivered_order_items",
+                                 {"order_id": order_id, "item_ids": item_ids, "payment_method_id": payment_method_id},
+                                 "", allow_execute=False)
 
-    @staticmethod
-    def _validate_item_request_shape(item_ids: Any) -> Tuple[List[str], int, int]:
-        """提交前的参数形状检查；完整归属与数量在事务内复查。"""
-        if not isinstance(item_ids, list):
-            raise RetailStoreError(
-                self._t("item_ids 必须是数组", "item_ids must be an array")
-            )
-        if not item_ids:
-            raise RetailStoreError(
-                self._t("item_ids 不能为空", "item_ids cannot be empty")
-            )
-        if len(item_ids) > 20:
-            raise RetailStoreError(
-                self._t(
-                    "一次最多提交 20 件退货商品",
-                    "At most 20 return items can be submitted at once",
-                )
-            )
-        result: List[str] = []
-        for item_id in item_ids:
-            if not isinstance(item_id, str) or not item_id.strip():
-                raise RetailStoreError(
-                    self._t(
-                        "item_ids 中的每一项都必须是非空字符串",
-                        "Each entry in item_ids must be a non-empty string",
-                    )
-                )
-            result.append(item_id.strip())
-        return result, len(result), len(set(result))
+    def submit_return(self, client_user_id: str, conv_id: str, order_id: str, item_ids: Any,
+                      payment_method_id: Any, user_message: str) -> Dict[str, Any]:
+        """兼容旧调用：只在已展示的同参数详情上执行，不会新建详情。"""
+        try:
+            args = canonical_args("return", {"order_id": order_id, "item_ids": item_ids,
+                                             "payment_method_id": payment_method_id})
+        except DomainError as ex:
+            return {"success": False, "error": str(ex)}
+        with closing(self._connect()) as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM pending_actions WHERE client_user_id=? AND conv_id=? AND kind='return'"
+                " AND args_json=? AND status='displayed'",
+                (client_user_id, conv_id, json.dumps(args, ensure_ascii=False, sort_keys=True))).fetchone()
+        if exists is None:
+            return {"success": False, "error": self._t(
+                "提交参数与已展示的详情不一致或尚未展示；请重新准备、展示并确认。",
+                "The submission does not match displayed details; prepare, show, and confirm them again.")}
+        return self.write_action(client_user_id, conv_id, "return_delivered_order_items", args, user_message)
+
+    def get_item_details(self, client_user_id: str, conv_id: str, item_id: str) -> Dict[str, Any]:
+        """商品规格属于公开目录。"""
+        key = str(item_id or "").strip()
+        with closing(self._connect()) as connection:
+            for product in self._products(connection).values():
+                variant = (product.get("variants") or {}).get(key)
+                if variant is not None:
+                    return {"success": True, "item": variant, "product_id": product.get("product_id"),
+                            "product_name": product.get("name")}
+        return {"success": False, "error": self._t("商品规格不存在", "Item not found")}
+
+    def list_all_product_types(self, client_user_id: str, conv_id: str) -> Dict[str, Any]:
+        with closing(self._connect()) as connection:
+            products = self._products(connection)
+        return {"success": True, "product_types": {p.get("name"): pid for pid, p in sorted(
+            products.items(), key=lambda kv: str(kv[1].get("name")))}}
 
     def _record_rejection(
         self,
@@ -2143,7 +1819,7 @@ class RetailStore:
                 client_user_id,
                 conv_id,
                 retail_user_id,
-                "return_rejected",
+                f"{self._EVENT_PREFIX.get(payload.get('kind', 'return'), 'return')}_rejected",
                 {**payload, "reason": reason},
                 order_id=order_id,
                 op_id=op_id,
@@ -2305,8 +1981,8 @@ class RetailStore:
                     "orders",
                     "products",
                     "sessions",
-                    "pending_returns",
-                    "return_operations",
+                    "pending_actions",
+                    "action_operations",
                     "retail_events",
                     "retail_support_state",
                 )

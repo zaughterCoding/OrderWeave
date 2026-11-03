@@ -5,6 +5,7 @@
 | 资源 | 用途 | 获取与许可证 |
 | --- | --- | --- |
 | τ²-bench retail | 可选的外部虚构订单种子、政策及基准环境 | [固定上游提交](https://github.com/sierra-research/tau2-bench/tree/fc0055dc4e0a316c3f83133267fbd6faaa770992)，MIT；准备工具会同时下载上游LICENSE |
+| τ²-bench retail工具语义 | `mcp_tools/retail_domain.py`移植官方retail写工具的业务规则，使数据库状态与官方评分一致 | 同上固定提交`src/tau2/domains/retail/tools.py`，MIT，Copyright (c) 2025 Sierra Research |
 | Qwen3-Embedding-0.6B | 可选本地向量编码 | [官方模型卡](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)，Apache-2.0 |
 | Qwen3-Reranker-0.6B | 可选本地相关性重排 | [官方模型卡](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B)，Apache-2.0 |
 | Python依赖 | API、工作图、MCP、存储及监控 | 依赖与版本见pyproject.toml和uv.lock，许可见各依赖发行包 |

@@ -224,11 +224,18 @@ class RetailWorkflow:
                 if analysis is not None and analysis.return_flow_action != "none"
                 else analyze_message(text, has_pending=True).return_flow_action
             )
-            if action == "cancel" or re.fullmatch(r"(?:cancel|cancel (?:the )?return)[.!]?", text, re.I):
+            call = self._call.get()
+            # 本轮已有确认判定且批准时优先视为确认，避免“确认取消订单”被当成撤回待确认详情。
+            decisions = [self.service.store.confirmation_decision(call["user"], call["conv"], context["turn"],
+                                                                  str(p["op_id"])) for p in pending if p.get("op_id")]
+            if any(d and d["approved"] for d in decisions):
+                route = "confirm"
+            elif action == "cancel" or re.fullmatch(r"(?:cancel|cancel (?:the )?return)[.!]?", text, re.I):
                 route = "cancel"
             elif action == "human" or re.search(r"\b(?:human|live agent)\b", text, re.I):
                 route = "human"
-            elif any(evaluate_confirmation(text, p, pending, language=self.service.language).approved for p in pending):
+            elif not any(decisions) and any(
+                    evaluate_confirmation(text, p, pending, language=self.service.language).approved for p in pending):
                 route = "confirm"
             else:
                 route = "revise_or_question"
@@ -245,7 +252,8 @@ class RetailWorkflow:
         call = self._call.get()
         self.service.store.cancel_pending(call["user"], call["conv"], "workflow_cancel")
         call["response"] = AgentResponse(agent_type=AgentType.RETAIL, content=(
-            "The pending return was cancelled." if self.service.language == "en" else "已取消待确认退货，旧详情不能再用于确认。"
+            "The pending request was withdrawn; nothing was changed." if self.service.language == "en"
+            else "已撤回待确认详情，未做任何修改，旧详情不能再用于确认。"
         ), success=True, latency_ms=0)
         return self._step(state, "cancel_return", pending_refs=[], phase="cancelled")
 
