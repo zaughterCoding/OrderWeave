@@ -12,6 +12,7 @@ import asyncio
 import json
 import subprocess
 import sys
+from statistics import median
 from pathlib import Path
 
 from evaluation.harness import config as cfg
@@ -78,8 +79,9 @@ async def execute(plan: dict, run_dir: Path, concurrency: int, max_trial: int = 
     async def one(task_id: str, trial: int) -> None:
         nonlocal stopped, running
         async with gate:
-            # 只为正在运行的会话预留上界，避免按并发数整体预留导致提前停止。
-            reserve = max(0.1, 1.5 * max(observed, default=0.0))
+            # 只为正在运行的会话预留；按已完成会话成本中位数的两倍估计，避免个别长会话（如攻击纠缠）
+            # 拉高预留导致提前停止。单会话失控由会话账本上限兜底。
+            reserve = max(0.05, 2 * median(observed)) if observed else 0.1
             if stopped or spent(run_dir) + reserve * (running + 1) > plan["budget_cny"]:
                 stopped = True
                 return
