@@ -32,6 +32,41 @@ def percentile(values: List[float], q: float):
     return ordered[min(len(ordered) - 1, int(round(q * (len(ordered) - 1))))]
 
 
+_NON_SYSTEM = {"user", "judge"}
+
+
+def token_stats(ran: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """被测系统（不含模拟用户与 Judge）的输入 token、缓存命中率与每轮用量。"""
+    total = hit = output = 0
+    for r in ran:
+        for stage, v in ((r.get("cost") or {}).get("stages") or {}).items():
+            if stage in _NON_SYSTEM:
+                continue
+            total += int(v.get("input_tokens") or 0)
+            hit += int(v.get("cache_read_tokens") or 0)
+            output += int(v.get("output_tokens") or 0)
+    turns = sum(int(r.get("turns") or 0) for r in ran)
+    return {"input_tokens": total, "cache_hit_rate": round(hit / total, 4) if total else None,
+            "miss_tokens_per_turn": round((total - hit) / turns, 1) if turns else None,
+            "input_tokens_per_turn": round(total / turns, 1) if turns else None,
+            "output_tokens_per_turn": round(output / turns, 1) if turns else None}
+
+
+def tag_breakdown(plan: Dict[str, Any], rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """自建数据集按场景标签汇总成功数（含未运行与无效，分母为计划会话）。"""
+    manifest = Path(plan["tasks_path"]).with_name("manifest.json")
+    if not manifest.exists():
+        return {}
+    tags = {row["id"]: row.get("tags", []) for row in json.loads(manifest.read_text(encoding="utf-8"))["tasks"]}
+    counts: Dict[str, List[int]] = {}
+    for r in rows:
+        for tag in tags.get(r["task_id"], []):
+            counts.setdefault(tag, [0, 0])
+            counts[tag][0] += 1 if r.get("success") else 0
+            counts[tag][1] += 1
+    return {tag: f"{s}/{n}" for tag, (s, n) in sorted(counts.items())}
+
+
 def summarize(run_dir: Path) -> Dict[str, Any]:
     plan = json.loads((run_dir / "plan.json").read_text(encoding="utf-8"))
     trials = int(plan["trials"])
@@ -68,6 +103,8 @@ def summarize(run_dir: Path) -> Dict[str, Any]:
                      "per_session_mean": round(sum(costs) / len(costs), 6) if costs else None,
                      "system_per_success": round(sum(system_costs) / len(success), 6) if success else None},
         "turn_latency_ms": {"p50": median(latencies) if latencies else None, "p95": percentile(latencies, 0.95)},
+        "tokens": token_stats(ran),
+        "per_tag": tag_breakdown(plan, rows),
         "per_task": {t: f"{per_task[t]}/{trials}" for t in plan["task_ids"]},
         "invalid": [{"task_id": r["task_id"], "trial": r["trial"], "termination": r["termination"],
                      "detail": str(r.get("termination_detail") or r.get("eval_error"))[:200]}
@@ -86,6 +123,8 @@ def write_report(run_dir: Path) -> Dict[str, Any]:
              f"- 安全 {summary['safety']}",
              f"- 费用 {summary['cost_cny']}",
              f"- 轮延迟 {summary['turn_latency_ms']}",
+             f"- token {summary['tokens']}",
+             f"- 场景标签 {summary['per_tag']}",
              f"- 终止 {summary['terminations']}", "", "| 任务 | 成功 |", "| --- | --- |"]
     lines += [f"| {t} | {v} |" for t, v in summary["per_task"].items()]
     (run_dir / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
