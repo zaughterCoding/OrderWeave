@@ -18,6 +18,7 @@ OrderWeave 将意图识别、按需角色协作、订单工具和可恢复状态
 - **分层识别与知识检索**：规则、LLM 与可选本地语义门控；可选 Dense + BM25 + RRF 融合检索及 Qwen 本地重排。
 - **统一 Agent 循环与钩子**：单 Agent 与多 Agent 角色共用一条工具循环；未知结果、跨轮执行、主执行权限、确认拒绝等策略以钩子插件挂入，每次模型与工具调用记录为可回放的追踪片段。
 - **上下文编排**：完整消息日志（含工具调用与结果）只追加；稳定前缀在前、本轮状态快照在尾，利于供应商前缀缓存；超出 token 预算时持久化地省略旧工具结果并生成带轮次锚点的摘要，token 换算按实际 usage 校准。
+- **按需 Skill**：固定政策的各动作章节（原文逐字）与操作要点组成 Skill，提示词只列名称与说明，Agent 通过 `load_skill` 取正文；写工具绑定 Skill，未加载即被钩子拒绝。
 - **可观察性**：按阶段记录工具轨迹、路由、守卫和预算；可选 Redis／ChromaDB 分层记忆与 Prometheus 监控。
 
 ## 架构
@@ -58,6 +59,7 @@ flowchart TD
 | 发布守卫 | 对照本轮本人订单、清单、金额和事件；无法核实则具体澄清 | 有限格式校验，不是完整自由文本语义审计 |
 | 无进展保护 | 同一事实下连续两轮守卫回退明确失败；新事实或正常通过可恢复 | 失败仍保留为失败，不通过截短会话提高分数 |
 | 上下文编排 | 完整消息日志→各角色按自身工具集渲染；状态快照随用户消息写入日志；预算超限时先把较早轮次的工具结果替换为可重查引用，再生成锚定摘要，压缩状态持久化 | 历史与摘要只供理解，不构成确认授权；`RETAIL_CONTEXT_MODE=window`保留旧两轮窗口作对照 |
+| 按需 Skill | 政策按章节拆分：通用规则常驻，取消／修改待处理订单／退货／换货章节与操作要点放入 `skills/retail-*`；拆分可逐字拼回原文 | Skill 只提供政策与流程文本，不能授权写入；`RETAIL_SKILL_MODE=inline`保留整份政策常驻 |
 | Agent 循环钩子 | pre_model／pre_tool／post_tool／on_tool_error／stop_response；零售策略为独立插件，旧客服角色经适配器沿用原方法 | 钩子只校验不变量，不能授权写入 |
 | 记忆 | 可选Redis工作记忆与摘要、ChromaDB情景记忆和画像；独立SQLite保存有限可见对话 | 画像默认关闭；历史不提供身份或提交授权 |
 
@@ -164,6 +166,7 @@ Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -ContentType "applicat
 | `RETAIL_AGENT_MODE` | `multi`；可设`single` |
 | `RETAIL_WORKFLOW_MODE` | `langgraph`；可设`legacy` |
 | `RETAIL_CONTEXT_MODE` | `compiled`（完整消息日志＋上下文编排）；可设`window`（旧两轮窗口） |
+| `RETAIL_SKILL_MODE` | `on_demand`（按需 Skill 并绑定写工具）；可设`inline`（整份政策常驻） |
 | `RETAIL_CONTEXT_BUDGET_TOKENS` | `32000`；历史超过该估计值时触发持久化压缩 |
 | `RETAIL_ENABLE_MEMORY` | 模板为`false`；启用需Redis、ChromaDB及本地记忆编码缓存 |
 | `RETAIL_ENABLE_KNOWLEDGE` | 模板为`false`；启用需与现有校验约定一致的本地知识资料 |

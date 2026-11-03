@@ -138,7 +138,8 @@ async def run_session(args: argparse.Namespace) -> Dict[str, Any]:
         enable_memory=profile.enable_memory, enable_knowledge=False, language="en",
         workflow_mode=profile.workflow_mode, checkpoint_path=case_dir / "checkpoints.sqlite",
         semantic_routing=False, ledger_settlement_policy=model["settlement_policy"],
-        model_thinking=profile.thinking, context_mode=profile.context_mode)
+        model_thinking=profile.thinking, context_mode=profile.context_mode,
+        skill_mode=profile.skill_mode)
     runtime = build_retail_runtime(runtime_config)
     await runtime.start()
     user_client = runtime.client.for_stage("user")

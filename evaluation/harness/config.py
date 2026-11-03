@@ -58,6 +58,8 @@ class Profile:
     thinking: str = "disabled"
     # window 为旧两轮窗口；compiled 为 S1 完整消息日志＋上下文编排。
     context_mode: str = "window"
+    # inline 为整份政策常驻；on_demand 为 S2b 按需 Skill。
+    skill_mode: str = "inline"
 
 
 PROFILES = {
@@ -65,6 +67,8 @@ PROFILES = {
     "legacy-single": Profile("legacy-single", agent_mode="single"),
     "ctx-multi": Profile("ctx-multi", context_mode="compiled"),
     "ctx-single": Profile("ctx-single", agent_mode="single", context_mode="compiled"),
+    "skill-multi": Profile("skill-multi", context_mode="compiled", skill_mode="on_demand"),
+    "skill-single": Profile("skill-single", agent_mode="single", context_mode="compiled", skill_mode="on_demand"),
 }
 
 

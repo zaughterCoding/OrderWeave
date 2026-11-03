@@ -104,7 +104,8 @@ class SkillManager:
         for path in self._discover_files(self.root_dir):
             try:
                 skill = self._load_file(path)
-                if skill is not None:
+                # 按需加载的零售 Skill 由 core.retail_skills 管理，不参与关键词注入。
+                if skill is not None and skill.agents != ["retail_on_demand"]:
                     loaded.append(skill)
             except Exception as ex:
                 msg = f"{path}: {ex}"

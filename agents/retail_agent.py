@@ -305,8 +305,10 @@ class RetailService:
         confirmation_client: Any = None,
         confirmation_model: str = "",
         context_engine: Any = None,
+        skill_library: Any = None,
     ):
         self.store = store
+        self.skill_library = skill_library
         # 为空时沿用两轮可见窗口（消融对照）；否则由完整消息日志编排上下文。
         self.context_engine = context_engine
         self.agent = agent
@@ -538,6 +540,9 @@ class RetailService:
                 "return_flow": (support_record or {}).get("return_flow", {}),
             }, pending_brief),
         )
+        if self.skill_library is not None:
+            request.retail_skills = self.skill_library
+            request.loaded_skills = self._loaded_skills(client_user_id, conv_id)
         if engine is not None:
             compaction = await engine.prepare(client_user_id, conv_id, turn)
             state: Dict[str, Any] = {"turn": turn, "bound_user_id": bound_user_id,
@@ -812,6 +817,22 @@ class RetailService:
         else:
             context["event"] = event
         return result
+
+    def _loaded_skills(self, client_user_id, conv_id) -> List[str]:
+        """本会话此前成功加载过的 Skill；只来自消息日志中的真实工具结果。"""
+        names: List[str] = []
+        for row in self.store.conversation_log(client_user_id, conv_id):
+            if row["kind"] != "tool_result":
+                continue
+            for block in row["content"]:
+                try:
+                    value = json.loads(block.get("content") or "{}")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(value, dict) and value.get("success") and value.get("skill") and "playbook" in value:
+                    if value["skill"] not in names:
+                        names.append(value["skill"])
+        return names
 
     def _order_evidence(self, client_user_id, conv_id, text, bound_user_id, pending):
         """回复中提到的本人订单以业务库当前记录作为核对证据。

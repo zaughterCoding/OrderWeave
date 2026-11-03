@@ -423,6 +423,8 @@ class RetailRuntimeConfig:
     # compiled：完整消息日志＋上下文编排；window：旧两轮可见窗口（消融对照）。
     context_mode: str = "compiled"
     context_budget_tokens: int = 32000
+    # on_demand：政策动作章节拆为按需加载的 Skill 并绑定写工具；inline：整份政策常驻提示词。
+    skill_mode: str = "on_demand"
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -547,6 +549,7 @@ class RetailRuntimeConfig:
             semantic_model_path=_env_optional_path("RETAIL_SEMANTIC_MODEL_PATH"),
             model_thinking=_env_text("RETAIL_MODEL_THINKING").lower(),
             context_mode=_env_text("RETAIL_CONTEXT_MODE", "compiled").lower(),
+            skill_mode=_env_text("RETAIL_SKILL_MODE", "on_demand").lower(),
             context_budget_tokens=max(2000, int(_env_text("RETAIL_CONTEXT_BUDGET_TOKENS", "32000"))),
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
@@ -631,6 +634,10 @@ class RetailRuntime:
                     self.tool_manager,
                     support_enabled=self.config.support_enabled,
                 )
+            if self.service.skill_library is not None:
+                # load_skill 在主进程本地执行，不经 MCP；只返回政策与流程文本。
+                spec = self.service.skill_library.tool_spec()
+                tools[spec.name] = spec
             self.agent.set_shared_tools(tools)
             if self.service.workflow is not None:
                 await self.service.workflow.start()
@@ -886,6 +893,14 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         _register_knowledge_tool(tool_manager, knowledge_base)
 
     policy_text = config.policy_path.read_text(encoding="utf-8")
+    if config.skill_mode not in {"on_demand", "inline"}:
+        raise ValueError("RETAIL_SKILL_MODE 只能是 on_demand 或 inline: " + config.skill_mode)
+    skill_library = None
+    if config.skill_mode == "on_demand":
+        from core.retail_skills import RetailSkillLibrary
+
+        skill_library = RetailSkillLibrary(policy_text)
+        policy_text = skill_library.base_policy()
     skill_manager = None
     if config.agent_mode == "multi":
         from core.retail_semantic_router import DEFAULT_MODEL, RetailSemanticRouter
@@ -943,7 +958,8 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
             model=config.model,
             store=store,
             tool_manager=tool_manager,
-            skill_manager=skill_manager,
+            # 按需 Skill 模式下旧关键词注入的中文 Skill 不再使用。
+            skill_manager=None if skill_library is not None else skill_manager,
             policy_text=policy_text,
             policy_source=(
                 f"{config.policy_path} "
@@ -982,6 +998,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         confirmation_client=client.for_stage("confirm", count_turn=True),
         confirmation_model=config.model,
         context_engine=context_engine,
+        skill_library=skill_library,
     )
 
     return RetailRuntime(

@@ -176,14 +176,14 @@ class RetailRoleMixin:
         return not req.retail_primary or req.retail_primary == self.agent_type.value
 
     def _supporting_read_only(self) -> set[str]:
-        allowed = set(RETAIL_READ_ONLY_TOOLS)
+        allowed = set(RETAIL_READ_ONLY_TOOLS) | {"load_skill"}
         if getattr(self, "support_enabled", False):
             # 支持模式辅助商品角色仍需可用的适用检索。
             allowed.add("search_knowledge_base")
         return allowed
 
     def _tools_for_request(self, req: Request) -> Dict[str, Any]:
-        allowed = set(self.retail_allowed_tools)
+        allowed = set(self.retail_allowed_tools) | {"load_skill"}
         if not self._is_primary(req):
             allowed &= self._supporting_read_only()
         return {

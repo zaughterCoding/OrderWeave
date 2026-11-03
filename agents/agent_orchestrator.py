@@ -194,6 +194,9 @@ class Request:
     context_view: Optional[Any] = None
     transcript: Optional[List[Dict[str, Any]]] = None
     spans: Optional[List[Dict[str, Any]]] = None
+    # 按需 Skill：技能库与本会话此前已加载的 Skill 名称（来自消息日志）。
+    retail_skills: Optional[Any] = None
+    loaded_skills: List[str] = field(default_factory=list)
 
 
 @dataclass

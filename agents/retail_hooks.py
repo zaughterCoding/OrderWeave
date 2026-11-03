@@ -95,15 +95,43 @@ class WriteStateHook(LoopHook):
             ctx.state["handoff"] = True
 
 
+class SkillGateHook(LoopHook):
+    """写工具绑定 Skill：本会话尚未加载对应 Skill 时拒绝调用，确保执行前读过该动作的政策原文。"""
+
+    name = "skill_gate"
+
+    def pre_tool(self, ctx, name, args) -> Optional[str]:
+        library = getattr(ctx.req, "retail_skills", None)
+        if library is None:
+            return None
+        bound = library.bound_skills(name)
+        loaded = set(getattr(ctx.req, "loaded_skills", None) or ()) | set(ctx.state.get("loaded_skills") or ())
+        if not bound or loaded & set(bound):
+            return None
+        from core.retail_skills import SKILL_TOOL
+
+        return (f"Call {SKILL_TOOL} with name '{bound[0]}' first to read this action's policy and procedure; "
+                "nothing was changed." if _en(ctx) else
+                f"请先调用 {SKILL_TOOL}（name='{bound[0]}'）阅读该动作的政策与流程；本次未做任何修改。")
+
+    def post_tool(self, ctx, name, args, result) -> None:
+        from core.retail_skills import SKILL_TOOL
+
+        if name == SKILL_TOOL and isinstance(result, dict) and result.get("success"):
+            loaded = ctx.state.setdefault("loaded_skills", [])
+            if result["skill"] not in loaded:
+                loaded.append(result["skill"])
+
+
 def single_agent_hooks():
-    return [SameTurnExecutionHook(), ConfirmationStopHook()]
+    return [SkillGateHook(), SameTurnExecutionHook(), ConfirmationStopHook()]
 
 
 def role_hooks():
     # 顺序即拒绝优先级：未知结果最先，其次跨轮执行，最后角色权限。
-    return [UnknownResultHook(), SameTurnExecutionHook(), PrimaryOnlyHook(),
+    return [UnknownResultHook(), SameTurnExecutionHook(), PrimaryOnlyHook(), SkillGateHook(),
             ConfirmationStopHook(), WriteStateHook()]
 
 
 __all__ = ["UnknownResultHook", "SameTurnExecutionHook", "PrimaryOnlyHook", "ConfirmationStopHook",
-           "WriteStateHook", "single_agent_hooks", "role_hooks"]
+           "WriteStateHook", "SkillGateHook", "single_agent_hooks", "role_hooks"]
