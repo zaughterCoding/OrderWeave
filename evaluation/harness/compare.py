@@ -2,7 +2,8 @@
 
 用法：
   uv run python -m evaluation.harness.compare --before s1-before-tau --after s1-after-tau
-未运行或无效会话按失败计入（与报告的“成功／计划”口径一致）；两边都需要同一任务集。
+未运行或无效会话按失败计入（与报告的“成功／计划”口径一致）；只比较两边共有的任务与试验号，
+因此减半套件可直接与上一阶段的完整运行配对（paired 中 before_rate／after_rate 为共有部分的成功率）。
 """
 from __future__ import annotations
 
@@ -41,7 +42,10 @@ def paired_delta(before: Dict[str, Dict[int, bool]], after: Dict[str, Dict[int, 
     means = sorted(sum(rng.choice(diffs) for _ in diffs) / len(diffs) for _ in range(rounds))
     flips = {"fixed": sum(1 for t in tasks for n in before[t] if n in after[t] and after[t][n] and not before[t][n]),
              "broken": sum(1 for t in tasks for n in before[t] if n in after[t] and before[t][n] and not after[t][n])}
-    return {"tasks": len(diffs), "delta": round(sum(diffs) / len(diffs), 4),
+    rate = lambda side: round(sum(side[t][n] for t in tasks for n in side[t] if n in before[t] and n in after[t])  # noqa: E731
+                              / max(1, sum(1 for t in tasks for n in before[t] if n in after[t])), 4)
+    return {"tasks": len(diffs), "before_rate": rate(before), "after_rate": rate(after),
+            "delta": round(sum(diffs) / len(diffs), 4),
             "ci95": [round(means[int(0.025 * rounds)], 4), round(means[int(0.975 * rounds) - 1], 4)], **flips}
 
 

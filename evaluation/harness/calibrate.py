@@ -3,6 +3,7 @@
   uv run python -m evaluation.harness.calibrate export --runs s0-base-b s0-base-c --n 50
   （在 calibration.csv 的 human 列填 1／0 后）
   uv run python -m evaluation.harness.calibrate score
+  或导出盲标文件交独立标注者：calibrate blind → 填 label → calibrate score --labels <文件>
 人工标注只看对话本身判断断言是否成立，不参考 judge 列。
 """
 from __future__ import annotations
@@ -36,9 +37,33 @@ def export(runs, n: int, seed: int) -> None:
     print(f"导出 {min(n, len(rows))}/{len(rows)} 条到 {OUT}")
 
 
-def score() -> None:
+BLIND = cfg.RUNS / "calibration-blind.csv"
+
+
+def blind() -> None:
+    """导出不含 judge 列的盲标文件，供独立标注者（人或另一模型家族）填写 label。"""
     with OUT.open(encoding="utf-8-sig") as stream:
-        rows = [r for r in csv.DictReader(stream) if r["human"].strip() in {"0", "1"}]
+        rows = list(csv.DictReader(stream))
+    if BLIND.exists():
+        raise SystemExit(f"{BLIND} 已存在，避免覆盖已有标注")
+    with BLIND.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=["row", "assertion", "dialogue", "label", "reason"])
+        writer.writeheader()
+        for i, r in enumerate(rows):
+            writer.writerow({"row": i, "assertion": r["assertion"], "dialogue": r["dialogue"], "label": "", "reason": ""})
+    print(f"导出 {len(rows)} 条到 {BLIND}")
+
+
+def score(labels: str = "") -> None:
+    with OUT.open(encoding="utf-8-sig") as stream:
+        rows = list(csv.DictReader(stream))
+    if labels:
+        # 盲标文件按 row 序号对回原行，标注写入 human 口径参与计算。
+        with open(labels, encoding="utf-8-sig") as stream:
+            marks = {int(m["row"]): m["label"].strip() for m in csv.DictReader(stream)}
+        for i, r in enumerate(rows):
+            r["human"] = marks.get(i, "")
+    rows = [r for r in rows if r["human"].strip() in {"0", "1"}]
     agree = sum(r["human"].strip() == r["judge"] for r in rows)
     pos = [r for r in rows if r["human"].strip() == "1"]
     neg = [r for r in rows if r["human"].strip() == "0"]
@@ -54,9 +79,16 @@ def main() -> int:
     e.add_argument("--runs", nargs="+", required=True)
     e.add_argument("--n", type=int, default=50)
     e.add_argument("--seed", type=int, default=11)
-    sub.add_parser("score")
+    sub.add_parser("blind")
+    sc = sub.add_parser("score")
+    sc.add_argument("--labels", default="", help="盲标文件路径（含 row 与 label 列）")
     args = parser.parse_args()
-    export(args.runs, args.n, args.seed) if args.cmd == "export" else score()
+    if args.cmd == "export":
+        export(args.runs, args.n, args.seed)
+    elif args.cmd == "blind":
+        blind()
+    else:
+        score(args.labels)
     return 0
 
 

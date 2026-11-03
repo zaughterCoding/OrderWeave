@@ -61,7 +61,33 @@ class Suite:
         return hashlib.sha256(data).hexdigest()
 
 
+_GENERIC_TAGS = {"b", "c", "dev", "holdout", "compatible"}
+HALF_SEED = "20261103"
+
+
+def half(ids: List[str], tags: dict) -> List[str]:
+    """按场景类型分层、固定哈希排序，每组取一半（向上取整）；只依赖任务定义。"""
+    groups: dict = {}
+    for task_id in ids:
+        # 按首个非通用标签（扰动类型／攻击类型）分层，组数少、每组取半后总量接近一半。
+        key = next((t for t in tags.get(task_id, []) if t not in _GENERIC_TAGS), "")
+        groups.setdefault(key, []).append(task_id)
+    chosen: List[str] = []
+    for key in sorted(groups):
+        ranked = sorted(groups[key], key=lambda t: hashlib.sha256((HALF_SEED + t).encode()).hexdigest())
+        chosen += ranked[: (len(ranked) + 1) // 2]
+    return [t for t in ids if t in set(chosen)]
+
+
 def load_suite(name: str) -> Suite:
+    """套件名可加 ``@half`` 后缀，取分层固定的一半任务（减半评测）。"""
+    if name.endswith("@half"):
+        suite = load_suite(name[: -len("@half")])
+        tags = {}
+        manifest = suite.tasks_path.with_name("manifest.json")
+        if manifest.exists():
+            tags = {row["id"]: row.get("tags", []) for row in json.loads(manifest.read_text(encoding="utf-8"))["tasks"]}
+        return Suite(name, suite.tasks_path, half(suite.task_ids, tags))
     if name in {"tau-core", "tau-base", "tau-mini"}:
         tasks = json.loads(cfg.TAU_TASKS.read_text(encoding="utf-8"))
         ids = [str(t["id"]) for t in tasks]
