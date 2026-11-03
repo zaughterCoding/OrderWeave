@@ -12,6 +12,7 @@ BASE_URL = f"https://raw.githubusercontent.com/sierra-research/tau2-bench/{REVIS
 ASSETS = {
     "db.json": ("data/tau2/domains/retail/db.json", "413a65160adbdb5fde0ffc0015c49b6d70250b10c18128de169b597af7766765"),
     "policy.md": ("data/tau2/domains/retail/policy.md", "2c9652afbce57d6e087768d37cda64d31c53d50b3e3225cfdb791bac66466467"),
+    "tasks.json": ("data/tau2/domains/retail/tasks.json", "8e03ebce7901bd6218e7a7dc3105faa9324091a68058f7fe61c65262868812e8"),
     "LICENSE": ("LICENSE", "e67c5aa0074dfcaefd3c3a1aedb94cb539234aecd15d5a972574e3200e6252fe"),
 }
 
@@ -44,7 +45,7 @@ def prepare(directory: Path, *, download: bool = False) -> dict[str, str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--directory", type=Path, default=Path("data/retail-assets"))
-    parser.add_argument("--download", action="store_true", help="明确授权从固定上游提交下载三个文件")
+    parser.add_argument("--download", action="store_true", help="明确授权从固定上游提交下载四个文件")
     args = parser.parse_args()
     for name, digest in prepare(args.directory, download=args.download).items():
         print(f"{name}: {digest}")

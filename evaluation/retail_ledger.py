@@ -594,13 +594,20 @@ class _BudgetedMessages:
         ledger: RetailLedger,
         stage: str,
         count_turn: bool = False,
+        thinking: Optional[Dict[str, Any]] = None,
     ):
         self._inner = inner
         self._ledger = ledger
         self._stage = stage
         self._count_turn = count_turn
+        self._thinking = thinking
 
     async def create(self, **kwargs: Any) -> Any:
+        # 统一的思考设置在预留前写入请求，账本按实际发送内容计费；调用方显式设置时不覆盖。
+        if self._thinking is not None:
+            extra = dict(kwargs.get("extra_body") or {})
+            extra.setdefault("thinking", self._thinking)
+            kwargs["extra_body"] = extra
         # 先检查单轮请求上限，再预留费用；被拒绝时不发出请求。
         if self._count_turn:
             self._ledger.consume_turn_request(self._stage)
@@ -632,13 +639,15 @@ class BudgetedClient:
         ledger: RetailLedger,
         stage: str,
         count_turn: bool = False,
+        thinking: Optional[Dict[str, Any]] = None,
     ):
         self._inner = inner
         self._ledger = ledger
         self.stage = stage
         self.count_turn = count_turn
+        self.thinking = thinking
         self.messages = _BudgetedMessages(
-            inner.messages, ledger, stage, count_turn=count_turn
+            inner.messages, ledger, stage, count_turn=count_turn, thinking=thinking
         )
 
     def for_stage(
@@ -650,6 +659,7 @@ class BudgetedClient:
             self._ledger,
             stage,
             count_turn=self.count_turn if count_turn is None else count_turn,
+            thinking=self.thinking,
         )
 
     async def aclose(self) -> None:
@@ -668,13 +678,14 @@ def build_budgeted_client(
     ledger: RetailLedger,
     stage: str,
     count_turn: bool = False,
+    thinking: Optional[Dict[str, Any]] = None,
 ) -> BudgetedClient:
-    """创建禁用 SDK 隐式重试的真实客户端。"""
+    """创建禁用 SDK 隐式重试的真实客户端；thinking 为供应商扩展参数，统一下发到所有阶段。"""
     from anthropic import AsyncAnthropic
 
     kwargs: Dict[str, Any] = {"api_key": api_key, "max_retries": 0}
     if base_url:
         kwargs["base_url"] = base_url
     return BudgetedClient(
-        AsyncAnthropic(**kwargs), ledger, stage, count_turn=count_turn
+        AsyncAnthropic(**kwargs), ledger, stage, count_turn=count_turn, thinking=thinking
     )

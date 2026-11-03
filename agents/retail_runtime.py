@@ -416,6 +416,10 @@ class RetailRuntimeConfig:
     checkpoint_path: Optional[Path] = None
     semantic_routing: bool = True
     semantic_model_path: Optional[Path] = None
+    # 评测按供应商缓存分价结算；生产默认沿用统一单价上界。
+    ledger_settlement_policy: str = "legacy"
+    # 供应商思考模式：disabled 时所有阶段请求统一关闭，空值沿用供应商默认。
+    model_thinking: str = ""
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -538,6 +542,7 @@ class RetailRuntimeConfig:
             checkpoint_path=_env_optional_path("RETAIL_CHECKPOINT_PATH"),
             semantic_routing=_env_bool("RETAIL_SEMANTIC_ROUTING", True),
             semantic_model_path=_env_optional_path("RETAIL_SEMANTIC_MODEL_PATH"),
+            model_thinking=_env_text("RETAIL_MODEL_THINKING").lower(),
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
             embedding_model=_env_text("RETAIL_EMBEDDING_MODEL", "qwen").lower(),
@@ -765,6 +770,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         output_price_cny_per_mtok=config.output_price_cny_per_mtok,
         run_id=config.run_id,
         model=config.model,
+        settlement_policy=config.ledger_settlement_policy,
     )
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
@@ -774,6 +780,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         base_url=config.base_url or None,
         ledger=ledger,
         stage="agent",
+        thinking={"type": config.model_thinking} if config.model_thinking in {"enabled", "disabled"} else None,
     )
 
     store = RetailStore(

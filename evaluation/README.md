@@ -39,6 +39,30 @@ JSONL每行一个对象。下面是字段规范，不附完整样本或gold。
 5. 任务评测每会话独立数据库和checkpoint；若每题重复三次，预先锁定题目与顺序。保留失败、无效、未运行及中断前缀，合并时按槽位唯一，不挑最佳结果。
 6. 输出只发布汇总结果及限制。原始记录、数据库、私有数据与费用凭证继续留本地。
 
+## 一条命令的评测 harness
+
+`evaluation/harness/` 以生产运行时构造被测系统，复用官方 τ² UserSimulator 与 DB／NL 评分。每个会话在独立子进程中运行，使用独立业务库、checkpoint 与费用账本；同一 run-id 重复执行只补跑缺结果的会话。
+
+准备：
+
+1. 独立 τ 环境：`uv venv .venv-tau --python 3.12`，再按固定提交安装 `tau2`（`git+https://github.com/sierra-research/tau2-bench@fc0055dc4e0a316c3f83133267fbd6faaa770992`）。
+2. τ 数据目录需含 `tau2/domains/retail/{db.json,policy.md,tasks.json}`，用 `HARNESS_TAU_DATA` 指定；可用 `prepare_assets --download` 获取这三个文件后按此结构放置。
+3. `.env` 配置模型凭证；harness 以 `.env` 覆盖外层环境变量，并移除外层 `ANTHROPIC_AUTH_TOKEN`。
+
+```powershell
+# τ 能力内 14 题各 3 次，全局预算 5 元
+uv run python -m evaluation.harness.run --suite tau-core --trials 3 --run-id my-run --budget-cny 5
+# 生成并在官方环境校验英文多轮集与安全集（固定种子，生成后不覆盖）
+uv run python -m evaluation.harness.build_datasets
+.venv-tau/Scripts/python.exe evaluation/harness/validate_tasks.py evaluation/data/harness/b-multiturn/tasks.json
+# 运行数据集子集：数据集名:标签（dev／holdout／compatible／扰动类型）
+uv run python -m evaluation.harness.run --suite b-multiturn:holdout --trials 3 --run-id my-b
+# 只重新汇总
+uv run python -m evaluation.harness.run --run-id my-run --report-only
+```
+
+报告给出计划／运行／有效／成功、官方定义的 pass^k、按任务 bootstrap 的 pass^1 95% 区间、写入安全（未展示即写入、重复写入）、按系统／模拟用户／Judge 分列的费用和轮延迟 P50／P95。缺结果的会话计入分母；无效会话不算成功并单列原因。`calibrate.py` 导出断言判定供人工标注并计算 Judge 一致率。
+
 ## τ-retail与官方组件
 
 历史任务来源为[τ²-bench固定提交](https://github.com/sierra-research/tau2-bench/tree/fc0055dc4e0a316c3f83133267fbd6faaa770992)，只核定能力范围内的13道零售题，不是全量τ成绩。若开展新实验，请自行获取官方任务和许可证，依据上游说明准备独立环境，不能用仓库历史数字代替新执行。

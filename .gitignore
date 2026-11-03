@@ -19,9 +19,9 @@
 !/core/
 /core/*
 !/core/*.py
-!/mcp/
-/mcp/*
-!/mcp/*.py
+!/mcp_tools/
+/mcp_tools/*
+!/mcp_tools/*.py
 !/memory/
 /memory/*
 !/memory/*.py
@@ -49,6 +49,9 @@
 !/evaluation/embedding_requirements.lock
 !/evaluation/README.md
 !/evaluation/RESULTS.md
+!/evaluation/harness/
+/evaluation/harness/*
+!/evaluation/harness/*.py
 !/tests/
 /tests/*
 !/tests/conftest.py
@@ -58,6 +61,7 @@
 !/tests/test_monitor_eval.py
 !/tests/test_retrieval.py
 !/tests/test_skills.py
+!/tests/test_harness.py
 !/tests/test_retail_ledger.py
 !/tests/test_retail_metrics.py
 !/tests/test_json_stage_budgets.py
