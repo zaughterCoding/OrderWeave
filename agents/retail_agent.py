@@ -680,6 +680,7 @@ class RetailService:
             pending_before=pending_before, pending_after=pending_after, turn=turn,
             bound_user_id=current_bound_user,
             session_events=self.store.list_events(client_user_id, conv_id),
+            user_order_ids=self._user_order_ids(client_user_id, conv_id, message),
             language=self.language,
         )
         guarded.record["facts_read_ms"] = round(facts_read_ms, 3)
@@ -863,6 +864,17 @@ class RetailService:
                     if value["skill"] not in names:
                         names.append(value["skill"])
         return names
+
+    def _user_order_ids(self, client_user_id, conv_id, message) -> set:
+        """本会话用户消息中出现过的订单号（含本轮），只用于允许复述，不作为订单事实证据。"""
+        from agents.retail_response_guard import _ORDER_ID, _order_id
+
+        texts = [message] + [h["content"] for h in self.store.visible_history(client_user_id, conv_id)
+                             if h.get("role") == "user"]
+        for row in self.store.conversation_log(client_user_id, conv_id):
+            if row["kind"] == "user":
+                texts += [b.get("text", "") for b in row["content"] if b.get("type") == "text"]
+        return {_order_id(m.group()) for text in texts for m in _ORDER_ID.finditer(text or "")}
 
     def _order_evidence(self, client_user_id, conv_id, text, bound_user_id, pending):
         """回复中提到的本人订单以业务库当前记录作为核对证据。

@@ -191,6 +191,7 @@ def constrain_response(
     pending_before: list[dict[str, Any]], pending_after: list[dict[str, Any]],
     turn: int, bound_user_id: str | None, language: str = "zh",
     session_events: list[dict[str, Any]] | None = None,
+    user_order_ids: set[str] | None = None,
 ) -> GuardedResponse:
     """输入仅限服务层选出的同会话本轮事实；开放语义仍需独立复核。"""
     started = time.perf_counter()
@@ -397,6 +398,8 @@ def constrain_response(
                       "source": "tool_trace", "trace_index": index, "status": order["status"]})
     known_ids = set(orders) | {p["order_id"] for p in pending_after + pending_before}
     known_ids |= {e["order_id"] for e in submitted}
+    # 复述用户自己给出的订单号（例如拒绝访问他人订单时）不泄露信息；其状态与金额仍按订单记录核对。
+    known_ids |= set(user_order_ids or ())
     units = _semantic_units(text)
     invalid_ids = {"#" + m.group().lstrip("#").upper()
                    for unit in units for m in _fact_matches(_ORDER_ID, unit)} - known_ids
