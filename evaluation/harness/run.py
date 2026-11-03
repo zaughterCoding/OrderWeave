@@ -40,6 +40,12 @@ def make_plan(args, run_dir: Path) -> dict:
     cfg.load_env()
     suite = load_suite(args.suite)
     task_ids = suite.task_ids[: args.limit] if args.limit else suite.task_ids
+    if args.only:
+        wanted = [t.strip() for t in args.only.split(",") if t.strip()]
+        missing = set(wanted) - set(suite.task_ids)
+        if missing:
+            raise SystemExit(f"套件中没有这些任务: {sorted(missing)}")
+        task_ids = wanted
     plan = {"run_id": args.run_id, "suite": args.suite, "tasks_path": str(suite.tasks_path),
             "suite_digest": suite.digest(), "task_ids": task_ids, "trials": args.trials,
             "profile": args.profile, "model": cfg.model_settings()["model"], "budget_cny": args.budget_cny,
@@ -58,22 +64,26 @@ def make_plan(args, run_dir: Path) -> dict:
     return plan
 
 
-async def execute(plan: dict, run_dir: Path, concurrency: int) -> None:
-    pending = [(t, n) for t in plan["task_ids"] for n in range(1, plan["trials"] + 1)
+async def execute(plan: dict, run_dir: Path, concurrency: int, max_trial: int = 0) -> None:
+    last = min(plan["trials"], max_trial) if max_trial else plan["trials"]
+    pending = [(t, n) for n in range(1, last + 1) for t in plan["task_ids"]
                if not (run_dir / "sessions" / t / f"trial-{n}" / "result.json").exists()]
     logs = run_dir / "logs"
     logs.mkdir(exist_ok=True)
     gate = asyncio.Semaphore(concurrency)
     stopped = False
     observed: list = []
+    running = 0
 
     async def one(task_id: str, trial: int) -> None:
-        nonlocal stopped
+        nonlocal stopped, running
         async with gate:
+            # 只为正在运行的会话预留上界，避免按并发数整体预留导致提前停止。
             reserve = max(0.1, 1.5 * max(observed, default=0.0))
-            if stopped or spent(run_dir) + reserve * concurrency > plan["budget_cny"]:
+            if stopped or spent(run_dir) + reserve * (running + 1) > plan["budget_cny"]:
                 stopped = True
                 return
+            running += 1
             case_dir = run_dir / "sessions" / task_id / f"trial-{trial}"
             with open(logs / f"{task_id}-t{trial}.log", "ab") as log:
                 proc = await asyncio.create_subprocess_exec(
@@ -82,6 +92,7 @@ async def execute(plan: dict, run_dir: Path, concurrency: int) -> None:
                     "--profile", plan["profile"], "--run-id", plan["run_id"], "--case-dir", str(case_dir),
                     cwd=str(cfg.ROOT), stdout=log, stderr=log)
                 code = await proc.wait()
+            running -= 1
             result = case_dir / "result.json"
             status = json.loads(result.read_text(encoding="utf-8")) if result.exists() else None
             if status:
@@ -104,6 +115,8 @@ def main() -> int:
     parser.add_argument("--budget-cny", type=float, default=5.0)
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--limit", type=int, default=0, help="只取套件前 N 题，用于试点")
+    parser.add_argument("--only", default="", help="逗号分隔的任务 ID，用于冒烟或定向复验")
+    parser.add_argument("--max-trial", type=int, default=0, help="本次只执行前 N 次试验，计划不变，可稍后续跑")
     parser.add_argument("--report-only", action="store_true")
     args = parser.parse_args()
     run_dir = cfg.RUNS / args.run_id
@@ -111,7 +124,7 @@ def main() -> int:
         if not args.suite:
             parser.error("需要 --suite")
         plan = make_plan(args, run_dir)
-        asyncio.run(execute(plan, run_dir, args.concurrency))
+        asyncio.run(execute(plan, run_dir, args.concurrency, args.max_trial))
     summary = write_report(run_dir)
     print(json.dumps({k: summary[k] for k in ("planned", "ran", "valid", "success", "pass_hat_k",
                                               "pass1_ci95", "safety", "cost_cny")}, ensure_ascii=False))

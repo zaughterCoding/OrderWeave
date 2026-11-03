@@ -24,7 +24,8 @@ POLICY_PATH = _path("HARNESS_POLICY_PATH", TAU_RETAIL_DIR / "policy.md")
 TAU_PYTHON = _path("HARNESS_TAU_PYTHON", ROOT / ".venv-tau" / "Scripts" / "python.exe")
 USER_WORKER = ROOT / "evaluation" / "tau_user_worker.py"
 EVAL_WORKER = ROOT / "evaluation" / "tau_eval_worker.py"
-DATASETS = ROOT / "evaluation" / "data" / "harness"
+DATASETS = _path("HARNESS_DATASETS", ROOT / "evaluation" / "data" / "harness")
+ENV_FILE = _path("HARNESS_ENV_FILE", ROOT / ".env")
 RUNS = _path("HARNESS_RUNS_DIR", ROOT / "data" / "evaluation" / "harness")
 
 GREETING = "Hi! How can I help you today?"
@@ -67,7 +68,7 @@ def load_env() -> None:
     """项目 .env 覆盖外层进程变量，并移除不属于被测服务的令牌，防止凭证发往错误端点。"""
     from dotenv import load_dotenv
 
-    load_dotenv(ROOT / ".env", override=True)
+    load_dotenv(ENV_FILE, override=True)
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 
