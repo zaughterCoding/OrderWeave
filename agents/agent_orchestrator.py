@@ -1244,7 +1244,7 @@ class AgentOrchestrator:
         pending_reply = False
         if retail_mode and req.retail_pending:
             from agents.retail_support import analyze_message
-            from mcp.retail_store import evaluate_confirmation
+            from mcp_tools.retail_store import evaluate_confirmation
             action = ((req.retail_support or {}).get("return_flow") or {}).get("action")
             action = action or analyze_message(req.message, has_pending=True).return_flow_action
             pending_reply = action not in {

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from mcp.qwen_embedding import IDENTITY, QwenEmbeddingFunction
+from mcp_tools.qwen_embedding import IDENTITY, QwenEmbeddingFunction
 
 
 ROOT = Path(__file__).resolve().parents[1]

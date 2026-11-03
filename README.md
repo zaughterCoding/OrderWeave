@@ -192,7 +192,7 @@ uv pip sync evaluation/embedding_requirements.lock --python data/embedding-env/S
 .\data\embedding-env\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Embedding-0.6B', revision='97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3', local_dir='data/models/qwen3-embedding-0.6b', allow_patterns=['config.json','model.safetensors','tokenizer.json','tokenizer_config.json','README.md'])"
 .\data\embedding-env\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Reranker-0.6B', revision='e61197ed45024b0ed8a2d74b80b4d909f1255473', local_dir='data/models/qwen3-reranker-0.6b', allow_patterns=['config.json','model.safetensors','tokenizer.json','tokenizer_config.json','README.md'])"
 # 若启用分层记忆，另行显式准备其MiniLM缓存：
-uv run python -c "from mcp.knowledge_base import _ProjectEmbeddingFunction; _ProjectEmbeddingFunction()._download_model_if_not_exists()"
+uv run python -c "from mcp_tools.knowledge_base import _ProjectEmbeddingFunction; _ProjectEmbeddingFunction()._download_model_if_not_exists()"
 ```
 
 知识资料和语义参考工件未分发，因此历史完整资料链的结果无法仅凭本仓库复现。可以先使用轻量业务入口；通用客服模式`RETAIL_MODE=false`另外支持自行导入知识，仍需完整的外部服务与编码缓存。
@@ -230,7 +230,7 @@ uv run python -m evaluation.score_results --kind task --input data/my-run/result
 api/          HTTP API与CLI
 agents/       Host、四角色、共享服务、状态图与发布守卫
 core/         意图识别、可选语义路由、Skills加载
-mcp/          stdio工具服务、SQLite、检索和本地模型适配
+mcp_tools/    stdio工具服务、SQLite、检索和本地模型适配
 memory/       分层记忆
 monitor/      监控与指标
 evaluation/   必要评测组件、外部资产准备、方法与结果摘要

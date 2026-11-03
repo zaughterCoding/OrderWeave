@@ -20,7 +20,7 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.shared.exceptions import McpError
 
 from agents.tools import AgentToolSpec
-from mcp.retail_protocol import build_context_meta
+from mcp_tools.retail_protocol import build_context_meta
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +104,7 @@ class RetailMCPClient:
 
         params = StdioServerParameters(
             command=self.python_executable,
-            args=["-m", "mcp.retail_server"],
+            args=["-m", "mcp_tools.retail_server"],
             env=self._server_env(),
             cwd=str(self.project_root),
             encoding="utf-8",

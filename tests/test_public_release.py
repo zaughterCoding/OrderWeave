@@ -94,7 +94,7 @@ def test_skills_use_public_brand_and_keep_legacy_setting_compatible(tmp_path, mo
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Windows内存接口")
 def test_reranker_memory_stats_do_not_import_experimental_code():
-    from mcp.qwen_reranker import memory_peak
+    from mcp_tools.qwen_reranker import memory_peak
     stats = memory_peak()
     assert stats["rss_peak_mib"] > 0
     assert stats["private_peak_mib"] > 0

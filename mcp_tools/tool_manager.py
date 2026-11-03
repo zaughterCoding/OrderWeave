@@ -196,7 +196,7 @@ class MCPToolManager:
         self._client = client or AsyncAnthropic(**kwargs)
         self._model = model
         self._reranker = reranker
-        from mcp.evidence_coverage import STRATEGIES
+        from mcp_tools.evidence_coverage import STRATEGIES
         if retrieval_strategy not in STRATEGIES:
             raise ValueError("未知检索选择策略")
         self.retrieval_strategy = retrieval_strategy
@@ -435,7 +435,7 @@ class MCPToolManager:
         带范围的调用不读写结果缓存，避免不同会话范围串用。
         """
         if self.retrieval_strategy != "relevance":
-            from mcp.evidence_coverage import retrieve_with_coverage
+            from mcp_tools.evidence_coverage import retrieve_with_coverage
             async def recall(text, k):
                 scoped = {**(context or {}), "knowledge_item_filter": item_filter} if item_filter else context
                 result = await self.call(tool_name, {"query": text, "top_k": k}, scoped, use_cache=False)
@@ -647,7 +647,7 @@ class MCPToolManager:
         diag = diagnostics if diagnostics is not None else {}
         diag["rerank_candidate_count"] = len(items)
         if self._reranker is not None and len(items) > 1:
-            from mcp.qwen_reranker import validate_scores
+            from mcp_tools.qwen_reranker import validate_scores
 
             diag["rerank_backend"] = "qwen"
             try:

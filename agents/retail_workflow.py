@@ -21,7 +21,7 @@ from langsmith import tracing_context
 from agents.agent_orchestrator import AgentResponse, AgentType, OrchestratorResult
 from agents.retail_handoff import RoleHandoff, RoleOutcome, build_role_handoff, role_outcome
 from agents.retail_support import analyze_message
-from mcp.retail_store import evaluate_confirmation
+from mcp_tools.retail_store import evaluate_confirmation
 
 
 class RetailGraphState(TypedDict, total=False):

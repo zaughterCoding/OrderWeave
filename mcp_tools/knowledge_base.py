@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 import chromadb
 from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
-from mcp.hybrid_retrieval import BM25Index, CANDIDATE_K, reciprocal_rank_fusion
+from mcp_tools.hybrid_retrieval import BM25Index, CANDIDATE_K, reciprocal_rank_fusion
 
 logger = logging.getLogger(__name__)
 

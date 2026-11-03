@@ -5,8 +5,8 @@ import asyncio
 import re
 import time
 
-from mcp.hybrid_retrieval import tokenize
-from mcp.qwen_reranker import validate_scores
+from mcp_tools.hybrid_retrieval import tokenize
+from mcp_tools.qwen_reranker import validate_scores
 
 SPEC = dict(initial_k=20, supplement_rounds=1, supplement_queries=2,
             supplement_k=5, new_candidates=10, total_candidates=30, final_k=5,

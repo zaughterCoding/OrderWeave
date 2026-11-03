@@ -21,7 +21,7 @@ from agents.agent_orchestrator import (
 )
 from core.intent_recognizer import IntentCategory, UrgencyLevel
 from evaluation.evaluator import EndToEndEvaluator, LLMJudge
-from mcp.tool_manager import MCPToolManager, Tool, ToolStats
+from mcp_tools.tool_manager import MCPToolManager, Tool, ToolStats
 from monitor.performance_monitor import PerformanceMonitor
 
 

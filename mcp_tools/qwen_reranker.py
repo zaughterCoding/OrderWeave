@@ -11,7 +11,7 @@ import sys
 import threading
 
 if __package__:
-    from mcp.qwen_embedding import QwenEmbeddingFunction, ROOT
+    from mcp_tools.qwen_embedding import QwenEmbeddingFunction, ROOT
 else:
     from qwen_embedding import QwenEmbeddingFunction, ROOT
 

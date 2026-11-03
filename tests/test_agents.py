@@ -20,7 +20,7 @@ from agents.agent_orchestrator import (
     build_shared_rag_tools,
 )
 from core.intent_recognizer import IntentCategory, UrgencyLevel
-from mcp.tool_manager import ToolResult
+from mcp_tools.tool_manager import ToolResult
 
 
 class FakeClient:

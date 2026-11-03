@@ -14,7 +14,7 @@ from agents.tools import (
     make_tool,
 )
 from agents.retail_support import support_evidence_applicable
-from mcp.retail_store import RetailStore, safe_calculate
+from mcp_tools.retail_store import RetailStore, safe_calculate
 
 _RETAIL_KNOWLEDGE_DESCRIPTION = (
     "检索本项目冻结的零售政策与商品准备建议证据，返回 evidence_id、正文和来源。"

@@ -97,8 +97,8 @@ def _build_knowledge_tooling(
     chroma_path: str,
 ):
     """构造 API 与 CLI 共用的知识检索工具链。"""
-    from mcp.knowledge_base import KnowledgeBase
-    from mcp.tool_manager import MCPToolManager, Tool
+    from mcp_tools.knowledge_base import KnowledgeBase
+    from mcp_tools.tool_manager import MCPToolManager, Tool
 
     tool_manager = MCPToolManager(
         api_key=cfg["api_key"],

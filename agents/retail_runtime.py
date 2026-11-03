@@ -45,12 +45,12 @@ from evaluation.retail_ledger import (
     RetailLedger,
     build_budgeted_client,
 )
-from mcp.knowledge_base import KnowledgeBase
-from mcp.qwen_embedding import QwenEmbeddingFunction
-from mcp.qwen_reranker import QwenReranker
-from mcp.retail_client import RetailMCPClient
-from mcp.retail_store import RetailStore
-from mcp.tool_manager import MCPToolManager, Tool
+from mcp_tools.knowledge_base import KnowledgeBase
+from mcp_tools.qwen_embedding import QwenEmbeddingFunction
+from mcp_tools.qwen_reranker import QwenReranker
+from mcp_tools.retail_client import RetailMCPClient
+from mcp_tools.retail_store import RetailStore
+from mcp_tools.tool_manager import MCPToolManager, Tool
 from memory.conversation_memory import MemoryManager
 
 logger = logging.getLogger(__name__)
@@ -685,7 +685,7 @@ def build_retail_runtime(
         raise ValueError("RETAIL_RETRIEVAL_MODE 只能是 dense、bm25 或 hybrid")
     if config.reranker_model not in {"llm", "qwen"}:
         raise ValueError("RETAIL_RERANKER_MODEL 只能是 llm 或 qwen")
-    from mcp.evidence_coverage import STRATEGIES
+    from mcp_tools.evidence_coverage import STRATEGIES
     if config.retrieval_strategy not in STRATEGIES:
         raise ValueError("未知RETAIL_RETRIEVAL_STRATEGY")
     if config.retrieval_strategy != "relevance" and config.reranker_model != "qwen":

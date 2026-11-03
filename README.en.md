@@ -192,7 +192,7 @@ Examples of explicit pinned downloads (network access, no paid model inference):
 .\data\embedding-env\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Embedding-0.6B', revision='97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3', local_dir='data/models/qwen3-embedding-0.6b', allow_patterns=['config.json','model.safetensors','tokenizer.json','tokenizer_config.json','README.md'])"
 .\data\embedding-env\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Reranker-0.6B', revision='e61197ed45024b0ed8a2d74b80b4d909f1255473', local_dir='data/models/qwen3-reranker-0.6b', allow_patterns=['config.json','model.safetensors','tokenizer.json','tokenizer_config.json','README.md'])"
 # Layered memory additionally needs its own explicitly prepared MiniLM cache:
-uv run python -c "from mcp.knowledge_base import _ProjectEmbeddingFunction; _ProjectEmbeddingFunction()._download_model_if_not_exists()"
+uv run python -c "from mcp_tools.knowledge_base import _ProjectEmbeddingFunction; _ProjectEmbeddingFunction()._download_model_if_not_exists()"
 ```
 
 Knowledge and semantic reference artifacts are not distributed, so the historical full configuration cannot be reproduced from this repository alone. Start with lightweight business mode. The general support mode (`RETAIL_MODE=false`) also supports user-imported knowledge, with its own complete service and encoder-cache requirements.
@@ -230,7 +230,7 @@ Schemas, fixed denominators, and error/invalid/not-run handling are described in
 api/          HTTP API and CLI
 agents/       Host, roles, shared service, graph, and response guard
 core/         Intent recognition, optional semantic routing, Skills
-mcp/          stdio tools, SQLite, retrieval, and local-model adapters
+mcp_tools/    stdio tools, SQLite, retrieval, and local-model adapters
 memory/       Layered memory
 monitor/      Monitoring and metrics
 evaluation/   Required components, external asset preparation, method, results

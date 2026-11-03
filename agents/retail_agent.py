@@ -33,7 +33,7 @@ from agents.retail_support import (
 )
 from agents.retail_tools import RETAIL_READ_ONLY_TOOLS, retail_tool_scope, retail_tools
 from agents.retail_response_guard import constrain_response
-from mcp.retail_store import RetailStore, SupportStateError
+from mcp_tools.retail_store import RetailStore, SupportStateError
 
 logger = logging.getLogger(__name__)
 

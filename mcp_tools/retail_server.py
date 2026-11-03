@@ -23,8 +23,8 @@ from mcp.shared.exceptions import McpError
 from agents.agent_orchestrator import Request
 from agents.retail_tools import retail_tool_scope, retail_tools
 from agents.tools import AgentToolSpec, validate_tool_input
-from mcp.retail_protocol import RetailContextError, parse_context_meta
-from mcp.retail_store import RetailStore, RetailStoreError
+from mcp_tools.retail_protocol import RetailContextError, parse_context_meta
+from mcp_tools.retail_store import RetailStore, RetailStoreError
 
 logger = logging.getLogger("retail_mcp")
 

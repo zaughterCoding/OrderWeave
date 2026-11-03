@@ -17,7 +17,7 @@ from agents.agent_orchestrator import (
 from evaluation.evaluator import LLMJudge
 from core.intent_recognizer import IntentRecognizer
 from memory.conversation_memory import MemoryManager
-from mcp.tool_manager import MCPToolManager
+from mcp_tools.tool_manager import MCPToolManager
 
 MIN_JSON_OUTPUT_TOKENS = 1024
 

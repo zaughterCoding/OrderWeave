@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mcp.qwen_reranker import QwenReranker, validate_scores, passage_text
-from mcp.tool_manager import MCPToolManager
+from mcp_tools.qwen_reranker import QwenReranker, validate_scores, passage_text
+from mcp_tools.tool_manager import MCPToolManager
 
 
 @pytest.mark.parametrize("scores", [[0.1], [True, 0.2], [float("nan"), 0], [float("inf"), 0], [-1, 0], [1.1, 0], None])
@@ -116,7 +116,7 @@ def test_reranker_timeout_closes_worker():
 
 
 def test_reranker_missing_model_never_downloads(tmp_path):
-    from mcp.qwen_reranker import verify_model
+    from mcp_tools.qwen_reranker import verify_model
 
     with pytest.raises(RuntimeError, match="缓存缺失"):
         verify_model(tmp_path)

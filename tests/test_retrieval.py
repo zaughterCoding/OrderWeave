@@ -6,8 +6,8 @@ import pytest
 
 from agents.agent_orchestrator import Request
 from agents.tools import build_shared_rag_tools
-from mcp.knowledge_base import KnowledgeBase
-from mcp.tool_manager import (
+from mcp_tools.knowledge_base import KnowledgeBase
+from mcp_tools.tool_manager import (
     MIN_RECALL_K,
     CircuitBreaker,
     MCPToolManager,
@@ -31,7 +31,7 @@ def make_manager(monkeypatch, responses):
 
     messages = Messages()
     monkeypatch.setattr(
-        "mcp.tool_manager.AsyncAnthropic",
+        "mcp_tools.tool_manager.AsyncAnthropic",
         lambda **kwargs: SimpleNamespace(messages=messages),
     )
     return MCPToolManager(api_key="test-key", model="test-model"), messages
