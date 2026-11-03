@@ -4,15 +4,16 @@
 
 [简体中文（默认）](README.md) · [Evaluation guide](evaluation/README.md) · [Results and scope](evaluation/RESULTS.md) · [MIT](LICENSE)
 
-OrderWeave connects intent recognition, on-demand role collaboration, order tools, and a recoverable state graph. It focuses on multi-turn workflows: understand a request, verify identity and order facts, present complete return details, wait for confirmation, and commit through server-side checks.
+OrderWeave connects intent recognition, on-demand role collaboration, order tools, and a recoverable state graph. It focuses on multi-turn workflows: understand a request, verify identity and order facts, present complete server-generated pending details, wait for confirmation, and carry them out through server-side checks. All seven τ² retail write actions are supported: returns, exchanges, cancelling pending orders, changing a pending order's items, address, or payment method, and changing the account address.
 
-The public code is intended for research, learning, and local demonstrations. Users supply fictional sandbox orders separately. A return request is not a real refund, and a handoff is only a simulated record.
+The public code is intended for research, learning, and local demonstrations. Users supply fictional sandbox orders separately. A return or cancellation request is not a real refund, and a handoff is only a simulated record.
 
 ## Features
 
 - **Shared entry points:** FastAPI and an interactive CLI use the same retail service. The default is `multi + langgraph`, with explicit single-agent and legacy fallbacks.
-- **On-demand collaboration:** general, technical, billing, and escalation roles. Only the primary role can bind identity, prepare or submit a return, or record a handoff; supporting roles are read-only.
-- **Recoverable workflows:** SQLite checkpoints and LangGraph Interrupt/Resume wait for a later user message after return details are displayed. Changed details require a new confirmation.
+- **On-demand collaboration:** general, technical, billing, and escalation roles. Only the primary role can bind identity, call write tools, or record a handoff; supporting roles are read-only.
+- **Two-phase writes:** the first call of any of the seven write tools only creates and displays pending details; an identical call after the user confirms in a later message carries them out. A structured classifier judges confirmation from the real user message and the decision is stored per turn; execution re-checks display state, identical arguments, a data fingerprint, and single use.
+- **Recoverable workflows:** SQLite checkpoints and LangGraph Interrupt/Resume wait for a later user message after details are displayed. Changed details require a new confirmation.
 - **Guarded tools:** a real stdio MCP subprocess and server-side identity, displayed-details, and current-message checks, plus transactions, deduplication, and unknown-result protection.
 - **Recognition and retrieval:** rules, structured LLM classification, optional local semantic gating, and optional Dense + BM25 + RRF retrieval with local Qwen reranking.
 - **Observability:** stage-level tool traces, routing, response guards, and budget records; optional Redis/ChromaDB memory and Prometheus monitoring.
@@ -51,7 +52,7 @@ The graph advances the workflow; the Store owns business authorization. Model ou
 | Optional semantic path | Qwen3 document embeddings and a ridge-regression linear head, gated by score, margin, same-class reference similarity, and task state | Scores are not correctness probabilities; external calibrated artifacts are required |
 | Hybrid retrieval | ChromaDB Dense, BM25 (k1=1.2, b=0.75), equal-weight RRF (constant 60) | Knowledge explains policy; it does not establish business state or authorization |
 | Local reranking | Qwen3-Reranker using final-position yes/no relevance scores, in a separate process | External weights are required; invalid caches fail explicitly without implicit downloads |
-| Transactions and recovery | Prepare → display unchanged details → later confirmation → transactional submission | Cancelling a pending return is not cancelling an order; unknown results are not blindly retried |
+| Transactions and recovery | One protocol for seven write actions: prepare → display unchanged details → per-turn confirmation decision → identical call executes; data fingerprint, deduplication, events, and checkpoints. Business semantics are ported from the official τ² tools and reference replays match the official database hash | Withdrawing pending details is not cancelling an order; unknown results are not blindly retried |
 | Response guard | Check current owned-order facts, item lists, amounts, and events; ask specific questions when verification fails | Limited formats and predicates, not a complete free-text semantic audit |
 | No-progress protection | Two consecutive guard fallbacks with unchanged facts explicitly fail the attempt; new facts or a valid response can recover | An early failure remains a failure in scoring |
 | Memory | Optional Redis working memory and summaries, ChromaDB episodic/profile memory, plus bounded SQLite-visible history | Profiles are off by default; history cannot establish identity or confirmation |
