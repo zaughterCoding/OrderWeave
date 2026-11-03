@@ -425,6 +425,9 @@ class RetailRuntimeConfig:
     context_budget_tokens: int = 32000
     # on_demand：政策动作章节拆为按需加载的 Skill 并绑定写工具；inline：整份政策常驻提示词。
     skill_mode: str = "on_demand"
+    # 会话事实账本：每轮结构化抽取用户陈述并校验引用（需 compiled 上下文才进入模型输入）。
+    # S3 小样本未见显著收益且成本约增三成，默认关闭。
+    task_facts: bool = False
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -550,6 +553,7 @@ class RetailRuntimeConfig:
             model_thinking=_env_text("RETAIL_MODEL_THINKING").lower(),
             context_mode=_env_text("RETAIL_CONTEXT_MODE", "compiled").lower(),
             skill_mode=_env_text("RETAIL_SKILL_MODE", "on_demand").lower(),
+            task_facts=_env_bool("RETAIL_TASK_FACTS", False),
             context_budget_tokens=max(2000, int(_env_text("RETAIL_CONTEXT_BUDGET_TOKENS", "32000"))),
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
@@ -999,6 +1003,8 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         confirmation_model=config.model,
         context_engine=context_engine,
         skill_library=skill_library,
+        fact_client=(client.for_stage("extract", count_turn=True)
+                     if config.task_facts and config.context_mode == "compiled" else None),
     )
 
     return RetailRuntime(

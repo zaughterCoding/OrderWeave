@@ -19,6 +19,7 @@ The public code is intended for research, learning, and local demonstrations. Us
 - **Unified agent loop with hooks:** single-agent and multi-agent roles share one tool loop; unknown results, cross-turn execution, primary-only writes, and rejected confirmations are enforced by hook plugins, and every model and tool call is recorded as a replayable trace span.
 - **Context compilation:** an append-only log of every message (including tool calls and results); stable prefix first and the per-turn state snapshot last, which suits provider prefix caching; over the token budget, older tool results are replaced by re-queryable references and earlier turns by an anchored summary, both persisted; token estimates are calibrated from real usage.
 - **On-demand skills:** each action section of the fixed policy (verbatim) plus a procedure forms a skill; the prompt lists only names and descriptions, and the agent reads a skill with `load_skill`. Write tools are bound to skills and rejected by a hook until the skill is loaded.
+- **Temporal fact ledger:** each turn the model proposes structured changes to what the customer has stated (add, supersede on change of mind, retract, unresolved); the system checks every quote verbatim before recording it. Superseded facts keep their history, the state snapshot shows current facts and recent changes of mind, and stated facts survive history compaction.
 - **Observability:** stage-level tool traces, routing, response guards, and budget records; optional Redis/ChromaDB memory and Prometheus monitoring.
 
 ## Architecture
@@ -59,6 +60,7 @@ The graph advances the workflow; the Store owns business authorization. Model ou
 | Response guard | Check current owned-order facts, item lists, amounts, and events; ask specific questions when verification fails | Limited formats and predicates, not a complete free-text semantic audit |
 | No-progress protection | Two consecutive guard fallbacks with unchanged facts explicitly fail the attempt; new facts or a valid response can recover | An early failure remains a failure in scoring |
 | Context compilation | Full message log rendered per role and tool set; the state snapshot is logged with the user message; over budget, older tool results become re-queryable references, then an anchored summary, with compaction persisted | History and summaries inform the model only and never authorize confirmation; `RETAIL_CONTEXT_MODE=window` keeps the old two-turn window for comparison |
+| Temporal fact ledger | Extraction runs in parallel with the confirmation check; quotes must appear verbatim in the latest customer message, supersede/retract must target a live fact, sizes are bounded; ambiguity is recorded as unresolved for the agent to ask about | Facts come only from customer statements and never establish identity or authorization; `RETAIL_TASK_FACTS=false` turns it off |
 | On-demand skills | The policy is split by section: general rules stay in the prompt; cancel / modify pending order / return / exchange sections and procedures live in `skills/retail-*`; the split concatenates back to the original text | Skills only provide policy and procedure text and cannot authorize writes; `RETAIL_SKILL_MODE=inline` keeps the whole policy in the prompt |
 | Agent loop hooks | pre_model / pre_tool / post_tool / on_tool_error / stop_response; retail policies are separate plugins, and the legacy roles keep their methods through an adapter | Hooks only check invariants and cannot authorize writes |
 | Memory | Optional Redis working memory and summaries, ChromaDB episodic/profile memory, plus bounded SQLite-visible history | Profiles are off by default; history cannot establish identity or confirmation |
@@ -166,6 +168,7 @@ Keep `user_id` and `conv_id` unchanged across turns. Obtain sandbox identity and
 | `RETAIL_AGENT_MODE` | `multi`; `single` is available |
 | `RETAIL_WORKFLOW_MODE` | `langgraph`; `legacy` is available |
 | `RETAIL_CONTEXT_MODE` | `compiled` (full message log and context compilation); `window` keeps the old two-turn window |
+| `RETAIL_TASK_FACTS` | `false` (no significant gain in S3 small-sample tests, about 30% higher cost); requires `compiled` context when enabled |
 | `RETAIL_SKILL_MODE` | `on_demand` (skills bound to write tools); `inline` keeps the whole policy in the prompt |
 | `RETAIL_CONTEXT_BUDGET_TOKENS` | `32000`; history above this estimate triggers persisted compaction |
 | `RETAIL_ENABLE_MEMORY` | Template: `false`; enabling requires Redis, ChromaDB, and local memory-encoder cache |

@@ -306,8 +306,11 @@ class RetailService:
         confirmation_model: str = "",
         context_engine: Any = None,
         skill_library: Any = None,
+        fact_client: Any = None,
     ):
         self.store = store
+        # 为空时不维护事实账本（消融对照）。
+        self.fact_client = fact_client
         self.skill_library = skill_library
         # 为空时沿用两轮可见窗口（消融对照）；否则由完整消息日志编排上下文。
         self.context_engine = context_engine
@@ -412,6 +415,25 @@ class RetailService:
         if decisions is not None:
             self.store.record_confirmation_decisions(client_user_id, conv_id, turn, decisions, "classifier")
 
+    async def _update_facts(self, message, client_user_id, conv_id, turn) -> Dict[str, Any]:
+        """抽取本轮用户陈述的事实增量并校验引用后记账；同一轮只处理一次。"""
+        if self.fact_client is None:
+            return {}
+        from memory.task_facts import apply_ops, extract
+
+        facts, processed = self.store.task_facts(client_user_id, conv_id)
+        if processed >= turn:
+            return {"skipped": "already_processed"}
+        history = self.store.visible_history(client_user_id, conv_id)
+        previous = next((h["content"] for h in reversed(history) if h.get("role") == "assistant"), "")
+        ops = await extract(self.fact_client, self.confirmation_model, facts, previous, message)
+        if ops is None:
+            return {"error": "extraction_failed"}
+        out = apply_ops(facts, ops, message, turn)
+        self.store.save_task_facts(client_user_id, conv_id, out["facts"], turn)
+        return {"accepted": [a["action"] for a in out["accepted"]],
+                "rejected": [r["reason"] for r in out["rejected"]]}
+
     async def _prepare_turn(self, message, client_user_id, conv_id):
         t0 = time.monotonic()
         # 进程重启后仍从真实会话事件末尾开始，不能重用历史成功。
@@ -424,7 +446,10 @@ class RetailService:
         pending_before = self.store.active_pending(client_user_id, conv_id)
         bound_user_id = self.store.bound_user_id(client_user_id, conv_id)
         pending_brief = self._pending_brief(pending_before)
-        await self._judge_confirmations(message, client_user_id, conv_id, turn, pending_before)
+        # 确认判定与事实抽取互不依赖，并行执行以免增加轮延迟。
+        _, facts_update = await asyncio.gather(
+            self._judge_confirmations(message, client_user_id, conv_id, turn, pending_before),
+            self._update_facts(message, client_user_id, conv_id, turn))
 
         support_record: Optional[Dict[str, Any]] = None
         support_state_error = ""
@@ -549,6 +574,10 @@ class RetailService:
                                      "pending_confirmation": pending_brief, "task": request.retail_task,
                                      "recent_events": [{"kind": e["event_type"], "order_id": e.get("order_id"),
                                                         "op_id": e.get("op_id")} for e in events_before[-6:]]}
+            if self.fact_client is not None:
+                from memory.task_facts import state_view
+
+                state["user_facts"] = state_view(self.store.task_facts(client_user_id, conv_id)[0])
             if support_packet is not None:
                 state["support"] = support_packet
             if context_text:
@@ -584,7 +613,7 @@ class RetailService:
             "request": request,
             "user_content": user_content,
             "turn_extra": turn_extra if engine is not None else [],
-            "compaction": compaction,
+            "compaction": {**compaction, **({"facts_update": facts_update} if facts_update else {})},
         }
 
     async def _execute_turn(self, context):

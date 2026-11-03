@@ -864,6 +864,14 @@ class RetailStore:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (client_user_id, conv_id, seq)
             );
+            CREATE TABLE IF NOT EXISTS task_facts (
+                client_user_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                processed_turn INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (client_user_id, conv_id)
+            );
             CREATE TABLE IF NOT EXISTS context_state (
                 client_user_id TEXT NOT NULL,
                 conv_id TEXT NOT NULL,
@@ -1109,6 +1117,20 @@ class RetailStore:
                 " WHERE client_user_id=? AND conv_id=? ORDER BY seq", (client_user_id, conv_id)).fetchall()
         return [{"seq": r["seq"], "turn": r["turn"], "role": r["role"], "kind": r["kind"], "agent": r["agent"],
                  "content": json.loads(r["content_json"])} for r in rows]
+
+    def task_facts(self, client_user_id: str, conv_id: str) -> Tuple[List[Dict[str, Any]], int]:
+        """会话事实账本与已处理到的轮次；事实来自用户陈述，不提供授权。"""
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT payload_json, processed_turn FROM task_facts"
+                                     " WHERE client_user_id=? AND conv_id=?", (client_user_id, conv_id)).fetchone()
+        return (json.loads(row["payload_json"]), int(row["processed_turn"])) if row else ([], 0)
+
+    def save_task_facts(self, client_user_id: str, conv_id: str, facts: List[Dict[str, Any]], turn: int) -> None:
+        with self._tx() as connection:
+            connection.execute(
+                "INSERT INTO task_facts VALUES (?,?,?,?,?) ON CONFLICT(client_user_id,conv_id) DO UPDATE SET"
+                " payload_json=excluded.payload_json, processed_turn=excluded.processed_turn, updated_at=excluded.updated_at",
+                (client_user_id, conv_id, json.dumps(facts, ensure_ascii=False), int(turn), _now()))
 
     def context_state(self, client_user_id: str, conv_id: str) -> Dict[str, Any]:
         """上下文压缩锚点与 token 换算系数；只影响模型看到的历史，不影响业务授权。"""
