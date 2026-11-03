@@ -906,7 +906,9 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
     if config.skill_mode == "on_demand":
         from core.retail_skills import RetailSkillLibrary
 
-        skill_library = RetailSkillLibrary(policy_text)
+        # 自进化候选通过独立目录加载，评测不改动仓库内 Skill。
+        skills_dir = os.getenv("ORDERWEAVE_RETAIL_SKILLS_DIR", "").strip()
+        skill_library = RetailSkillLibrary(policy_text, Path(skills_dir) if skills_dir else None)
         policy_text = skill_library.base_policy()
     skill_manager = None
     if config.agent_mode == "multi":

@@ -32,6 +32,18 @@ def git_commit() -> str:
         return "unknown"
 
 
+def skills_digest() -> dict:
+    """记录本次加载的按需 Skill 目录与内容摘要，便于区分自进化候选。"""
+    import hashlib
+    import os
+
+    folder = Path(os.getenv("ORDERWEAVE_RETAIL_SKILLS_DIR", "").strip() or cfg.ROOT / "skills")
+    digest = hashlib.sha256()
+    for path in sorted(folder.glob("retail-*/SKILL.md")):
+        digest.update(path.read_bytes())
+    return {"dir": str(folder), "sha256": digest.hexdigest()[:16]}
+
+
 def spent(run_dir: Path) -> float:
     """含中断保留目录在内的全部会话账本实际费用。"""
     return sum(ledger_cost(p).get("total_cny", 0) for p in (run_dir / "sessions").glob("*/*/ledger.sqlite"))
@@ -50,7 +62,7 @@ def make_plan(args, run_dir: Path) -> dict:
     plan = {"run_id": args.run_id, "suite": args.suite, "tasks_path": str(suite.tasks_path),
             "suite_digest": suite.digest(), "task_ids": task_ids, "trials": args.trials,
             "profile": args.profile, "model": cfg.model_settings()["model"], "budget_cny": args.budget_cny,
-            "git_commit": git_commit()}
+            "git_commit": git_commit(), "skills": skills_digest()}
     path = run_dir / "plan.json"
     if path.exists():
         old = json.loads(path.read_text(encoding="utf-8"))
