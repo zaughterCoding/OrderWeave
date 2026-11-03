@@ -650,6 +650,7 @@ class RetailService:
             events=new_events,
             pending_before=pending_before, pending_after=pending_after, turn=turn,
             bound_user_id=current_bound_user,
+            session_events=self.store.list_events(client_user_id, conv_id),
             language=self.language,
         )
         guarded.record["facts_read_ms"] = round(facts_read_ms, 3)

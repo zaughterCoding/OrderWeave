@@ -190,6 +190,7 @@ def constrain_response(
     text: str, *, traces: list[dict[str, Any]], events: list[dict[str, Any]],
     pending_before: list[dict[str, Any]], pending_after: list[dict[str, Any]],
     turn: int, bound_user_id: str | None, language: str = "zh",
+    session_events: list[dict[str, Any]] | None = None,
 ) -> GuardedResponse:
     """输入仅限服务层选出的同会话本轮事实；开放语义仍需独立复核。"""
     started = time.perf_counter()
@@ -205,6 +206,12 @@ def constrain_response(
     ]
     submitted = [e for e in events if e.get("event_type") == "return_requested"]
     handoffs = [e for e in events if e.get("event_type") == "handoff_requested"]
+    # 回顾此前轮次已发生的提交或交接是真实事实；只校验本轮会把总结误判为无依据。
+    # 受控回复块仍只由本轮事件生成。
+    history = session_events if session_events is not None else events
+    any_submitted = any(e.get("event_type") == "return_requested" or str(e.get("event_type", "")).endswith("_executed")
+                        for e in history)
+    any_handoff = any(e.get("event_type") == "handoff_requested" for e in history)
     already_submitted = any(
         t.get("tool_name") == "get_order_details" and _ok(t)
         and (t["result"].get("order") or {}).get("status") == "return requested"
@@ -348,13 +355,13 @@ def constrain_response(
             issue = "unverified_external_status"
             replacement = ("Refund arrival, warehouse receipt and email delivery have not been verified."
                            if english else "退款到账、仓库收货及邮件发送状态尚未核实。")
-        elif _fact_matches(_SUBMITTED, clause) and not submitted and not re.search(
+        elif _fact_matches(_SUBMITTED, clause) and not submitted and not any_submitted and not re.search(
             r"尚未|没有|未提交|不能|无法|确认后|提交后|will|not |cannot", clause, re.I
         ):
             issue = "unsupported_submission_claim"
             replacement = ("No new submitted return is verified in this turn." if english
                            else "本轮没有可核验的新退货提交结果。")
-        elif _fact_matches(_HANDOFF, clause) and not handoffs and not re.search(
+        elif _fact_matches(_HANDOFF, clause) and not handoffs and not any_handoff and not re.search(
             r"尚未|没有|未连接|未接入|不代表|not |cannot", clause, re.I
         ):
             issue = "unsupported_handoff_claim"
