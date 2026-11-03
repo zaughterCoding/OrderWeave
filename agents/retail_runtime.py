@@ -420,6 +420,9 @@ class RetailRuntimeConfig:
     ledger_settlement_policy: str = "legacy"
     # 供应商思考模式：disabled 时所有阶段请求统一关闭，空值沿用供应商默认。
     model_thinking: str = ""
+    # compiled：完整消息日志＋上下文编排；window：旧两轮可见窗口（消融对照）。
+    context_mode: str = "compiled"
+    context_budget_tokens: int = 32000
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -543,6 +546,8 @@ class RetailRuntimeConfig:
             semantic_routing=_env_bool("RETAIL_SEMANTIC_ROUTING", True),
             semantic_model_path=_env_optional_path("RETAIL_SEMANTIC_MODEL_PATH"),
             model_thinking=_env_text("RETAIL_MODEL_THINKING").lower(),
+            context_mode=_env_text("RETAIL_CONTEXT_MODE", "compiled").lower(),
+            context_budget_tokens=max(2000, int(_env_text("RETAIL_CONTEXT_BUDGET_TOKENS", "32000"))),
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
             embedding_model=_env_text("RETAIL_EMBEDDING_MODEL", "qwen").lower(),
@@ -682,6 +687,8 @@ def build_retail_runtime(
 ) -> RetailRuntime:
     """按环境配置构造零售运行时；不会自动重置已有业务库。"""
     config = config or RetailRuntimeConfig.from_env()
+    if config.context_mode not in {"compiled", "window"}:
+        raise ValueError("RETAIL_CONTEXT_MODE 只能是 compiled 或 window: " + config.context_mode)
     if config.workflow_mode not in {"langgraph", "legacy"}:
         raise ValueError("RETAIL_WORKFLOW_MODE 只能是 langgraph 或 legacy")
     if config.embedding_model not in {"qwen", "minilm"}:
@@ -947,6 +954,15 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
             support_enabled=config.support_enabled,
         )
 
+    context_engine = None
+    if config.context_mode == "compiled":
+        from core.context_engine import ContextEngine, make_llm_summarizer
+
+        context_engine = ContextEngine(
+            store, language=language, budget_tokens=config.context_budget_tokens,
+            summarizer=make_llm_summarizer(client.for_stage("compact", count_turn=True), config.model),
+        )
+
     service = RetailService(
         store=store,
         agent=agent,
@@ -965,6 +981,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         checkpoint_path=config.checkpoint_path,
         confirmation_client=client.for_stage("confirm", count_turn=True),
         confirmation_model=config.model,
+        context_engine=context_engine,
     )
 
     return RetailRuntime(

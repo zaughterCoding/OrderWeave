@@ -56,11 +56,15 @@ class Profile:
     max_tokens: int = 2048
     # 与历史 τ 结果口径一致：所有阶段（含模拟用户与 Judge）关闭思考。
     thinking: str = "disabled"
+    # window 为旧两轮窗口；compiled 为 S1 完整消息日志＋上下文编排。
+    context_mode: str = "window"
 
 
 PROFILES = {
     "legacy-multi": Profile("legacy-multi"),
     "legacy-single": Profile("legacy-single", agent_mode="single"),
+    "ctx-multi": Profile("ctx-multi", context_mode="compiled"),
+    "ctx-single": Profile("ctx-single", agent_mode="single", context_mode="compiled"),
 }
 
 

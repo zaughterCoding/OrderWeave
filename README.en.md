@@ -16,6 +16,8 @@ The public code is intended for research, learning, and local demonstrations. Us
 - **Recoverable workflows:** SQLite checkpoints and LangGraph Interrupt/Resume wait for a later user message after details are displayed. Changed details require a new confirmation.
 - **Guarded tools:** a real stdio MCP subprocess and server-side identity, displayed-details, and current-message checks, plus transactions, deduplication, and unknown-result protection.
 - **Recognition and retrieval:** rules, structured LLM classification, optional local semantic gating, and optional Dense + BM25 + RRF retrieval with local Qwen reranking.
+- **Unified agent loop with hooks:** single-agent and multi-agent roles share one tool loop; unknown results, cross-turn execution, primary-only writes, and rejected confirmations are enforced by hook plugins, and every model and tool call is recorded as a replayable trace span.
+- **Context compilation:** an append-only log of every message (including tool calls and results); stable prefix first and the per-turn state snapshot last, which suits provider prefix caching; over the token budget, older tool results are replaced by re-queryable references and earlier turns by an anchored summary, both persisted; token estimates are calibrated from real usage.
 - **Observability:** stage-level tool traces, routing, response guards, and budget records; optional Redis/ChromaDB memory and Prometheus monitoring.
 
 ## Architecture
@@ -55,6 +57,8 @@ The graph advances the workflow; the Store owns business authorization. Model ou
 | Transactions and recovery | One protocol for seven write actions: prepare → display unchanged details → per-turn confirmation decision → identical call executes; data fingerprint, deduplication, events, and checkpoints. Business semantics are ported from the official τ² tools and reference replays match the official database hash | Withdrawing pending details is not cancelling an order; unknown results are not blindly retried |
 | Response guard | Check current owned-order facts, item lists, amounts, and events; ask specific questions when verification fails | Limited formats and predicates, not a complete free-text semantic audit |
 | No-progress protection | Two consecutive guard fallbacks with unchanged facts explicitly fail the attempt; new facts or a valid response can recover | An early failure remains a failure in scoring |
+| Context compilation | Full message log rendered per role and tool set; the state snapshot is logged with the user message; over budget, older tool results become re-queryable references, then an anchored summary, with compaction persisted | History and summaries inform the model only and never authorize confirmation; `RETAIL_CONTEXT_MODE=window` keeps the old two-turn window for comparison |
+| Agent loop hooks | pre_model / pre_tool / post_tool / on_tool_error / stop_response; retail policies are separate plugins, and the legacy roles keep their methods through an adapter | Hooks only check invariants and cannot authorize writes |
 | Memory | Optional Redis working memory and summaries, ChromaDB episodic/profile memory, plus bounded SQLite-visible history | Profiles are off by default; history cannot establish identity or confirmation |
 
 ## Business walkthrough
@@ -159,6 +163,8 @@ Keep `user_id` and `conv_id` unchanged across turns. Obtain sandbox identity and
 | --- | --- |
 | `RETAIL_AGENT_MODE` | `multi`; `single` is available |
 | `RETAIL_WORKFLOW_MODE` | `langgraph`; `legacy` is available |
+| `RETAIL_CONTEXT_MODE` | `compiled` (full message log and context compilation); `window` keeps the old two-turn window |
+| `RETAIL_CONTEXT_BUDGET_TOKENS` | `32000`; history above this estimate triggers persisted compaction |
 | `RETAIL_ENABLE_MEMORY` | Template: `false`; enabling requires Redis, ChromaDB, and local memory-encoder cache |
 | `RETAIL_ENABLE_KNOWLEDGE` | Template: `false`; requires local knowledge matching the existing validation contract |
 | `RETAIL_SEMANTIC_ROUTING` | Template: `false`; requires external semantic artifacts and matching Qwen encoder |

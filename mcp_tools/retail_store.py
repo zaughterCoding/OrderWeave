@@ -852,6 +852,25 @@ class RetailStore:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY (client_user_id, conv_id, turn, op_id)
             );
+            CREATE TABLE IF NOT EXISTS conversation_log (
+                client_user_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                turn INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                agent TEXT,
+                content_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (client_user_id, conv_id, seq)
+            );
+            CREATE TABLE IF NOT EXISTS context_state (
+                client_user_id TEXT NOT NULL,
+                conv_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (client_user_id, conv_id)
+            );
             """
         )
 
@@ -1066,6 +1085,44 @@ class RetailStore:
                                              if response_guard and key in response_guard}})
             connection.execute("INSERT INTO retail_dialogue VALUES (?,?,?) ON CONFLICT(client_user_id,conv_id) DO UPDATE SET payload_json=excluded.payload_json",
                 (client_user_id, conv_id, json.dumps(pairs[-2:], ensure_ascii=False)))
+
+    def save_turn_messages(self, client_user_id: str, conv_id: str, turn: int,
+                           rows: List[Dict[str, Any]]) -> None:
+        """整轮写入完整消息（含工具调用与结果）；同一轮重复收口时整体替换，日志只追加。"""
+        with self._tx() as connection:
+            connection.execute("DELETE FROM conversation_log WHERE client_user_id=? AND conv_id=? AND turn=?",
+                               (client_user_id, conv_id, int(turn)))
+            row = connection.execute("SELECT COALESCE(MAX(seq),0) FROM conversation_log"
+                                     " WHERE client_user_id=? AND conv_id=?", (client_user_id, conv_id)).fetchone()
+            seq = int(row[0])
+            for item in rows:
+                seq += 1
+                connection.execute(
+                    "INSERT INTO conversation_log VALUES (?,?,?,?,?,?,?,?,?)",
+                    (client_user_id, conv_id, seq, int(turn), item["role"], item["kind"], item.get("agent"),
+                     json.dumps(item["content"], ensure_ascii=False, default=str), _now()))
+
+    def conversation_log(self, client_user_id: str, conv_id: str) -> List[Dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT seq, turn, role, kind, agent, content_json FROM conversation_log"
+                " WHERE client_user_id=? AND conv_id=? ORDER BY seq", (client_user_id, conv_id)).fetchall()
+        return [{"seq": r["seq"], "turn": r["turn"], "role": r["role"], "kind": r["kind"], "agent": r["agent"],
+                 "content": json.loads(r["content_json"])} for r in rows]
+
+    def context_state(self, client_user_id: str, conv_id: str) -> Dict[str, Any]:
+        """上下文压缩锚点与 token 换算系数；只影响模型看到的历史，不影响业务授权。"""
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT payload_json FROM context_state WHERE client_user_id=? AND conv_id=?",
+                                     (client_user_id, conv_id)).fetchone()
+        return json.loads(row["payload_json"]) if row else {}
+
+    def save_context_state(self, client_user_id: str, conv_id: str, payload: Dict[str, Any]) -> None:
+        with self._tx() as connection:
+            connection.execute(
+                "INSERT INTO context_state VALUES (?,?,?,?) ON CONFLICT(client_user_id,conv_id)"
+                " DO UPDATE SET payload_json=excluded.payload_json, updated_at=excluded.updated_at",
+                (client_user_id, conv_id, json.dumps(payload, ensure_ascii=False), _now()))
 
     def current_turn(self, client_user_id: str, conv_id: str) -> int:
         with closing(self._connect()) as connection:

@@ -64,6 +64,7 @@
 !/tests/test_harness.py
 !/tests/test_retail_actions.py
 !/tests/test_retail_confirmation.py
+!/tests/test_context_engine.py
 !/tests/test_retail_ledger.py
 !/tests/test_retail_metrics.py
 !/tests/test_json_stage_budgets.py

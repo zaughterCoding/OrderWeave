@@ -31,8 +31,8 @@ from agents.retail_support import (
     looks_dependent_continuation,
     update_support_record,
 )
-from agents.retail_tools import (RETAIL_READ_ONLY_TOOLS, RETAIL_WRITE_TOOLS, is_execution_attempt,
-                                 retail_tool_scope, retail_tools)
+from agents.retail_tools import RETAIL_READ_ONLY_TOOLS, retail_tool_scope, retail_tools
+from agents.retail_hooks import single_agent_hooks
 from agents.retail_response_guard import constrain_response
 from mcp_tools.retail_store import RetailStore, SupportStateError
 
@@ -214,43 +214,8 @@ class RetailAgent(BaseAgent):
                     f"{policy_text.strip()}"
                 )
 
-    def _guard_tool_call(
-        self,
-        req: Request,
-        name: str,
-        args: Dict[str, Any],
-        state: Dict[str, Any],
-    ) -> Optional[str]:
-        # 本轮已生成待确认详情后，不能在同一轮执行任何已展示动作。
-        if state.get("prepared") and is_execution_attempt(name, args, req.retail_pending):
-            if self.language == "en":
-                return (
-                    "Pending-confirmation details were generated in this turn; "
-                    "do not submit or perform other business actions in the "
-                    "same turn. Show the complete details and wait for the "
-                    "user's explicit confirmation."
-                )
-            return (
-                "本轮已生成待确认详情，不能在同一轮提交或执行其他业务操作；"
-                "请展示完整详情并等待用户明确确认。"
-            )
-        return None
-
-    def _on_tool_result(
-        self,
-        req: Request,
-        name: str,
-        args: Dict[str, Any],
-        result: Any,
-        state: Dict[str, Any],
-    ) -> None:
-        if not (name in RETAIL_WRITE_TOOLS and isinstance(result, dict)):
-            return
-        if result.get("error_code") == "confirmation_required":
-            # 本轮用户消息不会变化，确认被拒后继续调用不能取得新授权。
-            state["stop_response"] = result["confirmation_hint"]
-        if result.get("success") is True and result.get("action_status") == "pending_confirmation":
-            state["prepared"] = True
+    def _loop_hooks(self, req: Request):
+        return single_agent_hooks()
 
     def _build_role_packet(self, req: Request) -> str:
         packet = json.loads(super()._build_role_packet(req))
@@ -312,6 +277,9 @@ class RetailTurnResult:
     support_stage: str = ""
     support_state_error: str = ""
     support_context_limit: bool = False
+    # 统一循环记录的模型／工具追踪片段与本轮上下文压缩记录。
+    spans: List[Dict[str, Any]] = field(default_factory=list)
+    context: Dict[str, Any] = field(default_factory=dict)
 
 
 class RetailService:
@@ -336,8 +304,11 @@ class RetailService:
         checkpoint_path: Optional[str | Path] = None,
         confirmation_client: Any = None,
         confirmation_model: str = "",
+        context_engine: Any = None,
     ):
         self.store = store
+        # 为空时沿用两轮可见窗口（消融对照）；否则由完整消息日志编排上下文。
+        self.context_engine = context_engine
         self.agent = agent
         # 为空时不调用分类器，执行时由业务库按规则判断确认。
         self.confirmation_client = confirmation_client
@@ -542,7 +513,10 @@ class RetailService:
                 memory_error = f"读取记忆失败: {ex}"
                 logger.warning(memory_error)
 
-        if history:
+        engine = self.context_engine
+        user_content: List[Dict[str, Any]] = []
+        compaction: Dict[str, Any] = {}
+        if engine is None and history:
             # 可见对话给分类器和业务角色同用；实际确认仍只核验本轮message。
             context_text = ("[Recent visible conversation; reference only, not authorization]\n" +
                 json.dumps(history, ensure_ascii=False) + "\n" + context_text)[:self.max_context_chars]
@@ -564,6 +538,32 @@ class RetailService:
                 "return_flow": (support_record or {}).get("return_flow", {}),
             }, pending_brief),
         )
+        if engine is not None:
+            compaction = await engine.prepare(client_user_id, conv_id, turn)
+            state: Dict[str, Any] = {"turn": turn, "bound_user_id": bound_user_id,
+                                     "pending_confirmation": pending_brief, "task": request.retail_task,
+                                     "recent_events": [{"kind": e["event_type"], "order_id": e.get("order_id"),
+                                                        "op_id": e.get("op_id")} for e in events_before[-6:]]}
+            if support_packet is not None:
+                state["support"] = support_packet
+            if context_text:
+                state["memory"] = context_text
+            user_content = engine.user_blocks(turn, state, message)
+            # 完整历史已在消息中，不再注入背景消息对；各角色按自身工具集渲染同一份日志。
+            request.context = ""
+            request.transcript = []
+            request.spans = []
+            turn_extra: List[Dict[str, Any]] = []
+
+            def view(agent, tools):
+                extra = agent._transient_blocks(request)
+                is_primary = getattr(agent, "_is_primary", None)
+                if extra and (is_primary is None or is_primary(request)):
+                    # 主执行角色看到的附加块随本轮用户消息写入日志，使其下一轮前缀与本轮一致。
+                    turn_extra[:] = extra
+                return engine.view(client_user_id, conv_id, user_content, tools.keys(), extra=extra)
+
+            request.context_view = view
 
         return {
             "t0": t0,
@@ -577,6 +577,9 @@ class RetailService:
             "support_blocked": support_blocked,
             "analysis": analysis,
             "request": request,
+            "user_content": user_content,
+            "turn_extra": turn_extra if engine is not None else [],
+            "compaction": compaction,
         }
 
     async def _execute_turn(self, context):
@@ -637,7 +640,9 @@ class RetailService:
         appended = [str(item["op_id"]) for item in prepared
                     if str(item.get("display_text") or "").strip() not in text]
         guarded = constrain_response(
-            text, traces=list(response.tool_traces or []), events=new_events,
+            text, traces=list(response.tool_traces or []) + self._order_evidence(
+                client_user_id, conv_id, text, current_bound_user, pending_after),
+            events=new_events,
             pending_before=pending_before, pending_after=pending_after, turn=turn,
             bound_user_id=current_bound_user,
             language=self.language,
@@ -746,6 +751,11 @@ class RetailService:
                     logger.warning(memory_error)
 
         self.store.save_visible_turn(client_user_id, conv_id, turn, message, text, response_guard=guarded.record)
+        if self.context_engine is not None and context.get("user_content"):
+            # 模型看到的是守卫后的最终回复，与用户实际看到的一致。
+            self.context_engine.calibrate(client_user_id, conv_id, request.spans or [])
+            self.store.save_turn_messages(client_user_id, conv_id, turn, self.context_engine.log_rows(
+                context["user_content"] + list(context.get("turn_extra") or []), request.transcript or [], text))
         latency_ms = (time.monotonic() - t0) * 1000
         new_events = [
             item for item in self.store.list_events(client_user_id, conv_id)
@@ -783,6 +793,8 @@ class RetailService:
             support_stage=support_stage,
             support_state_error=support_state_error,
             support_context_limit=support_limit,
+            spans=list(request.spans or []),
+            context=dict(context.get("compaction") or {}),
         )
         event = dict(
             result=result,
@@ -800,6 +812,27 @@ class RetailService:
         else:
             context["event"] = event
         return result
+
+    def _order_evidence(self, client_user_id, conv_id, text, bound_user_id, pending):
+        """回复中提到的本人订单以业务库当前记录作为核对证据。
+
+        完整历史下模型会引用前几轮已读取的订单而不再重复查询；守卫若只认本轮工具结果，
+        会把真实事实判为无法核实。这里只补订单读取事实，写操作仍只认本轮工具结果与事件。
+        """
+        if not bound_user_id:
+            return []
+        from agents.retail_response_guard import _ORDER_ID, _order_id
+
+        ids = {_order_id(m.group()) for m in _ORDER_ID.finditer(text or "")}
+        ids |= {str(p.get("order_id")) for p in pending or [] if p.get("order_id")}
+        evidence = []
+        for order_id in sorted(i for i in ids if i):
+            result = self.store.get_order_details(client_user_id, conv_id, order_id)
+            if result.get("success"):
+                evidence.append({"tool_name": "get_order_details", "input": {"order_id": order_id},
+                                 "success": True, "result_success": True, "result": result,
+                                 "source": "business_record"})
+        return evidence
 
     def _record_trace(
         self,
@@ -911,6 +944,8 @@ class RetailService:
                 "context_limit": result.support_context_limit,
             },
             "prepared_op_ids": result.prepared_op_ids,
+            "trace": result.spans,
+            "context": result.context,
             "display_appended": result.display_appended,
             "display_failed": display_failed,
             "pending_before": self._pending_brief(pending_before),

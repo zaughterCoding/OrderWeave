@@ -33,6 +33,7 @@ from agents.tools import (
     technical_tools,
     validate_tool_input,
 )
+from agents.agent_loop import LoopError, LoopHook, MethodHook, run_tool_loop
 from core.intent_recognizer import IntentCategory, IntentRecognizer, UrgencyLevel
 from core.llm_utils import extract_text_content
 from mcp_tools.retail_domain import WRITE_KINDS
@@ -189,6 +190,10 @@ class Request:
     retail_handoff: Optional[Dict[str, Any]] = None
     retail_task: Dict[str, Any] = field(default_factory=dict)
     retail_routing: Dict[str, Any] = field(default_factory=dict)
+    # 零售路径：上下文编排器给出的起始消息（按角色与工具集生成）、本轮工具往返与追踪片段。
+    context_view: Optional[Any] = None
+    transcript: Optional[List[Dict[str, Any]]] = None
+    spans: Optional[List[Dict[str, Any]]] = None
 
 
 @dataclass
@@ -317,7 +322,12 @@ class BaseAgent:
                 knowledge_hits=knowledge_hits,
             )
 
-    async def _call_llm(self, req: Request) -> AgentCallResult:
+    def _initial_messages(self, req: Request) -> List[Dict[str, Any]]:
+        """本轮起始消息。零售路径由上下文编排器提供完整历史；旧模式沿用背景／契约消息对。"""
+        compiled = getattr(req, "context_view", None)
+        if compiled is not None:
+            return compiled(self, self._tools_for_request(req))
+
         def _clean(s: str) -> str:
             return s.encode("utf-8", errors="ignore").decode("utf-8")
 
@@ -353,173 +363,33 @@ class BaseAgent:
             messages.append({"role": "user", "content": f"{label}\n{_clean(role_packet)}"})
             messages.append({"role": "assistant", "content": ack})
         messages.append({"role": "user", "content": _clean(req.message)})
+        return messages
 
+    def _transient_blocks(self, req: Request) -> List[Dict[str, Any]]:
+        """只在本角色本次调用可见、不写入日志的附加块；默认没有。"""
+        return []
+
+    def _loop_hooks(self, req: Request) -> List[LoopHook]:
+        """本角色挂入工具循环的钩子；旧角色把子类方法适配为钩子。"""
+        return [MethodHook()]
+
+    async def _call_llm(self, req: Request) -> AgentCallResult:
         tools = self._tools_for_request(req)
-        tools_used: List[str] = []
-        tool_traces: List[Dict[str, Any]] = []
-        knowledge_hits = 0
-        # 普通请求只在本次调用内保存状态；零售编排由 Request 提供同一请求共享状态。
-        guard_state: Dict[str, Any] = (
-            req.retail_guard if req.retail_guard is not None else {}
-        )
         try:
-            for _ in range(max(1, int(self.max_tool_rounds or 3))):
-                request_kwargs: Dict[str, Any] = {
-                    "model": self._model,
-                    "max_tokens": self.profile.max_tokens,
-                    "temperature": self.profile.temperature,
-                    "system": self._build_system_prompt(req),
-                    "messages": messages,
-                }
-                if tools:
-                    request_kwargs["tools"] = [
-                        {
-                            "name": spec.name,
-                            "description": spec.description,
-                            "input_schema": spec.input_schema,
-                        }
-                        for spec in tools.values()
-                    ]
-                resp = await self._client.messages.create(**request_kwargs)
-                tool_uses = [block for block in (resp.content or []) if self._block_type(block) == "tool_use"]
-                if not tool_uses:
-                    return AgentCallResult(
-                        content=extract_text_content(resp.content),
-                        tools_used=list(tools_used),
-                        tool_traces=list(tool_traces),
-                        knowledge_hits=knowledge_hits,
-                    )
-
-                messages.append({"role": "assistant", "content": resp.content})
-                tool_results = []
-                # 供应商可能忽略单工具参数；仅纯只读批次可串行消费，写入仍逐次限制。
-                read_batch = all(self._block_value(block, "name") in self.serial_read_tools for block in tool_uses)
-                for index, block in enumerate(tool_uses):
-                    name = self._block_value(block, "name")
-                    tool_use_id = self._block_value(block, "id")
-                    args = self._block_value(block, "input") or {}
-                    spec = tools.get(name)
-                    tool_t0 = time.monotonic()
-                    call_success = True
-                    result_success: Optional[bool] = None
-                    error_text = ""
-                    skipped = False
-                    guard_reason = ""
-                    if (
-                        self.max_tool_uses_per_response is not None
-                        and index >= self.max_tool_uses_per_response
-                        and not read_batch
-                    ):
-                        call_success = False
-                        result_success = False
-                        skipped = True
-                        result: Any = {
-                            "success": False,
-                            "error": (
-                                "At most one tool call may be executed per model "
-                                "response; this call was not executed."
-                                if english
-                                else "每次模型响应最多执行一个工具调用；本次调用未执行。"
-                            ),
-                        }
-                        error_text = result["error"]
-                    elif spec is None:
-                        call_success = False
-                        result = {
-                            "success": False,
-                            "error": (
-                                f"Tool is not in the {self.agent_type.value} "
-                                "agent allowlist"
-                                if english
-                                else f"工具不在 {self.agent_type.value} Agent 白名单中"
-                            ),
-                        }
-                        error_text = result["error"]
-                    else:
-                        guard_reason = self._guard_tool_call(
-                            req, name, args, guard_state
-                        ) or ""
-                        if guard_reason:
-                            call_success = False
-                            result_success = False
-                            result = {"success": False, "error": guard_reason}
-                            error_text = guard_reason
-                        else:
-                            try:
-                                validate_tool_input(
-                                    spec, args, language=self.language
-                                )
-                                result = spec.handler(req, args)
-                                if inspect.isawaitable(result):
-                                    result = await result
-                                tools_used.append(name)
-                                if isinstance(result, dict) and "success" in result:
-                                    result_success = bool(result.get("success"))
-                                self._on_tool_result(
-                                    req, name, args, result, guard_state
-                                )
-                            except Exception as ex:
-                                if _request_stop(req, ex):
-                                    raise
-                                call_success = False
-                                logger.warning("Agent 工具 %s 执行失败: %s", name, ex)
-                                error_text = str(ex)
-                                result = {"success": False, "error": error_text}
-                                # 结果不明的工具调用交由业务角色登记，避免重放。
-                                self._on_tool_error(
-                                    req, name, args, ex, guard_state
-                                )
-                    tool_latency_ms = (time.monotonic() - tool_t0) * 1000
-                    if not error_text and isinstance(result, dict):
-                        error_text = str(result.get("error", "") or "")
-                    knowledge_hits += self._knowledge_hit_count(name, result)
-                    trace: Dict[str, Any] = {
-                        "agent_type": self.agent_type.value,
-                        "tool_name": name,
-                        "tool_use_id": tool_use_id,
-                        "input": dict(args),
-                        "success": call_success,
-                        "result_success": result_success,
-                        "latency_ms": round(tool_latency_ms, 1),
-                        "cached": bool(result.get("cached")) if isinstance(result, dict) else False,
-                        "reranked": bool(result.get("reranked")) if isinstance(result, dict) else False,
-                        "error": error_text,
-                    }
-                    if skipped:
-                        trace["skipped"] = True
-                    if guard_reason:
-                        trace["blocked_by_guard"] = True
-                    if self.capture_tool_results:
-                        trace["result"] = result
-                    tool_traces.append(trace)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": json.dumps(result, ensure_ascii=False),
-                    })
-                messages.append({"role": "user", "content": tool_results})
-                if guard_state.get("stop_response"):
-                    return AgentCallResult(
-                        content=guard_state["stop_response"],
-                        tools_used=list(tools_used),
-                        tool_traces=list(tool_traces),
-                        knowledge_hits=knowledge_hits,
-                    )
-
-            raise AgentCallError(
-                f"{self.agent_type.value} 工具调用超过最大轮数",
-                tools_used,
-                tool_traces,
-                knowledge_hits,
+            out = await run_tool_loop(
+                self, req, self._initial_messages(req), tools, self._loop_hooks(req),
+                system=self._build_system_prompt(req), stop_check=_request_stop,
             )
-        except AgentCallError:
-            raise
-        except Exception as ex:
-            if _request_stop(req, ex):
-                raise
-            raise AgentCallError(
-                str(ex), tools_used, tool_traces, knowledge_hits
-            ) from ex
+        except LoopError as ex:
+            partial = ex.result
+            raise AgentCallError(str(ex), partial.tools_used, partial.tool_traces,
+                                 partial.knowledge_hits) from ex
+        return AgentCallResult(
+            content=out.content,
+            tools_used=out.tools_used,
+            tool_traces=out.tool_traces,
+            knowledge_hits=out.knowledge_hits,
+        )
 
     @staticmethod
     def _knowledge_hit_count(name: str, result: Any) -> int:

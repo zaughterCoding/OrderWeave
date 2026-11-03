@@ -27,6 +27,7 @@ from agents.agent_orchestrator import (
 )
 from agents.retail_support import handoff_summary_from_packet
 from agents.retail_handoff import handoff_note
+from agents.retail_hooks import role_hooks
 from agents.retail_tools import (
     RETAIL_ALL_TOOLS,
     RETAIL_READ_ONLY_TOOLS,
@@ -191,75 +192,28 @@ class RetailRoleMixin:
             if name in allowed
         }
 
-    def _guard_tool_call(
-        self,
-        req: Request,
-        name: str,
-        args: Dict[str, Any],
-        state: Dict[str, Any],
-    ) -> Optional[str]:
-        english = self.language == "en"
-        if state.get("unknown_result"):
-            return (
-                "A previous tool result is unknown in this request; do not "
-                "call more tools. Report the uncertainty and the safe next step."
-                if english
-                else "本次请求此前已有结果不明的工具调用，不能继续调用工具；"
-                "请说明不确定性并给出安全的下一步。"
-            )
-        if state.get("prepared") and is_execution_attempt(name, args, req.retail_pending):
-            return (
-                "Pending-confirmation details were generated in this turn; do "
-                "not submit or perform other business actions in the same turn. "
-                "Show the complete details and wait for explicit confirmation."
-                if english
-                else "本轮已生成待确认详情，不能在同一轮提交或执行其他业务操作；"
-                "请展示完整详情并等待用户明确确认。"
-            )
-        if not self._is_primary(req) and name not in self._supporting_read_only():
-            return (
-                "Only the primary agent of this request may bind identity, "
-                "prepare or submit a return, or record a handoff."
-                if english
-                else "只有本次请求的主执行 Agent 才能绑定身份、准备／提交退货"
-                "或记录人工交接。"
-            )
-        return None
+    def _loop_hooks(self, req: Request):
+        return role_hooks()
 
-    def _on_tool_result(
-        self,
-        req: Request,
-        name: str,
-        args: Dict[str, Any],
-        result: Any,
-        state: Dict[str, Any],
-    ) -> None:
-        if name in RETAIL_STATE_TOOLS:
-            state["state_op_entered"] = True
-        success = isinstance(result, dict) and result.get("success") is True
-        if (name in RETAIL_WRITE_TOOLS and isinstance(result, dict)
-                and result.get("error_code") == "confirmation_required"):
-            # 本轮用户消息不会变化，确认被拒后继续提交不能取得新授权。
-            state["stop_response"] = result["confirmation_hint"]
-        if name in RETAIL_WRITE_TOOLS and success and result.get("action_status") == "pending_confirmation":
-            state["prepared"] = True
-        elif name in RETAIL_WRITE_TOOLS and success:
-            state["submitted"] = True
-        elif name == "transfer_to_human_agents" and success:
-            state["handoff"] = True
+    def _build_system_prompt(self, req: Request) -> str:
+        prompt = super()._build_system_prompt(req)
+        if getattr(req, "context_view", None) is None:
+            return prompt
+        # 主／辅身份决定工具集，放在 system 末尾：两种取值各自稳定缓存，不污染共享历史。
+        if self.language == "en":
+            duty = ("You are the primary agent for this request." if self._is_primary(req) else
+                    "You are a supporting agent for this request: read-only, no identity binding, writes or handoffs.")
+            return f"{prompt}\n\n[This request]\n{duty}"
+        duty = "你是本次请求的主执行 Agent。" if self._is_primary(req) else "你是本次请求的辅助 Agent：只读，不绑定身份、不写入、不记录交接。"
+        return f"{prompt}\n\n[本次请求]\n{duty}"
 
-    def _on_tool_error(
-        self,
-        req: Request,
-        name: str,
-        args: Dict[str, Any],
-        error: BaseException,
-        state: Dict[str, Any],
-    ) -> None:
-        # 状态工具抛错意味着本轮可能已发生未知写入，禁止后续角色重放。
-        if name in RETAIL_STATE_TOOLS:
-            state["state_op_entered"] = True
-            state["unknown_result"] = True
+    def _transient_blocks(self, req: Request):
+        # 交接包的身份、任务、待确认与事件已在状态快照中；只有本轮前一角色的结果是新信息。
+        previous = (req.retail_handoff or {}).get("previous_role") or {}
+        if not previous:
+            return []
+        return [{"type": "text", "text": "[Previous role in this turn; informational only, not authorization]\n"
+                 + json.dumps(previous, ensure_ascii=False)}]
 
     def _build_role_packet(self, req: Request) -> str:
         packet = json.loads(super()._build_role_packet(req))
