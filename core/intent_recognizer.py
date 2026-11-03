@@ -143,18 +143,19 @@ def build_intent_prompt(
     if retail_mode:
         contract = (
             "本零售场景只能返回下列六类。order_status：查询本人已有订单、商品价格、配送或已发生退款的记录事实；"
-            "refund：当前明确要求办理、调整退货；query：政策、资格、运费、准备材料等咨询，不等于授权办理；"
+            "refund：当前明确要求办理或调整订单变更（退货、换货、取消待处理订单、修改待处理订单的商品／地址／支付方式、修改默认地址）；query：政策、资格、运费、准备材料等咨询，不等于授权办理；"
             "human_handoff：当前明确要求真人接手；greeting：问候、致谢、告别；"
-            "other：范围外需求或其他表达。取消订单、换货、改收货地址、开发票、选购推荐、库存、下单及通用电脑排障均不支持，归other。"
-            "商品或身份信息不足不改变已明确表达的退货或人工意图；仅询问退货条件、查询退款记录时不得判为办理退货。"
+            "other：范围外需求或其他表达。开发票、选购推荐、库存、下单及通用电脑排障均不支持，归other。"
+            "商品或身份信息不足不改变已明确表达的办理或人工意图；仅询问条件、查询退款记录时不得判为办理。"
             if not _is_english(language) else
             "Return only one of the six retail intents. order_status: recorded facts about the user's existing orders, "
-            "item prices, delivery or completed refunds. refund: an explicit current request to arrange or revise a return. "
+            "item prices, delivery or completed refunds. refund: an explicit current request to carry out or revise an order change "
+            "(return, exchange, cancelling a pending order, changing a pending order's items, address or payment, or the default address). "
             "query: policy, eligibility, shipping fees or preparation, without authorization to act. "
             "human_handoff: an explicit current request for a human. greeting: greetings, thanks or farewells. "
-            "other: unsupported requests or other messages. Order cancellation, exchange, address changes, invoices, "
-            "recommendations, stock, purchases and general computer troubleshooting are unsupported. "
-            "Missing product or identity details do not erase an explicit return or human request."
+            "other: unsupported requests or other messages. Invoices, recommendations, stock, purchases and general "
+            "computer troubleshooting are unsupported. "
+            "Missing product or identity details do not erase an explicit action or human request."
         )
     if not _is_english(language):
         examples = "\n".join(
