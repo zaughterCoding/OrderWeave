@@ -126,3 +126,29 @@ def test_loop_hooks_block_and_trace():
     assert [s["kind"] for s in req.spans] == ["model", "tool", "model"]
     assert req.spans[0]["usage"]["cache_read"] == 90
     assert len(req.transcript) == 1
+
+
+class _Check(LoopHook):
+    name = "check"
+
+    def pre_publish(self, ctx, text, tool_traces):
+        return "fix it" if "bad" in text else None
+
+
+def test_publish_check_revises_once():
+    agent = SimpleNamespace(agent_type=SimpleNamespace(value="general"), language="en", _model="m",
+                            profile=SimpleNamespace(max_tokens=100, temperature=0), max_tool_rounds=3,
+                            capture_tool_results=True, _knowledge_hit_count=lambda name, value: 0)
+    # 修订后合格：发出修订稿，反馈不写入工具往返。
+    agent._client = _FakeClient([[_Block(type="text", text="bad draft")], [_Block(type="text", text="good reply")]])
+    req = SimpleNamespace(retail_guard={}, transcript=[], spans=[])
+    out = asyncio.run(run_tool_loop(agent, req, [{"role": "user", "content": "hi"}], {}, [_Check()],
+                                    system="s", stop_check=lambda r, e: False))
+    assert out.content == "good reply" and req.transcript == []
+    assert [s["kind"] for s in req.spans] == ["model", "revision", "model"]
+    # 只修订一次：仍不合格时原样交给发布守卫兜底。
+    agent._client = _FakeClient([[_Block(type="text", text="bad draft")], [_Block(type="text", text="bad again")]])
+    req = SimpleNamespace(retail_guard={}, transcript=[], spans=[])
+    out = asyncio.run(run_tool_loop(agent, req, [{"role": "user", "content": "hi"}], {}, [_Check()],
+                                    system="s", stop_check=lambda r, e: False))
+    assert out.content == "bad again"

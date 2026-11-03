@@ -307,8 +307,11 @@ class RetailService:
         context_engine: Any = None,
         skill_library: Any = None,
         fact_client: Any = None,
+        publish_revision: bool = False,
     ):
         self.store = store
+        # 发布前校验并让模型修订一次；关闭时只由发布守卫替换（对照）。
+        self.publish_revision = bool(publish_revision)
         # 为空时不维护事实账本（消融对照）。
         self.fact_client = fact_client
         self.skill_library = skill_library
@@ -565,6 +568,20 @@ class RetailService:
                 "return_flow": (support_record or {}).get("return_flow", {}),
             }, pending_brief),
         )
+        if self.publish_revision:
+            def publish_check(text, traces):
+                pending_now = self.store.active_pending(client_user_id, conv_id)
+                session = self.store.list_events(client_user_id, conv_id)
+                bound_now = self.store.bound_user_id(client_user_id, conv_id)
+                checked = constrain_response(
+                    text, traces=list(traces) + self._order_evidence(client_user_id, conv_id, text, bound_now, pending_now),
+                    events=[e for e in session if int(e["event_id"]) > first_event_id],
+                    pending_before=pending_before, pending_after=pending_now, turn=turn, bound_user_id=bound_now,
+                    language=self.language, session_events=session,
+                    user_order_ids=self._user_order_ids(client_user_id, conv_id, message))
+                return list(checked.record.get("findings") or [])
+
+            request.publish_check = publish_check
         if self.skill_library is not None:
             request.retail_skills = self.skill_library
             request.loaded_skills = self._loaded_skills(client_user_id, conv_id)

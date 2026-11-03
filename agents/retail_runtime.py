@@ -428,6 +428,8 @@ class RetailRuntimeConfig:
     # 会话事实账本：每轮结构化抽取用户陈述并校验引用（需 compiled 上下文才进入模型输入）。
     # S3 小样本未见显著收益且成本约增三成，默认关闭。
     task_facts: bool = False
+    # 发布前用守卫不变量检查草稿，有问题时反馈给模型修订一次。
+    publish_revision: bool = True
 
     @classmethod
     def from_env(cls) -> "RetailRuntimeConfig":
@@ -554,6 +556,7 @@ class RetailRuntimeConfig:
             context_mode=_env_text("RETAIL_CONTEXT_MODE", "compiled").lower(),
             skill_mode=_env_text("RETAIL_SKILL_MODE", "on_demand").lower(),
             task_facts=_env_bool("RETAIL_TASK_FACTS", False),
+            publish_revision=_env_bool("RETAIL_PUBLISH_REVISION", True),
             context_budget_tokens=max(2000, int(_env_text("RETAIL_CONTEXT_BUDGET_TOKENS", "32000"))),
             enable_memory=_env_bool("RETAIL_ENABLE_MEMORY", True),
             enable_knowledge=enable_knowledge,
@@ -1005,6 +1008,7 @@ def _build_retail_runtime(config: RetailRuntimeConfig, encoder) -> RetailRuntime
         skill_library=skill_library,
         fact_client=(client.for_stage("extract", count_turn=True)
                      if config.task_facts and config.context_mode == "compiled" else None),
+        publish_revision=config.publish_revision,
     )
 
     return RetailRuntime(

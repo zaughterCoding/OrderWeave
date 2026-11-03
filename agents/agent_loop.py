@@ -41,6 +41,10 @@ class LoopHook:
         """一批工具结果回填后；返回非空字符串即结束本角色调用并以此作为回复。"""
         return None
 
+    def pre_publish(self, ctx: "LoopContext", text: str, tool_traces: List[Dict[str, Any]]) -> Optional[str]:
+        """最终回复发出前；返回非空字符串作为修订反馈，模型据此改写一次。"""
+        return None
+
 
 @dataclass
 class LoopContext:
@@ -138,6 +142,7 @@ async def run_tool_loop(
     knowledge_hits = 0
     max_rounds = max(1, int(getattr(agent, "max_tool_rounds", 3) or 3))
     per_response = getattr(agent, "max_tool_uses_per_response", None)
+    revisions_left = 1
     serial_read = set(getattr(agent, "serial_read_tools", ()) or ())
 
     def result(content: str) -> LoopResult:
@@ -169,7 +174,16 @@ async def run_tool_loop(
             tool_uses = [b for b in (resp.content or []) if block_type(b) == "tool_use"]
             if not tool_uses:
                 from core.llm_utils import extract_text_content
-                return result(extract_text_content(resp.content))
+                draft = extract_text_content(resp.content)
+                feedback = next((f for f in (h.pre_publish(ctx, draft, tool_traces) for h in hooks) if f), None)
+                if feedback and revisions_left > 0:
+                    # 草稿未发出：带上具体问题让模型改写一次；修订对话不写入日志。
+                    revisions_left -= 1
+                    ctx.spans.append({"kind": "revision", "agent": agent_name, "feedback": feedback[:500]})
+                    messages.append({"role": "assistant", "content": [{"type": "text", "text": draft or "(empty)"}]})
+                    messages.append({"role": "user", "content": [{"type": "text", "text": feedback}]})
+                    continue
+                return result(draft)
 
             assistant_blocks = plain_blocks(resp.content)
             messages.append({"role": "assistant", "content": assistant_blocks})

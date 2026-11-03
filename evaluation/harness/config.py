@@ -62,6 +62,8 @@ class Profile:
     skill_mode: str = "inline"
     # S3 会话事实账本。
     task_facts: bool = False
+    # S4 发布前校验与修订。
+    publish_revision: bool = False
 
 
 PROFILES = {
@@ -71,6 +73,9 @@ PROFILES = {
     "ctx-single": Profile("ctx-single", agent_mode="single", context_mode="compiled"),
     "skill-multi": Profile("skill-multi", context_mode="compiled", skill_mode="on_demand"),
     "skill-single": Profile("skill-single", agent_mode="single", context_mode="compiled", skill_mode="on_demand"),
+    "check-multi": Profile("check-multi", context_mode="compiled", skill_mode="on_demand", publish_revision=True),
+    "check-single": Profile("check-single", agent_mode="single", context_mode="compiled", skill_mode="on_demand",
+                            publish_revision=True),
     "facts-multi": Profile("facts-multi", context_mode="compiled", skill_mode="on_demand", task_facts=True),
     "facts-single": Profile("facts-single", agent_mode="single", context_mode="compiled", skill_mode="on_demand",
                             task_facts=True),

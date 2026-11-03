@@ -197,6 +197,8 @@ class Request:
     # 按需 Skill：技能库与本会话此前已加载的 Skill 名称（来自消息日志）。
     retail_skills: Optional[Any] = None
     loaded_skills: List[str] = field(default_factory=list)
+    # 发布前校验：(草稿, 本角色工具轨迹) -> 守卫发现列表；由服务层按当前业务状态提供。
+    publish_check: Optional[Any] = None
 
 
 @dataclass

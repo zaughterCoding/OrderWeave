@@ -62,6 +62,7 @@ The graph advances the workflow; the Store owns business authorization. Model ou
 | Context compilation | Full message log rendered per role and tool set; the state snapshot is logged with the user message; over budget, older tool results become re-queryable references, then an anchored summary, with compaction persisted | History and summaries inform the model only and never authorize confirmation; `RETAIL_CONTEXT_MODE=window` keeps the old two-turn window for comparison |
 | Temporal fact ledger | Extraction runs in parallel with the confirmation check; quotes must appear verbatim in the latest customer message, supersede/retract must target a live fact, sizes are bounded; ambiguity is recorded as unresolved for the agent to ask about | Facts come only from customer statements and never establish identity or authorization; `RETAIL_TASK_FACTS=false` turns it off |
 | On-demand skills | The policy is split by section: general rules stay in the prompt; cancel / modify pending order / return / exchange sections and procedures live in `skills/retail-*`; the split concatenates back to the original text | Skills only provide policy and procedure text and cannot authorize writes; `RETAIL_SKILL_MODE=inline` keeps the whole policy in the prompt |
+| Pre-publish check and revision | The model's draft is checked with the guard invariants; problems go back as structured feedback for one rewrite, and the publish guard stays as the last line | One revision only; `RETAIL_PUBLISH_REVISION=false` turns it off |
 | Agent loop hooks | pre_model / pre_tool / post_tool / on_tool_error / stop_response; retail policies are separate plugins, and the legacy roles keep their methods through an adapter | Hooks only check invariants and cannot authorize writes |
 | Memory | Optional Redis working memory and summaries, ChromaDB episodic/profile memory, plus bounded SQLite-visible history | Profiles are off by default; history cannot establish identity or confirmation |
 
@@ -168,6 +169,7 @@ Keep `user_id` and `conv_id` unchanged across turns. Obtain sandbox identity and
 | `RETAIL_AGENT_MODE` | `multi`; `single` is available |
 | `RETAIL_WORKFLOW_MODE` | `langgraph`; `legacy` is available |
 | `RETAIL_CONTEXT_MODE` | `compiled` (full message log and context compilation); `window` keeps the old two-turn window |
+| `RETAIL_PUBLISH_REVISION` | `true`; check the draft before publishing and revise once |
 | `RETAIL_TASK_FACTS` | `false` (no significant gain in S3 small-sample tests, about 30% higher cost); requires `compiled` context when enabled |
 | `RETAIL_SKILL_MODE` | `on_demand` (skills bound to write tools); `inline` keeps the whole policy in the prompt |
 | `RETAIL_CONTEXT_BUDGET_TOKENS` | `32000`; history above this estimate triggers persisted compaction |

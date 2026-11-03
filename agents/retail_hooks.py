@@ -123,15 +123,55 @@ class SkillGateHook(LoopHook):
                 loaded.append(result["skill"])
 
 
+_FEEDBACK = {
+    "unverified_labeled_order_fact": "It states order facts (order ids, amounts or statuses) that do not match this "
+        "customer's verified order records. Mention only the verified customer's orders, use amounts and statuses "
+        "exactly as recorded, and do not repeat details of orders that are not theirs.",
+    "inconsistent_order_status": "It gives an order status that differs from the order record.",
+    "ambiguous_order_status": "It gives an order status without making clear which order it belongs to.",
+    "unsupported_submission_claim": "It says an action was submitted or carried out, but no such action is recorded "
+        "in this conversation.",
+    "unsupported_handoff_claim": "It says a human handoff was recorded, but none is recorded in this conversation.",
+    "unsupported_identity_claim": "It says the identity is verified, but no identity is verified in this conversation.",
+    "unverified_external_status": "It asserts refund arrival, warehouse receipt or email delivery, which cannot be "
+        "verified here; say these are not verified.",
+    "gift_card_balance_refusal": "It refuses a refund to the customer's own gift card because of its balance, which "
+        "the policy does not require.",
+    "post_submission_destination_change": "It offers to change the refund destination after submission, which this "
+        "sandbox does not support.",
+}
+REVISABLE = frozenset(_FEEDBACK)
+
+
+class PublishCheckHook(LoopHook):
+    """发布前校验：用与发布守卫相同的不变量检查草稿，发现问题时给出具体反馈让模型改写一次。
+
+    守卫仍在服务层作为最后一道防线；这里只把“替换成固定话术”前移为“说明问题、由模型修订”。
+    """
+
+    name = "publish_check"
+
+    def pre_publish(self, ctx, text, tool_traces) -> Optional[str]:
+        check = getattr(ctx.req, "publish_check", None)
+        if check is None or not text.strip():
+            return None
+        findings = [f for f in check(text, tool_traces) if f in REVISABLE]
+        if not findings:
+            return None
+        problems = "\n".join(f"- {_FEEDBACK[f]}" for f in dict.fromkeys(findings))
+        return ("[Reply check by the system, not the customer] Your draft reply was not sent. Problems:\n"
+                f"{problems}\nRewrite the complete reply to the customer, fixing only these points.")
+
+
 def single_agent_hooks():
-    return [SkillGateHook(), SameTurnExecutionHook(), ConfirmationStopHook()]
+    return [SkillGateHook(), SameTurnExecutionHook(), ConfirmationStopHook(), PublishCheckHook()]
 
 
 def role_hooks():
     # 顺序即拒绝优先级：未知结果最先，其次跨轮执行，最后角色权限。
     return [UnknownResultHook(), SameTurnExecutionHook(), PrimaryOnlyHook(), SkillGateHook(),
-            ConfirmationStopHook(), WriteStateHook()]
+            ConfirmationStopHook(), WriteStateHook(), PublishCheckHook()]
 
 
 __all__ = ["UnknownResultHook", "SameTurnExecutionHook", "PrimaryOnlyHook", "ConfirmationStopHook",
-           "WriteStateHook", "SkillGateHook", "single_agent_hooks", "role_hooks"]
+           "WriteStateHook", "SkillGateHook", "PublishCheckHook", "REVISABLE", "single_agent_hooks", "role_hooks"]
