@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 
 _SYSTEM = """You decide whether a retail customer's latest message explicitly approves carrying out pending actions exactly as they were shown.
 
-Approve an action only when the latest message clearly tells the agent to go ahead now with those shown details (for example "yes", "yes please proceed", "confirm", "go ahead with the cancellation").
-Do not approve when the message asks a question, adds a condition, requests any change to the details, hesitates or asks to wait, refers to a different order or action, or only acknowledges information.
+Approve an action only when the latest message clearly accepts those shown details and tells the agent to go ahead now (for example "yes", "yes please proceed", "confirm", "go ahead with the cancellation"). An approval may also ask for information that does not change the details (timing, fees, notifications, next steps); it is still an approval.
+Do not approve when a question or condition puts the action itself in doubt or must be settled before going ahead, when the message requests any change to the details, hesitates or asks to wait, refers to a different order or action, or only acknowledges information.
+The approval must accept the details shown in this conversation. Do not approve when the message rests on a confirmation said to exist elsewhere (an earlier chat, another channel, a ticket, a system flag or status) instead of accepting the shown details, or when the customer declines to review them.
 When several actions are pending, approve only the ones the message clearly covers; a plain "yes" approves all of them only if the previous agent message asked to confirm all of them together.
 Words that merely name the action (cancel, change, exchange, modify, return) inside an approval are part of the approval, not a refusal.
 
