@@ -216,17 +216,19 @@ Knowledge and semantic reference artifacts are not distributed, so the historica
 
 ## Evaluation results
 
-### Full τ²-bench retail (2026-11-03)
+### Full τ²-bench retail (2026-11-04)
 
 | Metric | Result |
 | --- | --- |
-| pass^1 | **0.781** (95% CI 0.719–0.836, task bootstrap) |
-| pass^2 / pass^3 | **0.675** / **0.614** |
-| Sessions | 114 tasks × 3 = 342, all valid, 267 successes; 14 ended by agent failure |
-| Write safety | All 466 writes were shown first and carried out after a later confirmation; 0 unconfirmed, 0 duplicate |
-| Cost and latency | About CNY 0.037 per session (including user simulator and judge); 88.3% system input cache hits; turn latency P50 4.5 s / P95 9.7 s |
+| pass^1 | **0.822** (95% CI 0.763–0.874, task bootstrap) |
+| pass^2 / pass^3 | **0.734** / **0.667** |
+| Sessions | 114 tasks × 3 = 342, all valid, 281 successes; 1 ended by agent failure |
+| Write safety | All 503 writes were shown first and carried out after a later confirmation; 0 unconfirmed, 0 duplicate |
+| Cost and latency | About CNY 0.046 per session (including user simulator and judge); 86.5% system input cache hits; turn latency P50 5.9 s / P95 11.2 s |
 
-Setup: τ²-bench pinned at fc0055d, all 114 tasks of the retail base split, official user simulator and database plus natural-language assertion scoring; the system under test, the user simulator and the judge all use deepseek-flash with thinking disabled; default configuration (multi-agent, full message-log context, on-demand skills, pre-publish check and revision, fact ledger off). No task is excluded; 15 tasks whose official reference actions raise errors are scored as the official harness does. The judge agreed with blind labels from another model family on 0.92 of 50 assertions. This is one run, not an online success rate.
+Setup: τ²-bench pinned at fc0055d, all 114 tasks of the retail base split, official user simulator and database plus natural-language assertion scoring; the system under test, the user simulator and the judge all use deepseek-flash with thinking disabled; default configuration (multi-agent, full message-log context, on-demand skills, pre-publish check and revision, request checklist, fact ledger off). No task is excluded; 15 tasks whose official reference actions raise errors are scored as the official harness does. The judge agreed with blind labels from another model family on 0.92 of 50 assertions. This is one run, not an online success rate.
+
+Paired by task against the previous full run (2026-11-03: pass^1 0.781, pass^3 0.614, 14 agent failures): pass^1 +0.041 (95% CI 0.000–0.085, borderline significant), mainly from no longer ending sessions on calls that never ran and from the request checklist reducing missed writes; the cost is about +25% per session and about +1.3 s turn latency at P50.
 
 ### Small-sample comparisons during development
 
