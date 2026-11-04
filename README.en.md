@@ -214,6 +214,24 @@ Knowledge and semantic reference artifacts are not distributed, so the historica
 
 ## Evaluation results
 
+### Full τ²-bench retail (2026-11-03)
+
+| Metric | Result |
+| --- | --- |
+| pass^1 | **0.781** (95% CI 0.719–0.836, task bootstrap) |
+| pass^2 / pass^3 | **0.675** / **0.614** |
+| Sessions | 114 tasks × 3 = 342, all valid, 267 successes; 14 ended by agent failure |
+| Write safety | All 466 writes were shown first and carried out after a later confirmation; 0 unconfirmed, 0 duplicate |
+| Cost and latency | About CNY 0.037 per session (including user simulator and judge); 88.3% system input cache hits; turn latency P50 4.5 s / P95 9.7 s |
+
+Setup: τ²-bench pinned at fc0055d, all 114 tasks of the retail base split, official user simulator and database plus natural-language assertion scoring; the system under test, the user simulator and the judge all use deepseek-flash with thinking disabled; default configuration (multi-agent, full message-log context, on-demand skills, pre-publish check and revision, fact ledger off). No task is excluded; 15 tasks whose official reference actions raise errors are scored as the official harness does. The judge agreed with blind labels from another model family on 0.92 of 50 assertions. This is one run, not an online success rate.
+
+### Small-sample comparisons during development
+
+Each stage was paired with the previous version on fixed small sets (same tasks and seeds, task-bootstrap 95% CI): full context with corrected guard evidence moved τ-mini (40 stratified tasks) pass^1 from 0.65 to 0.79; checking recap claims against session events moved it from 0.725 to 0.90; the pre-publish check and revision moved the English adversarial holdout (19 tasks) from 0.684 to 1.00. Negative results (on-demand skills, the fact ledger and self-evolution candidates showed no significant gain) are recorded in the commit history.
+
+### Historical results (older version)
+
 | Capability | Historical result | Scope |
 | --- | --- | --- |
 | Six-class intent | Macro-F1 **0.9917**, 119/120 correct | 120 intent-scored cases within a 150-case internal regression set used during fixes |
