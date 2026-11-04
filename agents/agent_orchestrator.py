@@ -1121,14 +1121,18 @@ class AgentOrchestrator:
             from agents.retail_support import analyze_message
             from mcp_tools.retail_store import evaluate_confirmation
             action = ((req.retail_support or {}).get("return_flow") or {}).get("action")
-            action = action or analyze_message(req.message, has_pending=True).return_flow_action
-            pending_reply = action not in {
-                "cancel", "human", "switch_to_troubleshooting", "conditional_return",
-                "related_question", "independent_question",
-            } and (action == "provide_info" or any(
+            if not action and language != "en":
+                action = analyze_message(req.message, has_pending=True).return_flow_action
+            # 优先使用本轮分类器判定；分类器未判定时才回退到偏保守的规则。
+            judged = [item.get("confirmation_approved") for item in req.retail_pending]
+            approved = (any(judged) if any(j is not None for j in judged) else any(
                 evaluate_confirmation(req.message, item, req.retail_pending, language=language).approved
                 for item in req.retail_pending
             ))
+            pending_reply = action not in {
+                "cancel", "human", "switch_to_troubleshooting", "conditional_return",
+                "related_question", "independent_question",
+            } and (action == "provide_info" or approved)
         # 1. 调用方未识别过意图时，这里识别。
         if req.intent is None:
             if pending_reply:

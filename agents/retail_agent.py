@@ -551,6 +551,10 @@ class RetailService:
             context_text = ("[Recent visible conversation; reference only, not authorization]\n" +
                 json.dumps(history, ensure_ascii=False) + "\n" + context_text)[:self.max_context_chars]
 
+        for item in pending_brief:
+            # 只供编排路由参考；执行时业务库仍按同轮同操作的判定独立核验。
+            decision = self.store.confirmation_decision(client_user_id, conv_id, turn, str(item.get("op_id")))
+            item["confirmation_approved"] = None if decision is None else bool(decision["approved"])
         request = Request(
             message=message,
             user_id=client_user_id,

@@ -44,8 +44,6 @@ _HANDOFF = re.compile(
     r"(?:live agent.{0,12}(?:connected|taken over)|handoff.{0,12}(?:recorded|completed))", re.I,
 )
 _IDENTITY = re.compile(r"身份.{0,5}(?:已核实|已验证|核对成功)|已.{0,4}(?:核实|验证).{0,4}身份|identity.{0,10}(?:verified|confirmed)", re.I)
-_GIFT_REFUSAL = re.compile(r"礼品卡.{0,18}(?:余额不足|没有余额|余额为\s*0|余额是\s*0).{0,18}(?:不能|无法|不支持|不可).{0,10}(?:退款|退货)|礼品卡.{0,100}余额.{0,30}低于.{0,20}无法覆盖|gift card.{0,20}(?:insufficient|zero|no balance).{0,25}(?:cannot|can't|unable)", re.I)
-_CHANGE_DESTINATION = re.compile(r"(?:之后|后续|提交后|稍后|随时).{0,12}(?:更改|修改|更换|调整).{0,8}(?:退款去向|支付方式)|(?:can|may).{0,15}change.{0,15}(?:refund destination|payment method).{0,15}(?:later|after)", re.I)
 _ORDER_ID = re.compile(r"#?W\d+", re.I)
 _STATUS = re.compile(r"(?:订单状态|order status)\s*(?:[:：]|为|是)\s*([^\n，。.,;；]+)", re.I)
 _AMOUNT = re.compile(r"(?:预计申请金额|预计退款金额|退款金额|estimated refund amount)\s*[:：为是]?\s*[¥￥$]?\s*(\d[\d,]*(?:\.\d+)?)", re.I)
@@ -89,7 +87,7 @@ def _explanation(unit: str, match: re.Match) -> bool:
     instruction = re.split(r"[，,:：\n]", prefix)[-1].strip()
     if re.fullmatch(r"(?:\d+[.)、]\s*)?(?:请(?:先)?|需(?:要)?(?:先)?|建议(?:先)?|先|并)?(?:确认|核对|检查)(?:该|此)?", instruction):
         return True
-    # 状态名的定义不是对本人订单的查询结果。
+    # 状态名的定义不是对本人订单的查询结果；声称类正则改由模型校验后随之移除。
     return bool(re.match(r"\s*(?:return requested|已申请退货).{0,30}只(?:表示|代表|说明)", prefix, re.I))
 
 
@@ -224,11 +222,6 @@ def constrain_response(
     any_submitted = any(e.get("event_type") == "return_requested" or str(e.get("event_type", "")).endswith("_executed")
                         for e in history)
     any_handoff = any(e.get("event_type") == "handoff_requested" for e in history)
-    already_submitted = any(
-        t.get("tool_name") == "get_order_details" and _ok(t)
-        and (t["result"].get("order") or {}).get("status") == "return requested"
-        for t in traces
-    )
     for event in submitted:
         payload = event["payload"]
         order_id, op_id = event["order_id"], event["op_id"]
@@ -352,18 +345,7 @@ def constrain_response(
     for clause in _semantic_units(text):
         issue = ""
         replacement = ""
-        if _GIFT_REFUSAL.search(clause) and not _QUESTIONS.search(clause):
-            issue = "gift_card_balance_refusal"
-            replacement = (
-                "An existing gift card owned by you may be a refund destination; "
-                "eligibility must be checked with the business tools."
-                if english else "本人已有礼品卡可作为退款去向；是否可办理须以业务工具校验为准。"
-            )
-        elif _CHANGE_DESTINATION.search(clause) and (submitted or already_submitted or "提交后" in clause) and not re.search(r"不支持|不能|cannot|not support", clause, re.I):
-            issue = "post_submission_destination_change"
-            replacement = ("This sandbox does not support changing the destination after submission."
-                           if english else "本沙箱不支持提交后更改退款去向。")
-        elif any(not re.search(r"尚未核实|无法确认|未知|not verified|unknown|cannot confirm", clause[m.end():].split("，")[0], re.I)
+        if any(not re.search(r"尚未核实|无法确认|未知|not verified|unknown|cannot confirm", clause[m.end():].split("，")[0], re.I)
                  for m in _fact_matches(_UNOBSERVED, clause)):
             issue = "unverified_external_status"
             replacement = ("Refund arrival, warehouse receipt and email delivery have not been verified."

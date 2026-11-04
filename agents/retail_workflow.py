@@ -4,7 +4,6 @@ from __future__ import annotations
 import hashlib
 import asyncio
 import json
-import re
 import time
 import uuid
 from contextvars import ContextVar
@@ -218,21 +217,23 @@ class RetailWorkflow:
         route = "normal"
         if pending:
             analysis = context.get("analysis")
-            # 支持未启用时 Host 分析没有动作，仍需按待办消息本身判定退出。
-            action = (
-                analysis.return_flow_action
-                if analysis is not None and analysis.return_flow_action != "none"
-                else analyze_message(text, has_pending=True).return_flow_action
-            )
+            # 支持未启用时 Host 分析没有动作，中文仍按待办消息本身判定退出；英文不用关键词改道，
+            # 撤回或转人工由业务角色理解后调用工具，待确认详情不会因提到某个词被作废。
+            if analysis is not None and analysis.return_flow_action != "none":
+                action = analysis.return_flow_action
+            elif self.service.language == "en":
+                action = "none"
+            else:
+                action = analyze_message(text, has_pending=True).return_flow_action
             call = self._call.get()
             # 本轮已有确认判定且批准时优先视为确认，避免“确认取消订单”被当成撤回待确认详情。
             decisions = [self.service.store.confirmation_decision(call["user"], call["conv"], context["turn"],
                                                                   str(p["op_id"])) for p in pending if p.get("op_id")]
             if any(d and d["approved"] for d in decisions):
                 route = "confirm"
-            elif action == "cancel" or re.fullmatch(r"(?:cancel|cancel (?:the )?return)[.!]?", text, re.I):
+            elif action == "cancel":
                 route = "cancel"
-            elif action == "human" or re.search(r"\b(?:human|live agent)\b", text, re.I):
+            elif action == "human":
                 route = "human"
             elif not any(decisions) and any(
                     evaluate_confirmation(text, p, pending, language=self.service.language).approved for p in pending):

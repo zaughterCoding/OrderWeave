@@ -135,10 +135,6 @@ _FEEDBACK = {
     "unsupported_identity_claim": "It says the identity is verified, but no identity is verified in this conversation.",
     "unverified_external_status": "It asserts refund arrival, warehouse receipt or email delivery, which cannot be "
         "verified here; say these are not verified.",
-    "gift_card_balance_refusal": "It refuses a refund to the customer's own gift card because of its balance, which "
-        "the policy does not require.",
-    "post_submission_destination_change": "It offers to change the refund destination after submission, which this "
-        "sandbox does not support.",
 }
 REVISABLE = frozenset(_FEEDBACK)
 

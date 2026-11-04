@@ -543,11 +543,6 @@ def analyze_message(
         )
     )
     existing_active = bool(has_record and continuation)
-    # 已知耳机问题中换一台平板测试，不等于把支持对象改成平板。
-    companion_tablet = bool(
-        existing_active and explicit and re.search(r"(?:另一|其他|别的|换一).{0,3}平板", lower)
-        and not _contains_any(lower, (word for word in _OTHER_PRODUCT_WORDS if word != "平板"))
-    )
 
     result.product_explicit = explicit
     result.product_mentioned = explicit or bare
@@ -562,7 +557,7 @@ def analyze_message(
     elif explicit and foreign_product_id:
         result.scope_state = "out_of_scope"
         result.reason = "unsupported_product_id"
-    elif explicit and other_product and not companion_tablet:
+    elif explicit and other_product:
         result.scope_state = "out_of_scope"
         result.reason = "other_product"
     elif explicit and unsupported_issue:

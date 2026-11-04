@@ -379,9 +379,6 @@ def _evaluate_confirmation_en(
     text = _normalize_text(message)
     if not text:
         return ConfirmationDecision(False, "none", "The confirmation is empty")
-    # 只消除详情定语中的过去时歧义，转述肯定与provided that仍不得授权。
-    text = re.sub(r"\b(details(?:\s+that)?\s+you)\s+provided\b(?!\s+that\b)",
-                  r"\1 supplied", text, flags=re.I)
     if len(text) > 400:
         return ConfirmationDecision(
             False, "none", "The confirmation is too long to judge safely"
@@ -407,11 +404,10 @@ def _evaluate_confirmation_en(
     mentioned = _order_ids_in(text)
     clauses = _clauses(text)
 
+    # 规则只是分类器失败时的回退，宁可多拒；复杂礼貌句交给分类器判断。
     fillers = {
         "please", "thanks", "thank you", "great", "perfect", "fine", "good",
         "thanks for your help", "thank you for your help",
-        "thanks for laying out the details", "thank you for confirming the details",
-        "thank you for preparing the details and for your help",
     }
 
     def _positive_clauses(related: List[str]) -> bool:
