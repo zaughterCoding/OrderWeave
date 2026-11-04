@@ -62,6 +62,7 @@ flowchart TD
 | 无进展保护 | 同一事实下连续两轮守卫回退明确失败；新事实或正常通过可恢复 | 失败仍保留为失败，不通过截短会话提高分数 |
 | 上下文编排 | 完整消息日志→各角色按自身工具集渲染；状态快照随用户消息写入日志；预算超限时先把较早轮次的工具结果替换为可重查引用，再生成锚定摘要，压缩状态持久化 | 历史与摘要只供理解，不构成确认授权；`RETAIL_CONTEXT_MODE=window`保留旧两轮窗口作对照 |
 | 时序事实账本 | 抽取与确认判定并行；引用须逐字出现在本轮用户消息，取代／撤回须指向仍有效的事实，数量与长度受限；存疑信息标为待澄清交给 Agent 追问 | 事实只来自用户陈述，不提供身份或授权；`RETAIL_TASK_FACTS=false`关闭 |
+| 请求清单 | 与确认判定并行抽取用户要求的写操作；引用须逐字来自本轮用户消息，订单号须出现在本轮对话原文；进度只由业务事件与待确认记录推出。执行结果改用固定话术时附未完成项提醒；仍有可办请求时转人工前先提醒一次 | 清单只用于提醒与编排，不提供授权；用户坚持时照常转人工；`RETAIL_REQUEST_PLAN=false`关闭 |
 | 按需 Skill | 政策按章节拆分：通用规则常驻，取消／修改待处理订单／退货／换货章节与操作要点放入 `skills/retail-*`；拆分可逐字拼回原文 | Skill 只提供政策与流程文本，不能授权写入；`RETAIL_SKILL_MODE=inline`保留整份政策常驻 |
 | Agent 循环钩子 | pre_model／pre_tool／post_tool／on_tool_error／stop_response；零售策略为独立插件，旧客服角色经适配器沿用原方法 | 钩子只校验不变量，不能授权写入 |
 | 记忆 | 可选Redis工作记忆与摘要、ChromaDB情景记忆和画像；独立SQLite保存有限可见对话 | 画像默认关闭；历史不提供身份或提交授权 |
@@ -170,6 +171,7 @@ Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -ContentType "applicat
 | `RETAIL_WORKFLOW_MODE` | `langgraph`；可设`legacy` |
 | `RETAIL_CONTEXT_MODE` | `compiled`（完整消息日志＋上下文编排）；可设`window`（旧两轮窗口） |
 | `RETAIL_PUBLISH_REVISION` | `true`；发布前校验并修订一次 |
+| `RETAIL_REQUEST_PLAN` | `true`；会话请求清单，需`compiled`上下文 |
 | `RETAIL_TASK_FACTS` | `false`（S3小样本未见显著收益，成本约增三成）；开启需`compiled`上下文 |
 | `RETAIL_SKILL_MODE` | `on_demand`（按需 Skill 并绑定写工具）；可设`inline`（整份政策常驻） |
 | `RETAIL_CONTEXT_BUDGET_TOKENS` | `32000`；历史超过该估计值时触发持久化压缩 |

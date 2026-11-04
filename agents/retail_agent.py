@@ -308,8 +308,11 @@ class RetailService:
         skill_library: Any = None,
         fact_client: Any = None,
         publish_revision: bool = False,
+        plan_client: Any = None,
     ):
         self.store = store
+        # 为空时不维护请求清单（消融对照）。
+        self.plan_client = plan_client
         # 发布前校验并让模型修订一次；关闭时只由发布守卫替换（对照）。
         self.publish_revision = bool(publish_revision)
         # 为空时不维护事实账本（消融对照）。
@@ -437,6 +440,36 @@ class RetailService:
         return {"accepted": [a["action"] for a in out["accepted"]],
                 "rejected": [r["reason"] for r in out["rejected"]]}
 
+    async def _update_plan(self, message, client_user_id, conv_id, turn, after_event_id) -> Dict[str, Any]:
+        """抽取本轮用户提出或放弃的请求并校验引用后更新清单；同一轮只处理一次。"""
+        if self.plan_client is None:
+            return {}
+        from agents.retail_plan import apply_ops, extract
+
+        plan, processed = self.store.request_plan(client_user_id, conv_id)
+        if processed >= turn:
+            return {"skipped": "already_processed"}
+        history = self.store.visible_history(client_user_id, conv_id)
+        previous = next((h["content"] for h in reversed(history) if h.get("role") == "assistant"), "")
+        ops = await extract(self.plan_client, self.confirmation_model, plan, previous, message)
+        if ops is None:
+            return {"error": "extraction_failed"}
+        out = apply_ops(plan, ops, message, previous, turn, after_event_id)
+        self.store.save_request_plan(client_user_id, conv_id, out["plan"], turn)
+        return {"accepted": [a["action"] for a in out["accepted"]],
+                "rejected": [r["reason"] for r in out["rejected"]]}
+
+    def _refresh_plan(self, client_user_id, conv_id, pending, nudged=()) -> Dict[str, Any]:
+        """按业务记录刷新清单进度并持久化；不改变已抽取到的轮次。"""
+        from agents.retail_plan import refresh
+
+        plan, processed = self.store.request_plan(client_user_id, conv_id)
+        plan = refresh(plan, self.store.list_events(client_user_id, conv_id), pending)
+        if nudged:
+            plan["nudged"] = sorted(set(plan.get("nudged") or []) | set(nudged))
+        self.store.save_request_plan(client_user_id, conv_id, plan, processed)
+        return plan
+
     async def _prepare_turn(self, message, client_user_id, conv_id):
         t0 = time.monotonic()
         # 进程重启后仍从真实会话事件末尾开始，不能重用历史成功。
@@ -449,10 +482,12 @@ class RetailService:
         pending_before = self.store.active_pending(client_user_id, conv_id)
         bound_user_id = self.store.bound_user_id(client_user_id, conv_id)
         pending_brief = self._pending_brief(pending_before)
-        # 确认判定与事实抽取互不依赖，并行执行以免增加轮延迟。
-        _, facts_update = await asyncio.gather(
+        # 确认判定、事实抽取与请求清单互不依赖，并行执行以免增加轮延迟。
+        _, facts_update, plan_update = await asyncio.gather(
             self._judge_confirmations(message, client_user_id, conv_id, turn, pending_before),
-            self._update_facts(message, client_user_id, conv_id, turn))
+            self._update_facts(message, client_user_id, conv_id, turn),
+            self._update_plan(message, client_user_id, conv_id, turn, first_event_id))
+        plan = self._refresh_plan(client_user_id, conv_id, pending_before) if self.plan_client is not None else None
 
         support_record: Optional[Dict[str, Any]] = None
         support_state_error = ""
@@ -572,6 +607,11 @@ class RetailService:
                 "return_flow": (support_record or {}).get("return_flow", {}),
             }, pending_brief),
         )
+        if plan is not None:
+            from agents.retail_plan import open_goals
+
+            # 供转人工提醒与路由使用；只含仍未完成的请求。
+            request.retail_plan = open_goals(plan)
         if self.publish_revision:
             def publish_check(text, traces):
                 pending_now = self.store.active_pending(client_user_id, conv_id)
@@ -599,6 +639,10 @@ class RetailService:
                 from memory.task_facts import state_view
 
                 state["user_facts"] = state_view(self.store.task_facts(client_user_id, conv_id)[0])
+            if plan is not None:
+                from agents.retail_plan import plan_view
+
+                state["requests"] = plan_view(plan)
             if support_packet is not None:
                 state["support"] = support_packet
             if context_text:
@@ -634,7 +678,8 @@ class RetailService:
             "request": request,
             "user_content": user_content,
             "turn_extra": turn_extra if engine is not None else [],
-            "compaction": {**compaction, **({"facts_update": facts_update} if facts_update else {})},
+            "compaction": {**compaction, **({"facts_update": facts_update} if facts_update else {}),
+                           **({"plan_update": plan_update} if plan_update else {})},
         }
 
     async def _execute_turn(self, context):
@@ -706,6 +751,17 @@ class RetailService:
         )
         guarded.record["facts_read_ms"] = round(facts_read_ms, 3)
         text = guarded.text
+        if self.plan_client is not None:
+            from agents.retail_plan import reminder
+
+            nudged = getattr(request, "plan_handoff_nudged", None) or ()
+            plan = self._refresh_plan(client_user_id, conv_id, pending_after, nudged)
+            if guarded.record.get("mode") == "controlled" and not guarded.record.get("recovery_signature"):
+                # 执行结果由固定话术替代模型回复时，模型无法提及其余请求；由清单确定性补充。
+                note = reminder(plan, self.language == "en", turn, pending_after)
+                if note:
+                    text = f"{text}\n\n{note}"
+                    guarded.record["plan_reminder"] = True
         if guarded.record.get("recovery_signature"):
             previous = self.store.last_response_guard(client_user_id, conv_id)
             same = (previous.get("turn") in (turn - 1, turn)

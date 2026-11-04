@@ -215,6 +215,8 @@ async def run_tool_loop(
                         reason = hook.pre_tool(ctx, name, args) or ""
                         if reason:
                             blocked_by = hook.name
+                            # 建议性拦截同样确定未执行，守卫不应把它登记为写入失败。
+                            not_executed = bool(getattr(hook, "advisory", False))
                             break
                     if reason:
                         call_success, result_success, error_text = False, False, reason

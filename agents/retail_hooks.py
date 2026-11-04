@@ -123,6 +123,29 @@ class SkillGateHook(LoopHook):
                 loaded.append(result["skill"])
 
 
+class OpenRequestsHandoffHook(LoopHook):
+    """仍有可办理的请求时，转人工前先提醒一次；同一组请求已提醒过、用户仍坚持时放行。
+
+    只是建议性拦截：被拦下的调用确定未执行，不影响任何授权判断。
+    """
+
+    name = "open_requests_handoff"
+    advisory = True
+
+    def pre_tool(self, ctx, name, args) -> Optional[str]:
+        if name != "transfer_to_human_agents":
+            return None
+        goals = [g for g in getattr(ctx.req, "retail_plan", None) or [] if not g.get("nudged")]
+        if not goals or ctx.state.get("plan_handoff_nudged"):
+            return None
+        from agents.retail_plan import handoff_feedback
+
+        ctx.state["plan_handoff_nudged"] = [g["id"] for g in goals]
+        # 记在请求上（单 Agent 无共享 state），轮末持久化为已提醒，用户坚持时下一次放行。
+        ctx.req.plan_handoff_nudged = list(ctx.state["plan_handoff_nudged"])
+        return handoff_feedback(goals, _en(ctx))
+
+
 _FEEDBACK = {
     "unverified_labeled_order_fact": "It states order facts (order ids, amounts or statuses) that do not match this "
         "customer's verified order records. Mention only the verified customer's orders, use amounts and statuses "
@@ -160,14 +183,16 @@ class PublishCheckHook(LoopHook):
 
 
 def single_agent_hooks():
-    return [SkillGateHook(), SameTurnExecutionHook(), ConfirmationStopHook(), PublishCheckHook()]
+    return [SkillGateHook(), SameTurnExecutionHook(), OpenRequestsHandoffHook(), ConfirmationStopHook(),
+            PublishCheckHook()]
 
 
 def role_hooks():
-    # 顺序即拒绝优先级：未知结果最先，其次跨轮执行，最后角色权限。
+    # 顺序即拒绝优先级：未知结果最先，其次跨轮执行，再角色权限；清单提醒只在其余检查通过后生效。
     return [UnknownResultHook(), SameTurnExecutionHook(), PrimaryOnlyHook(), SkillGateHook(),
-            ConfirmationStopHook(), WriteStateHook(), PublishCheckHook()]
+            OpenRequestsHandoffHook(), ConfirmationStopHook(), WriteStateHook(), PublishCheckHook()]
 
 
 __all__ = ["UnknownResultHook", "SameTurnExecutionHook", "PrimaryOnlyHook", "ConfirmationStopHook",
-           "WriteStateHook", "SkillGateHook", "PublishCheckHook", "REVISABLE", "single_agent_hooks", "role_hooks"]
+           "WriteStateHook", "SkillGateHook", "OpenRequestsHandoffHook", "PublishCheckHook", "REVISABLE",
+           "single_agent_hooks", "role_hooks"]

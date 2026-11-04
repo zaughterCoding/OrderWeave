@@ -64,6 +64,8 @@ class Profile:
     task_facts: bool = False
     # S4 发布前校验与修订。
     publish_revision: bool = False
+    # 会话请求清单（多动作规划核对）。
+    request_plan: bool = False
 
 
 PROFILES = {
@@ -76,6 +78,8 @@ PROFILES = {
     "check-multi": Profile("check-multi", context_mode="compiled", skill_mode="on_demand", publish_revision=True),
     "check-single": Profile("check-single", agent_mode="single", context_mode="compiled", skill_mode="on_demand",
                             publish_revision=True),
+    "plan-multi": Profile("plan-multi", context_mode="compiled", skill_mode="on_demand", publish_revision=True,
+                          request_plan=True),
     "facts-multi": Profile("facts-multi", context_mode="compiled", skill_mode="on_demand", task_facts=True),
     "facts-single": Profile("facts-single", agent_mode="single", context_mode="compiled", skill_mode="on_demand",
                             task_facts=True),

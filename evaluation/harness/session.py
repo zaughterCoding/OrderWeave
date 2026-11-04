@@ -140,7 +140,7 @@ async def run_session(args: argparse.Namespace) -> Dict[str, Any]:
         semantic_routing=False, ledger_settlement_policy=model["settlement_policy"],
         model_thinking=profile.thinking, context_mode=profile.context_mode,
         skill_mode=profile.skill_mode, task_facts=profile.task_facts,
-        publish_revision=profile.publish_revision)
+        publish_revision=profile.publish_revision, request_plan=profile.request_plan)
     runtime = build_retail_runtime(runtime_config)
     await runtime.start()
     user_client = runtime.client.for_stage("user")

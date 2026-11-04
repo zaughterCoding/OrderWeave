@@ -234,7 +234,9 @@ class RetailWorkflow:
             elif action == "cancel":
                 route = "cancel"
             elif action == "human":
-                route = "human"
+                # 仍有未提醒的可办请求时不先作废待确认详情，交由业务角色说明后再决定是否转接。
+                plan = getattr(context["request"], "retail_plan", None) or []
+                route = "revise_or_question" if any(not g.get("nudged") for g in plan) else "human"
             elif not any(decisions) and any(
                     evaluate_confirmation(text, p, pending, language=self.service.language).approved for p in pending):
                 route = "confirm"

@@ -1237,6 +1237,20 @@ class AgentOrchestrator:
                 reason="pending_confirmation_routed_to_billing",
                 confidence=1.0,
             )
+        if (
+            retail_mode
+            and decision.primary_agent == AgentType.ESCALATION
+            and any(not g.get("nudged") for g in getattr(req, "retail_plan", None) or [])
+            and self._pool.get(AgentType.BILLING)
+        ):
+            # 交接角色不调用模型、直接转人工；仍有未提醒的可办请求时交给业务角色先说明，
+            # 用户坚持时由其转接（转人工钩子只提醒一次）。
+            decision = RoutingDecision(
+                primary_agent=AgentType.BILLING,
+                supporting_agents=[],
+                reason="handoff_request_with_open_items",
+                confidence=1.0,
+            )
         if retail_mode:
             req.retail_primary = decision.primary_agent.value
         return decision
