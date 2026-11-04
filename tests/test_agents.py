@@ -754,3 +754,32 @@ def test_parallel_run_keeps_a_valid_hit_from_any_agent():
 
     assert result.knowledge_hits == 1
     assert "search_knowledge_base" in result.tools_used
+
+
+def _order_trace(order):
+    return {"tool_name": "get_order_details", "input": {"order_id": order["order_id"]}, "success": True,
+            "result_success": True, "result": {"success": True, "order": order}}
+
+
+def test_guard_accepts_amounts_derived_from_order_items_and_rejects_others():
+    from agents.retail_response_guard import constrain_response
+    order = {"order_id": "#W1000001", "user_id": "u1", "status": "delivered",
+             "items": [{"item_id": "1", "name": "Lamp", "price": 10.5}, {"item_id": "2", "name": "Desk", "price": 20.25},
+                       {"item_id": "3", "name": "Chair", "price": 5.0}]}
+    kwargs = dict(traces=[_order_trace(order)], events=[], pending_before=[], pending_after=[], turn=1,
+                  bound_user_id="u1", language="en")
+    # 表格排版下的两件商品合计可由订单记录推出，回复保持不变。
+    ok = "| Lamp | $10.50 |\n| Desk | $20.25 |\n\nEstimated refund amount: $30.75"
+    assert "unverified_labeled_order_fact" not in constrain_response(ok, **kwargs).record["findings"]
+    bad = "Estimated refund amount: $31.00"
+    assert "unverified_labeled_order_fact" in constrain_response(bad, **kwargs).record["findings"]
+
+
+def test_guard_ignores_calls_rejected_before_execution():
+    from agents.retail_response_guard import constrain_response
+    trace = {"tool_name": "cancel_pending_order", "input": {"order_id": "#W1000001", "reason": "no longer needed"},
+             "success": False, "result_success": False, "not_executed": True,
+             "result": {"success": False, "error": "Tool is not in the technical agent allowlist"}}
+    guarded = constrain_response("Let me look into that.", traces=[trace], events=[], pending_before=[],
+                                 pending_after=[], turn=1, bound_user_id="u1", language="en")
+    assert "unknown_action_result" not in guarded.record["findings"]

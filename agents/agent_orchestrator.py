@@ -1162,7 +1162,10 @@ class AgentOrchestrator:
                 req.entities = recognized_entities
 
         if self._needs_clarification(req):
-            if retail_mode and (self._support_routing(req) is not None or self._information_followup(req)):
+            # 零售会话已有身份或对话上下文时，单句低置信度不代表需求不明，交给 General 结合上下文判断。
+            if retail_mode and (getattr(req, "retail_user_id", None) or req.history):
+                pass
+            elif retail_mode and (self._support_routing(req) is not None or self._information_followup(req)):
                 # 支持范围的澄清由 General 结合 Host 上下文完成，避免通用
                 # 低置信度分支先截断用户已说明的耳机问题。
                 pass
@@ -1601,7 +1604,8 @@ class AgentOrchestrator:
         协作 Agent，表达“主处理加辅助诊断”的关系，避免把命中的每个
         关键词都不分优先级地拼在一起。
         """
-        if req.urgency == UrgencyLevel.CRITICAL:
+        # 零售政策只在用户要求人工或请求超出能力时转人工；紧急程度不构成转人工理由。
+        if req.urgency == UrgencyLevel.CRITICAL and not getattr(self, "retail_mode", False):
             return RoutingDecision(
                 primary_agent=AgentType.ESCALATION,
                 reason="紧急度为 CRITICAL，触发升级路由",

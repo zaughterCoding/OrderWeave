@@ -145,3 +145,40 @@ def test_each_write_kind_main_path(tmp_path, seed, tool):
     done = store.write_action("u", "c", tool, args, YES)
     assert done["success"] and done["action_status"] == "executed", done
     assert any(e["event_type"].endswith("_executed") for e in store.list_events("u", "c"))
+
+
+def test_batch_confirmed_actions_survive_each_others_refunds(tmp_path, seed):
+    def two_pending_by_gift_card(user):
+        orders = [seed["orders"][o] for o in user["orders"] if seed["orders"][o]["status"] == "pending"
+                  and seed["orders"][o]["payment_history"][0]["payment_method_id"].startswith("gift_card")]
+        return orders[:2] if len(orders) >= 2 else None
+    user = next(u for u in seed["users"].values() if two_pending_by_gift_card(u))
+    first, second = two_pending_by_gift_card(user)
+    store = _store(tmp_path)
+    _bind(store, seed, user["user_id"])
+    turn = store.current_turn("u", "c")
+    ops = [store.write_action("u", "c", "cancel_pending_order", {"order_id": o["order_id"], "reason": "no longer needed"}, "")
+           for o in (first, second)]
+    for op in ops:
+        assert store.mark_pending_displayed("u", "c", op["op_id"], turn, False)
+    turn = store.begin_turn("u", "c")
+    store.record_confirmation_decisions("u", "c", turn, [{"op_id": op["op_id"], "approved": True} for op in ops], "test")
+    # 同批确认的第一笔退款改了礼品卡余额，第二笔仍按已展示详情执行。
+    for o in (first, second):
+        done = store.write_action("u", "c", "cancel_pending_order", {"order_id": o["order_id"], "reason": "no longer needed"}, YES)
+        assert done.get("action_status") == "executed", done
+
+
+def test_outside_change_after_display_still_blocks_execution(tmp_path, seed):
+    store = _store(tmp_path)
+    order, user = _order(seed, "pending")
+    _bind(store, seed, user["user_id"])
+    args = {"order_id": order["order_id"], "reason": "no longer needed"}
+    _prepare_and_display(store, "cancel_pending_order", args)
+    changed = dict(order, items=order["items"][:-1] or order["items"], status="pending (item modified)")
+    with store._tx() as connection:
+        connection.execute("UPDATE orders SET payload=? WHERE order_id=?",
+                           (json.dumps(changed, sort_keys=True), order["order_id"]))
+    store.begin_turn("u", "c")
+    result = store.write_action("u", "c", "cancel_pending_order", args, YES)
+    assert result.get("action_status") != "executed"

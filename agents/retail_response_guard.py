@@ -167,6 +167,17 @@ def _listed_estimate(text: str, order: dict[str, Any]) -> tuple[int, list[str]] 
     return (total, selected) if selected and not (Counter(selected) - available) else None
 
 
+def _item_subset_sums(order: dict[str, Any], limit: int = 12) -> set[int]:
+    """订单商品价格（分）的所有子集和；商品过多时只取单价与全额，避免组合爆炸。"""
+    prices = [int(Decimal(str(item["price"])) * 100) for item in order.get("items", []) if "price" in item]
+    if len(prices) > limit:
+        return set(prices) | {sum(prices)}
+    sums = {0}
+    for price in prices:
+        sums |= {value + price for value in sums}
+    return sums - {0}
+
+
 def _order_clarification(orders: dict[str, Any], english: bool, bound: bool) -> str:
     """仅展示已绑定用户的本轮查询结果，不代选退货商品或承诺金额。"""
     text = ("I could not verify the requested details. " if english else "我暂时无法核实所请求的详情。")
@@ -282,7 +293,8 @@ def constrain_response(
 
     for index, trace in enumerate(traces):
         name = trace.get("tool_name")
-        if name not in _ACTIONS:
+        # 执行前被拒（不在角色工具集、参数校验失败）确定未写入，模型已看到错误，不需登记或改写回复。
+        if name not in _ACTIONS or trace.get("not_executed"):
             continue
         result = trace.get("result")
         result = result if isinstance(result, dict) else {}
@@ -415,8 +427,16 @@ def constrain_response(
         if estimate:
             facts.append({"kind": "consultation_estimate", "order_id": target["order_id"],
                           "amount_cents": estimate[0], "item_ids": estimate[1], "source": "order_read_line_items"})
-    bad_amount = bool(amount_matches) and (len(pending_after) > 1 or any(
-        Decimal(m.group(1).replace(",", "")) * 100 not in amounts for m in amount_matches))
+    if amount_matches:
+        # 带标签金额只要求能由业务记录推出：待确认金额及其合计、会话内已提交退货金额、
+        # 已读订单商品价格的子集和。不依赖回复排版（表格、多笔详情）逐行解析。
+        amounts |= {sum(int(p.get("amount_cents") or 0) for p in pending_after)}
+        amounts |= {int((e.get("payload") or {}).get("amount_cents") or 0) for e in history
+                    if e.get("event_type") == "return_requested"}
+        for order in orders.values():
+            amounts |= _item_subset_sums(order)
+    bad_amount = bool(amount_matches) and any(
+        Decimal(m.group(1).replace(",", "")) * 100 not in amounts for m in amount_matches)
     if invalid_ids or (bad_amount and not blocks) or (status_matches and not orders and not blocks):
         findings.append("unverified_labeled_order_fact")
         text = _order_clarification(orders, english, bool(bound_user_id))

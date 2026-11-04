@@ -1507,8 +1507,35 @@ class RetailStore:
 
     @staticmethod
     def _fingerprint(order: Optional[Dict[str, Any]], user: Dict[str, Any]) -> str:
+        # 礼品卡余额不进入指纹：同批已确认的退款会改余额，余额是否足够由执行时的业务校验保证。
+        user = dict(user or {})
+        methods = user.get("payment_methods")
+        if isinstance(methods, dict):
+            user["payment_methods"] = {k: {f: v for f, v in m.items() if f != "balance"} if isinstance(m, dict) else m
+                                       for k, m in methods.items()}
         data = json.dumps([order, user], ensure_ascii=False, sort_keys=True)
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+    def _rebase_displayed(self, connection: sqlite3.Connection, client_user_id: str, conv_id: str,
+                          user_id: str, op_id: str, old_order: Optional[Dict[str, Any]],
+                          old_user: Dict[str, Any], new_user: Dict[str, Any]) -> None:
+        """刚执行的已确认写入只会让同会话其他待确认项的基准过期：
+        仅当某项基准恰好等于本次写入前的状态时，才把基准前移到写入后状态；其他变化仍须重新展示。"""
+        old_id = (old_order or {}).get("order_id")
+        rows = connection.execute(
+            "SELECT op_id, kind, args_json, base_fingerprint FROM pending_actions"
+            " WHERE client_user_id=? AND conv_id=? AND retail_user_id=? AND status='displayed' AND op_id<>?",
+            (client_user_id, conv_id, user_id, op_id)).fetchall()
+        for row in rows:
+            try:
+                _, after_order, _ = self._action_target(connection, row["kind"], json.loads(row["args_json"]), user_id)
+            except RetailStoreError:
+                continue
+            before_order = old_order if after_order and after_order.get("order_id") == old_id else after_order
+            if row["base_fingerprint"] != self._fingerprint(before_order, old_user):
+                continue
+            connection.execute("UPDATE pending_actions SET base_fingerprint=?, updated_at=? WHERE op_id=?",
+                               (self._fingerprint(after_order, new_user), _now(), row["op_id"]))
 
     def _action_target(self, connection: sqlite3.Connection, kind: str, args: Dict[str, Any],
                        user_id: str) -> Tuple[Optional[sqlite3.Row], Optional[Dict[str, Any]], Dict[str, Any]]:
@@ -1822,6 +1849,8 @@ class RetailStore:
                                    amount_cents=pending["amount_cents"])
                 self._event(connection, client_user_id, conv_id, user_id, self.executed_event(kind), payload,
                             order_id=pending["order_id"], op_id=op_id)
+                self._rebase_displayed(connection, client_user_id, conv_id, user_id, op_id,
+                                       order, user, new_user)
         except (RetailStoreError, DomainError) as ex:
             self._record_rejection(client_user_id, conv_id, str(pending["retail_user_id"]),
                                    pending["order_id"], op_id, str(ex), {"kind": kind, "args": args})

@@ -197,14 +197,15 @@ async def run_tool_loop(
                 spec = tools.get(name)
                 tool_t0 = time.monotonic()
                 call_success, result_success, error_text = True, None, ""
-                skipped, blocked_by = False, ""
+                skipped, blocked_by, not_executed = False, "", False
                 if per_response is not None and index >= per_response and not read_batch:
                     call_success, result_success, skipped = False, False, True
                     error_text = ("At most one tool call may be executed per model response; this call was not executed."
                                   if english else "每次模型响应最多执行一个工具调用；本次调用未执行。")
                     value: Any = {"success": False, "error": error_text}
                 elif spec is None:
-                    call_success = False
+                    # 工具不在本角色工具集内：处理器从未被调用，结果确定为未执行。
+                    call_success, result_success, not_executed = False, False, True
                     error_text = (f"Tool is not in the {agent_name} agent allowlist"
                                   if english else f"工具不在 {agent_name} Agent 白名单中")
                     value = {"success": False, "error": error_text}
@@ -221,6 +222,14 @@ async def run_tool_loop(
                     else:
                         try:
                             validate_tool_input(spec, args, language=agent.language)
+                        except ValueError as ex:
+                            # 参数校验在执行前失败，同样确定未执行，不登记为结果不明。
+                            call_success, result_success, not_executed = False, False, True
+                            error_text = str(ex)
+                    if reason or not_executed:
+                        value = {"success": False, "error": error_text}
+                    else:
+                        try:
                             value = spec.handler(req, args)
                             if inspect.isawaitable(value):
                                 value = await value
@@ -253,6 +262,8 @@ async def run_tool_loop(
                 }
                 if skipped:
                     trace["skipped"] = True
+                if not_executed:
+                    trace["not_executed"] = True
                 if blocked_by:
                     trace["blocked_by_guard"] = True
                     trace["blocked_by"] = blocked_by
