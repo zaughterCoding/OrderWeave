@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="OrderWeave">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3730a3"/><stop offset="1" stop-color="#0f172a"/></linearGradient>
+    <linearGradient id="warp" gradientUnits="userSpaceOnUse" x1="0" y1="46" x2="0" y2="210"><stop offset="0" stop-color="#67e8f9"/><stop offset="1" stop-color="#0e7490"/></linearGradient>
+    <linearGradient id="weft" gradientUnits="userSpaceOnUse" x1="46" y1="0" x2="210" y2="0"><stop offset="0" stop-color="#fde68a"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
+  <g fill="none" stroke-width="30">
+    <path d="M46 78H210" stroke="url(#weft)" stroke-linecap="round"/>
+    <path d="M46 128H210" stroke="url(#weft)" stroke-linecap="round"/>
+    <path d="M46 178H210" stroke="url(#weft)" stroke-linecap="round"/>
+    <path d="M78 46V210" stroke="#1b1a45" stroke-width="40" stroke-linecap="round"/>
+    <path d="M78 46V210" stroke="url(#warp)" stroke-linecap="round"/>
+    <path d="M128 46V210" stroke="#1b1a45" stroke-width="40" stroke-linecap="round"/>
+    <path d="M128 46V210" stroke="url(#warp)" stroke-linecap="round"/>
+    <path d="M178 46V210" stroke="#1b1a45" stroke-width="40" stroke-linecap="round"/>
+    <path d="M178 46V210" stroke="url(#warp)" stroke-linecap="round"/>
+    <path d="M58 128H98" stroke="#1b1a45" stroke-width="40"/>
+    <path d="M57 128H99" stroke="url(#weft)"/>
+    <path d="M108 78H148" stroke="#1b1a45" stroke-width="40"/>
+    <path d="M107 78H149" stroke="url(#weft)"/>
+    <path d="M108 178H148" stroke="#1b1a45" stroke-width="40"/>
+    <path d="M107 178H149" stroke="url(#weft)"/>
+    <path d="M158 128H198" stroke="#1b1a45" stroke-width="40"/>
+    <path d="M157 128H199" stroke="url(#weft)"/>
+  </g>
+</svg>

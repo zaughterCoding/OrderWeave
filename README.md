@@ -1,286 +1,340 @@
+<div align="center">
+
+<img src="assets/logo.svg" alt="OrderWeave logo" width="120" height="120">
+
 # OrderWeave
 
-**基于 LangGraph、MCP 与受控事务的多 Agent 零售客服系统。**
+**A stateful multi-agent retail support agent with two-phase confirmed writes, built on LangGraph and MCP.**
 
-[English](README.en.md) · [评测方法](evaluation/README.md) · [结果与适用范围](evaluation/RESULTS.md) · [MIT](LICENSE)
+English · [简体中文](README.zh-CN.md)
 
-OrderWeave 将意图识别、按需角色协作、订单工具和可恢复状态图连接到同一条客服链路。项目重点是多轮办理：识别用户需求，核对身份和订单，展示服务端生成的完整待确认详情，等待用户确认，再由服务端执行并记录结果。支持τ² retail全部七类写操作：退货、换货、取消待处理订单、修改待处理订单的商品／地址／支付方式、修改账户默认地址。
+<p>
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white">
+  <img alt="LangGraph" src="https://img.shields.io/badge/LangGraph-1.2.16-1C3C3C?logo=langchain&logoColor=white">
+  <img alt="MCP" src="https://img.shields.io/badge/MCP-1.12.4-000000?logo=anthropic&logoColor=white">
+  <img alt="Anthropic SDK" src="https://img.shields.io/badge/Anthropic_SDK-0.40.0-D97757?logo=anthropic&logoColor=white">
+  <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115.5-009688?logo=fastapi&logoColor=white">
+  <img alt="Pydantic" src="https://img.shields.io/badge/Pydantic-2.10.3-E92063?logo=pydantic&logoColor=white">
+  <br>
+  <img alt="SQLite" src="https://img.shields.io/badge/SQLite-checkpoints-003B57?logo=sqlite&logoColor=white">
+  <img alt="ChromaDB" src="https://img.shields.io/badge/ChromaDB-0.5.23-FF6446">
+  <img alt="Redis" src="https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white">
+  <img alt="Prometheus" src="https://img.shields.io/badge/Prometheus_client-0.21.1-E6522C?logo=prometheus&logoColor=white">
+  <img alt="uv" src="https://img.shields.io/badge/uv-locked-DE5FE9?logo=uv&logoColor=white">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-177_passed-2ea44f">
+  <br>
+  <img alt="tau2-bench retail pass^1" src="https://img.shields.io/badge/%CF%84%C2%B2--bench_retail-pass%5E1_0.822-22c55e">
+  <img alt="Unconfirmed writes" src="https://img.shields.io/badge/unconfirmed_writes-0%2F503-22c55e">
+  <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
+</p>
 
-公开代码面向研究、学习和本地演示。订单来自使用者自行准备的虚构沙箱；退货或取消申请不等于真实退款，人工交接仅为模拟记录。
+[Highlights](#-highlights) ·
+[Results](#-evaluation-results) ·
+[Architecture](#%EF%B8%8F-architecture) ·
+[Quick start](#-quick-start) ·
+[Configuration](#%EF%B8%8F-configuration) ·
+[Evaluation](#-reproducing-the-evaluation)
 
-## 功能
+</div>
 
-- **统一入口**：FastAPI HTTP API 与交互式 CLI 共用零售服务；默认 `multi + langgraph`，保留单 Agent 和 legacy 回退。
-- **按需协作**：general、technical、billing、escalation 四角色；只有主执行者可执行身份绑定、写操作和交接，辅助角色只读。
-- **两阶段写操作**：七类写工具首次调用只生成并展示待确认详情；用户在后续消息确认后，同参数再次调用才执行。确认由结构化分类器依据真实用户消息判定并逐轮持久化，执行时再核对展示状态、参数一致、数据指纹与一次性使用。
-- **可恢复办理**：SQLite checkpoint 保存工作图；详情展示后通过 Interrupt／Resume 等待新用户消息，修改后重新确认。
-- **受控工具调用**：真实 stdio MCP 子进程；服务端根据会话身份、已展示详情和本轮消息校验授权，提供事务、防重和未知结果保护。
-- **分层识别与知识检索**：规则、LLM 与可选本地语义门控；可选 Dense + BM25 + RRF 融合检索及 Qwen 本地重排。
-- **统一 Agent 循环与钩子**：单 Agent 与多 Agent 角色共用一条工具循环；未知结果、跨轮执行、主执行权限、确认拒绝等策略以钩子插件挂入，每次模型与工具调用记录为可回放的追踪片段。
-- **上下文编排**：完整消息日志（含工具调用与结果）只追加；稳定前缀在前、本轮状态快照在尾，利于供应商前缀缓存；超出 token 预算时持久化地省略旧工具结果并生成带轮次锚点的摘要，token 换算按实际 usage 校准。
-- **按需 Skill**：固定政策的各动作章节（原文逐字）与操作要点组成 Skill，提示词只列名称与说明，Agent 通过 `load_skill` 取正文；写工具绑定 Skill，未加载即被钩子拒绝。
-- **时序事实账本**：每轮由模型结构化提出用户陈述的事实增量（新增、改口取代、撤回、待澄清），系统逐字校验引用后记账；改口保留取代关系，状态快照给出当前事实与最近改口，历史压缩后用户陈述仍逐字保留。
-- **可观察性**：按阶段记录工具轨迹、路由、守卫和预算；可选 Redis／ChromaDB 分层记忆与 Prometheus 监控。
+---
 
-## 架构
+## 📖 Overview
+
+OrderWeave is an e-commerce customer-service agent that actually **changes orders**, not just answers questions. It handles a conversation end to end: understand the request, verify the customer's identity, read the orders they own, show complete server-generated pending details, wait for the customer to confirm in a later message, and only then execute the change behind server-side checks.
+
+It supports all seven write actions of the [τ²-bench](https://github.com/sierra-research/tau2-bench) retail domain:
+
+| Order state | Actions |
+| --- | --- |
+| Pending order | Cancel · Modify items · Modify shipping address · Modify payment method |
+| Delivered order | Return · Exchange |
+| Account | Modify default address |
+
+On the full τ²-bench retail benchmark (114 tasks × 3 trials) it reaches **pass^1 0.822** while carrying out **503 writes with 0 unconfirmed and 0 duplicate**.
+
+> [!NOTE]
+> OrderWeave is for research, learning and local demos. Orders come from a fictional sandbox you prepare yourself; a "return requested" is not a real refund, and a handoff to a human is only a simulated record.
+
+## ✨ Highlights
+
+- **🔐 Two-phase writes, enforced by the server.** The first call of any write tool only prepares and displays pending details. An identical call after the customer confirms in a *later* message executes it. A structured classifier judges the confirmation from the real user message; execution re-checks display state, identical arguments, a data fingerprint and single use. Model output, summaries, client `user_id` and intent labels can never authorize a write.
+- **🧵 Recoverable LangGraph workflow.** SQLite checkpoints plus Interrupt/Resume let a conversation wait for confirmation across turns and even across service restarts. Changed details require a fresh confirmation; uncertain writes are never blindly replayed.
+- **🤝 On-demand multi-agent collaboration.** General, technical, billing and escalation roles share one hook-based agent loop. Only the primary role may bind identity, call write tools or record a handoff; supporting roles are read-only.
+- **🛠️ A real MCP tool boundary.** Tools run in a stdio MCP subprocess with server-side identity, ownership, transaction, deduplication and unknown-result protection. Business semantics are ported from the official τ² tools, and reference replays match the official database hash.
+- **🧠 Compiled context.** An append-only log of every message, rendered per role with a stable prefix first and the per-turn state snapshot last (friendly to provider prefix caching, 86.5% input cache hits). Over budget, old tool results become re-queryable references and earlier turns an anchored summary, both persisted.
+- **📚 Policy as on-demand skills.** Each action section of the fixed policy becomes a skill. The prompt lists only names and descriptions; write tools stay locked by a hook until the agent loads the matching skill with `load_skill`.
+- **📝 Request checklist.** Each turn the model proposes the changes the customer asked for; code checks quotes verbatim and derives progress only from business events. Before a transfer to a human with handleable requests still open, the agent reminds the customer once.
+- **🛡️ Pre-publish check and response guard.** Drafts are checked against current order facts, items, amounts and session events; problems return as structured feedback for one rewrite, and the publish guard stays as the last line.
+- **📊 Built-in evaluation harness.** One command runs the official τ² user simulator and DB/NL scoring with per-session databases, a shared cost ledger, resumable runs, paired task-bootstrap comparisons and trace viewing.
+
+## 📈 Evaluation results
+
+### Full τ²-bench retail (2026-11-04)
+
+| Metric | Result |
+| --- | --- |
+| **pass^1** | **0.822** (95% CI 0.763–0.874, task bootstrap) |
+| pass^2 / pass^3 | 0.734 / 0.667 |
+| Sessions | 114 tasks × 3 = 342, all valid, 281 successes; 1 ended by agent error |
+| Write safety | 503 writes, all displayed first and executed after a later confirmation; **0 unconfirmed, 0 duplicate** |
+| Cost | ≈ CNY 0.046 per session (system under test + user simulator + judge) |
+| Latency | Turn P50 5.9 s / P95 11.2 s; 86.5% system input cache hits |
+
+<details>
+<summary><b>Setup and how it was measured</b></summary>
+
+- τ²-bench pinned at [`fc0055d`](https://github.com/sierra-research/tau2-bench/tree/fc0055dc4e0a316c3f83133267fbd6faaa770992), all 114 tasks of the retail base split, official user simulator and database plus natural-language assertion scoring.
+- The system under test, the user simulator and the judge all use `deepseek-flash` with thinking disabled; default configuration (multi-agent, compiled context, on-demand skills, pre-publish revision, request checklist).
+- No task is excluded. 15 tasks whose official reference actions raise errors are scored as the official harness does.
+- The LLM judge agreed with blind labels from another model family on 0.92 of 50 assertions.
+- This is a single run, not an online success rate.
+
+</details>
+
+### Progress over development
+
+Each change was paired with the previous version on fixed small suites (same tasks and seeds, task-bootstrap 95% CI) before the final full runs:
+
+| Change | Suite | Before → After |
+| --- | --- | --- |
+| Compiled full-history context + guard checks against live order records | τ-mini (40 stratified tasks) | 0.65 → 0.79 |
+| Recap claims checked against all session events | τ-mini | 0.725 → 0.90 |
+| Pre-publish check and one revision | English adversarial holdout (19 tasks) | 0.684 → 1.00 |
+| No dead-ends on calls that never ran + request checklist | Full τ² retail | 0.781 → **0.822** (pass^3 0.614 → 0.667) |
+
+Negative results are kept too: enabling model thinking, the temporal fact ledger, claim-level guard checks, a variant-filter tool and self-evolved skill candidates showed no significant gain (or regressed) and are off by default or not shipped.
+
+## 🏗️ Architecture
 
 ```mermaid
 flowchart TD
-    Client[HTTP API / CLI] --> Service[共享零售会话服务]
-    Service --> Graph[LangGraph 状态图 / SQLite checkpoint]
-    Graph --> Route[规则 / 意图识别 / 可选语义门控]
-    Route --> Host[Host 按需分派]
-    Host --> General[General 接待与订单]
-    Host --> Technical[Technical 商品与有限支持]
-    Host --> Billing[Billing 退货办理]
-    Host --> Escalation[Escalation 模拟交接]
-    General --> Tools[MCP 工具边界]
-    Billing --> Tools
-    Technical --> Tools
-    Escalation --> Tools
-    Tools --> Store[SQLite 身份 / 待确认详情 / 事务 / 事件]
-    Host --> Compose[按需 Composer]
-    Compose --> Guard[发布守卫与无进展保护]
+    Client[HTTP API / CLI] --> Service[Shared retail service]
+    Service --> Graph[LangGraph state graph<br/>SQLite checkpoints]
+    Graph --> Route[Rules + structured intent<br/>optional semantic gate]
+    Route --> Host[On-demand role dispatch]
+    Host --> General[General]
+    Host --> Technical[Technical]
+    Host --> Billing[Billing]
+    Host --> Escalation[Escalation]
+    General & Technical & Billing & Escalation --> Loop[Hook-based agent loop<br/>skills · checklist · trace spans]
+    Loop --> Tools[stdio MCP tool boundary]
+    Tools --> Store[(SQLite store<br/>identity · pending details<br/>transactions · events)]
+    Loop --> Guard[Pre-publish check<br/>response guard]
     Guard --> Service
-    Tools -. 可选 .-> RAG[ChromaDB / Dense + BM25 / RRF / Qwen 重排]
-    Service -. 可选 .-> Memory[Redis 短期记忆 / 摘要 / ChromaDB 长期记忆]
+    Tools -. optional .-> RAG[ChromaDB Dense + BM25<br/>RRF · Qwen reranker]
+    Service -. optional .-> Memory[Redis working memory<br/>ChromaDB long-term memory]
 ```
 
-图状态负责推进流程，Store 负责业务授权。模型输出、历史摘要、客户端 `user_id` 和分类结果都不能代替用户确认。断点恢复也不会自动重放不确定的写操作。
+The graph advances the workflow; the store owns business authorization.
 
-## 算法与控制机制
+### How a write is carried out
 
-| 模块 | 实现 | 边界 |
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Customer
+    participant A as Agent (primary role)
+    participant M as MCP tools
+    participant S as SQLite store
+    C->>A: I want to return a delivered item
+    A->>C: Please verify: email, or name + zip code
+    C->>A: Identity details
+    A->>M: find user / read owned orders
+    A->>M: return_delivered_order_items(...)
+    M->>S: prepare pending details + fingerprint
+    S-->>A: pending details (not executed)
+    A->>C: Order, items, refund amount, destination — confirm?
+    Note over C,A: Turn ends, checkpoint persisted (survives restart)
+    C->>A: Yes, go ahead
+    A->>A: classify confirmation on the real message
+    A->>M: identical call
+    M->>S: check shown · same args · fingerprint · single use
+    S-->>A: executed + business event
+    A->>C: Return requested (no claim that money has arrived)
+```
+
+<details>
+<summary><b>Components and their boundaries</b></summary>
+
+| Component | Implementation | Boundary |
 | --- | --- | --- |
-| 意图与路由 | 规则优先级、LLM结构化分类、多源融合；六类零售意图映射到四角色 | 分类不绑定身份、不授权交易 |
-| 可选本地语义路径 | Qwen3文档向量、岭回归线性头；分数、间隔、同类参考相似度与任务状态共同门控 | 分数不是正确概率；需要外部校准工件，缺失时走原识别路径 |
-| 混合检索 | ChromaDB Dense、BM25（k1=1.2、b=0.75）、等权RRF（常数60） | 知识仅作说明，不提供业务状态或交易授权 |
-| 本地重排 | Qwen3-Reranker，按最后位置的yes/no相关性分数排序；独立进程隔离依赖 | 需要外部权重，缓存不符时报错，不隐式下载 |
-| 事务与恢复 | 七类写操作共用准备→原样展示→逐轮确认判定→同参数执行；数据指纹、防重、事件与checkpoint恢复；业务语义移植自τ²官方工具，参考动作回放与官方数据库哈希一致 | 撤回待确认详情不等于取消订单；结果未知时不盲重试 |
-| 发布前校验与修订 | 模型草稿先用守卫不变量检查，发现问题时以结构化反馈让模型改写一次；发布守卫仍作最后防线 | 只修订一次；`RETAIL_PUBLISH_REVISION=false`关闭 |
-| 发布守卫 | 对照本人订单当前记录、会话业务事件与待确认详情；用户自己给出的订单号可复述；无法核实则具体澄清 | 有限格式校验，不是完整自由文本语义审计 |
-| 无进展保护 | 同一事实下连续两轮守卫回退明确失败；新事实或正常通过可恢复 | 失败仍保留为失败，不通过截短会话提高分数 |
-| 上下文编排 | 完整消息日志→各角色按自身工具集渲染；状态快照随用户消息写入日志；预算超限时先把较早轮次的工具结果替换为可重查引用，再生成锚定摘要，压缩状态持久化 | 历史与摘要只供理解，不构成确认授权；`RETAIL_CONTEXT_MODE=window`保留旧两轮窗口作对照 |
-| 时序事实账本 | 抽取与确认判定并行；引用须逐字出现在本轮用户消息，取代／撤回须指向仍有效的事实，数量与长度受限；存疑信息标为待澄清交给 Agent 追问 | 事实只来自用户陈述，不提供身份或授权；`RETAIL_TASK_FACTS=false`关闭 |
-| 请求清单 | 与确认判定并行抽取用户要求的写操作；引用须逐字来自本轮用户消息，订单号须出现在本轮对话原文；进度只由业务事件与待确认记录推出。执行结果改用固定话术时附未完成项提醒；仍有可办请求时转人工前先提醒一次 | 清单只用于提醒与编排，不提供授权；用户坚持时照常转人工；`RETAIL_REQUEST_PLAN=false`关闭 |
-| 按需 Skill | 政策按章节拆分：通用规则常驻，取消／修改待处理订单／退货／换货章节与操作要点放入 `skills/retail-*`；拆分可逐字拼回原文 | Skill 只提供政策与流程文本，不能授权写入；`RETAIL_SKILL_MODE=inline`保留整份政策常驻 |
-| Agent 循环钩子 | pre_model／pre_tool／post_tool／on_tool_error／stop_response；零售策略为独立插件，旧客服角色经适配器沿用原方法 | 钩子只校验不变量，不能授权写入 |
-| 记忆 | 可选Redis工作记忆与摘要、ChromaDB情景记忆和画像；独立SQLite保存有限可见对话 | 画像默认关闭；历史不提供身份或提交授权 |
+| Intent and routing | Rule priorities, structured LLM classification and multi-source fusion; six retail intents mapped to four roles | Classification never binds identity or authorizes a transaction |
+| Optional semantic gate | Qwen3 embeddings + ridge-regression head, gated by score, margin, reference similarity and task state | Scores are not correctness probabilities; needs external calibrated artifacts |
+| Hybrid retrieval | ChromaDB Dense, BM25 (k1=1.2, b=0.75), equal-weight RRF (k=60), local Qwen3-Reranker in a separate process | Knowledge explains policy; it never establishes business state |
+| Transactions | prepare → display unchanged details → per-turn confirmation → identical call executes; fingerprint, dedup, events, checkpoints | Withdrawing pending details is not cancelling an order; unknown results are not retried blindly |
+| Context compilation | Full message log per role; state snapshot last; persisted reference/summary compaction; usage-calibrated token estimates | History informs the model only; `RETAIL_CONTEXT_MODE=window` keeps the old two-turn window |
+| On-demand skills | Policy split by section into `skills/retail-*`; the split concatenates back to the original text | Skills provide text only; `RETAIL_SKILL_MODE=inline` keeps the whole policy in the prompt |
+| Request checklist | Model-proposed items with verbatim quotes and order ids validated by code; progress from business events | Drives reminders and routing only; an insisting customer is still transferred |
+| Response guard | Checks owned-order facts, items, amounts and events; asks specific questions when verification fails | Limited predicates, not a full semantic audit of free text |
+| Agent loop hooks | `pre_model` / `pre_tool` / `post_tool` / `on_tool_error` / `stop_response`; every model and tool call is a replayable trace span | Hooks check invariants; they cannot authorize writes |
+| Memory | Optional Redis working memory and summaries, ChromaDB episodic/profile memory | Off by default; never a source of identity or confirmation |
 
-## 业务流程展示
+</details>
 
-以下是交互流程说明，不是在线服务录屏或新的模型评测记录。
+## 🚀 Quick start
 
-```text
-用户：想退回某件已送达商品。
-系统：请提供本人邮箱，或姓名和邮编。
-用户：提供外部沙箱中的身份信息。
-系统：通过工具核对身份、查询本人订单，询问商品与退款去向。
-用户：指定商品和合法退款去向。
-系统：准备并展示订单号、商品、数量、预计金额、去向及操作编号。
-用户：在下一轮明确确认；也可以修改、取消待确认申请或要求人工。
-系统：服务端校验后执行，反馈“已申请退货”；不宣称退款已经到账。换货、取消和修改订单使用同一流程。
-```
+### Requirements
 
-已展示详情可以在服务重启后继续确认；同一确认不能导致重复写入。缺少退款去向、存在附加条件或改口时，系统需要补充信息或重新展示，不能直接提交。
+- Windows, Python 3.12 and [uv](https://docs.astral.sh/uv/) (other platforms have not been validated equally)
+- An Anthropic Messages-compatible model endpoint and your own API key
 
-## 运行环境
+The lightweight business mode below needs **no** Redis, ChromaDB or local models.
 
-- Windows、Python 3.12、[uv](https://docs.astral.sh/uv/)。其他系统未作同等验证。
-- 支持 Anthropic Messages 协议的模型服务。真实请求需要使用者自己的凭证与明确预算。
-- **轻量业务入口**：仅需外部订单种子、政策和模型服务；不需要Redis、ChromaDB或本地Qwen。
-- **扩展资料链**：另外需要Redis、ChromaDB、对应本地模型及知识／语义工件。
-
-### 1. 安装
-
-在仓库根目录执行：
+### 1. Install
 
 ```powershell
-uv python find 3.12
+git clone https://github.com/zaughterCoding/OrderWeave.git
+cd OrderWeave
 uv sync --locked --group dev
 Copy-Item .env.example .env
 ```
 
-本仓库**不分发任何评测数据集、运行订单、知识资料、参考向量或模型权重**。公开源代码不会自动恢复维护者的私有评测环境。
+### 2. Prepare the sandbox assets
 
-### 2. 显式准备外部运行资料
-
-准备工具只在指定 `--download` 时联网，获取固定提交的τ²-bench虚构订单、政策及其LICENSE，并校验SHA-256：
+The repository ships no datasets, orders or model weights. This fetches the fictional retail seed, policy and license from the pinned τ²-bench commit and verifies SHA-256 hashes (network is used only with `--download`):
 
 ```powershell
 uv run python -m evaluation.prepare_assets --download
-# 已有合法资料时，只做本地核对，不联网：
+# Verify existing local assets offline:
 uv run python -m evaluation.prepare_assets
 ```
 
-默认目录为 `data/retail-assets/`，受Git忽略规则保护。也可以自行获取相同版本的文件，通过 `--directory` 指定位置并同步修改环境变量。工具不下载任务、gold、知识集或模型。
+Files go to `data/retail-assets/` (ignored by Git).
 
-上游为 [τ²-bench固定提交](https://github.com/sierra-research/tau2-bench/tree/fc0055dc4e0a316c3f83133267fbd6faaa770992)。这些资源保留原许可证，详见[第三方说明](THIRD_PARTY_NOTICES.md)。
+### 3. Configure the model and budget
 
-### 3. 配置模型与预算
-
-编辑本地 `.env`：
+Edit `.env`:
 
 ```dotenv
-ANTHROPIC_API_KEY=填写自己的凭证
-ANTHROPIC_BASE_URL=填写兼容服务地址
-LLM_MODEL=填写服务接受的模型ID
-RETAIL_INPUT_CNY_PER_MTOK=填写当前输入费率
-RETAIL_OUTPUT_CNY_PER_MTOK=填写当前输出费率
+ANTHROPIC_API_KEY=your-own-key
+ANTHROPIC_BASE_URL=your-compatible-endpoint
+LLM_MODEL=your-provider-model-id
+RETAIL_INPUT_CNY_PER_MTOK=current-input-price
+RETAIL_OUTPUT_CNY_PER_MTOK=current-output-price
 RETAIL_BUDGET_CNY=1
 ```
 
-费率单位为人民币／百万token，须按实际供应商核对。模板故意不预填模型价格；缺少有效费率时拒绝启动。预算按请求上界预留并记录usage，不等于供应商账单，也不保证同一预算在所有模型上完成同样轮数。
+Prices are CNY per million tokens and must match your provider; startup rejects missing or invalid rates. The built-in ledger reserves an upper bound per request and stops at the budget — it is not a provider invoice.
 
-模板默认关闭知识、外部记忆和语义快速路径，使用新的本地SQLite业务库与checkpoint。请勿将真实客户信息用于这个演示沙箱。
-
-### 4. 启动API或CLI
+### 4. Run
 
 ```powershell
-# API，默认只绑定127.0.0.1:8000
+# HTTP API on 127.0.0.1:8000 (explorer at /docs)
 uv run python -m api.main
 
-# 或在另一个独立运行中使用CLI
+# Or an interactive CLI
 uv run python -m api.main --cli
 ```
 
-API启动后访问 `http://127.0.0.1:8000/docs` 查看交互文档：
-
 ```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health
-$body = @{ message = "你好，我想申请退货"; user_id = "demo-client"; conv_id = "demo-conversation" } | ConvertTo-Json
+$body = @{ message = "Hi, I want to return an item"; user_id = "demo"; conv_id = "demo-1" } | ConvertTo-Json
 Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -ContentType "application/json; charset=utf-8" -Body ([Text.Encoding]::UTF8.GetBytes($body))
 ```
 
-后续轮次使用相同的 `user_id`／`conv_id`；身份信息和订单内容从你本地的外部种子中取得。改变会话标识不会授权访问其他人的订单。
+Keep `user_id` and `conv_id` unchanged across turns. Take sandbox identities from your local seed; changing client identifiers does not grant access to anyone else's orders.
 
-| 接口 | 用途 |
+| Endpoint | Purpose |
 | --- | --- |
-| `GET /health` | 当前运行模式、工具与预算状态 |
-| `POST /chat` | 多轮客服入口 |
-| `GET /trace/tool/{request_id}` | 指定请求的工具与控制轨迹 |
-| `GET /skills` | 已加载Skills |
-| `GET /monitor`、`GET /metrics` | 监控；是否可用取决于运行模式和配置 |
-| `POST /search` | 可选知识检索；轻量模式未启用 |
+| `GET /health` | Active mode, tools and budget state |
+| `POST /chat` | Multi-turn support conversation |
+| `GET /trace/tool/{request_id}` | Tool and control traces of one request |
+| `GET /skills` | Loaded skills |
+| `GET /monitor`, `GET /metrics` | Monitoring and Prometheus metrics |
+| `POST /search` | Optional knowledge retrieval (off in lightweight mode) |
 
-## 可选扩展配置
+## ⚙️ Configuration
 
-| 参数 | 默认／说明 |
-| --- | --- |
-| `RETAIL_AGENT_MODE` | `multi`；可设`single` |
-| `RETAIL_WORKFLOW_MODE` | `langgraph`；可设`legacy` |
-| `RETAIL_CONTEXT_MODE` | `compiled`（完整消息日志＋上下文编排）；可设`window`（旧两轮窗口） |
-| `RETAIL_PUBLISH_REVISION` | `true`；发布前校验并修订一次 |
-| `RETAIL_REQUEST_PLAN` | `true`；会话请求清单，需`compiled`上下文 |
-| `RETAIL_TASK_FACTS` | `false`（S3小样本未见显著收益，成本约增三成）；开启需`compiled`上下文 |
-| `RETAIL_SKILL_MODE` | `on_demand`（按需 Skill 并绑定写工具）；可设`inline`（整份政策常驻） |
-| `RETAIL_CONTEXT_BUDGET_TOKENS` | `32000`；历史超过该估计值时触发持久化压缩 |
-| `RETAIL_ENABLE_MEMORY` | 模板为`false`；启用需Redis、ChromaDB及本地记忆编码缓存 |
-| `RETAIL_ENABLE_KNOWLEDGE` | 模板为`false`；启用需与现有校验约定一致的本地知识资料 |
-| `RETAIL_SEMANTIC_ROUTING` | 模板为`false`；启用需外部语义工件和匹配的Qwen编码器 |
-| `RETAIL_SEMANTIC_MODEL_PATH` | 外部分类头与参考向量文件；本仓库不附带 |
-| `RETAIL_EMBEDDING_MODEL` | `qwen`，也支持`minilm` |
-| `RETAIL_RERANKER_MODEL` | `qwen`，可显式选`llm`；后者可能增加费用 |
-| `RETAIL_RETRIEVAL_MODE` | `hybrid`、`dense`或`bm25` |
-| `RETAIL_SUPPORT_ENABLED` | `false`；有限技术支持需额外匹配资料，不是通用故障处理 |
+| Setting | Default | Notes |
+| --- | --- | --- |
+| `RETAIL_AGENT_MODE` | `multi` | `single` runs one agent (≈30% cheaper, slightly lower success) |
+| `RETAIL_WORKFLOW_MODE` | `langgraph` | `legacy` is a fallback |
+| `RETAIL_CONTEXT_MODE` | `compiled` | `window` keeps the old two-turn window for comparison |
+| `RETAIL_CONTEXT_BUDGET_TOKENS` | `32000` | Above this estimate, history is compacted and persisted |
+| `RETAIL_SKILL_MODE` | `on_demand` | `inline` keeps the whole policy in the prompt |
+| `RETAIL_PUBLISH_REVISION` | `true` | Check the draft before publishing and revise once |
+| `RETAIL_REQUEST_PLAN` | `true` | Session request checklist (needs `compiled`) |
+| `RETAIL_TASK_FACTS` | `false` | Temporal fact ledger; no significant gain, ≈30% more cost |
+| `RETAIL_ENABLE_MEMORY` | `false` | Needs Redis, ChromaDB and a local MiniLM cache |
+| `RETAIL_ENABLE_KNOWLEDGE` | `false` | Needs your own knowledge collection |
+| `RETAIL_SEMANTIC_ROUTING` | `false` | Needs external semantic artifacts and a Qwen encoder |
+| `RETAIL_RETRIEVAL_MODE` | `hybrid` | `dense` or `bm25` |
 
-需要外部服务时显式启动：
+<details>
+<summary><b>Optional services and local models</b></summary>
 
 ```powershell
+# Redis on 6380, ChromaDB on 8002
 docker compose up -d redis chromadb
-# 停止而不删除数据卷：
 docker compose stop
 ```
 
-Redis使用6380端口，ChromaDB使用8002端口。compose保留既有`agent-ecommerce-*`容器／卷名以兼容本地部署。记忆使用MiniLM缓存，零售RAG可使用Qwen；二者并非同一个索引或缓存。不要在缺少资料时直接打开全部开关。
-
-Qwen推理在独立环境运行，主环境依赖保持锁定：
+Qwen inference runs in a separate environment so the main dependencies stay locked:
 
 ```powershell
 uv venv data/embedding-env --python 3.12
 uv pip sync evaluation/embedding_requirements.lock --python data/embedding-env/Scripts/python.exe --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-按官方模型卡自行下载 [Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) 和 [Reranker](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B)。本地目录分别为 `data/models/qwen3-embedding-0.6b` 和 `data/models/qwen3-reranker-0.6b`；固定revision及逐文件哈希见两个生产模块的`REVISION`／`MODEL_FILES`，缺少或不符会报错。模型权重须为这些固定版本，运行时不联网下载或执行模型仓库代码。
-
-显式下载固定模型文件的示例（会联网，不会调用付费模型）：
+Download [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) and [Qwen3-Reranker-0.6B](https://huggingface.co/Qwen/Qwen3-Reranker-0.6B) yourself into `data/models/qwen3-embedding-0.6b` and `data/models/qwen3-reranker-0.6b`. The modules pin `REVISION` and `MODEL_FILES`; mismatched files fail validation, and runtime never downloads models or runs model-repository code.
 
 ```powershell
 .\data\embedding-env\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Embedding-0.6B', revision='97b0c614be4d77ee51c0cef4e5f07c00f9eb65b3', local_dir='data/models/qwen3-embedding-0.6b', allow_patterns=['config.json','model.safetensors','tokenizer.json','tokenizer_config.json','README.md'])"
 .\data\embedding-env\Scripts\python.exe -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-Reranker-0.6B', revision='e61197ed45024b0ed8a2d74b80b4d909f1255473', local_dir='data/models/qwen3-reranker-0.6b', allow_patterns=['config.json','model.safetensors','tokenizer.json','tokenizer_config.json','README.md'])"
-# 若启用分层记忆，另行显式准备其MiniLM缓存：
-uv run python -c "from mcp_tools.knowledge_base import _ProjectEmbeddingFunction; _ProjectEmbeddingFunction()._download_model_if_not_exists()"
 ```
 
-知识资料和语义参考工件未分发，因此历史完整资料链的结果无法仅凭本仓库复现。可以先使用轻量业务入口；通用客服模式`RETAIL_MODE=false`另外支持自行导入知识，仍需完整的外部服务与编码缓存。
+</details>
 
-## 评测结果
-
-### τ²-bench retail 全量（2026-11-04）
-
-| 指标 | 结果 |
-| --- | --- |
-| pass^1 | **0.822**（95%区间 0.763–0.874，按任务bootstrap） |
-| pass^2 ／ pass^3 | **0.734** ／ **0.667** |
-| 会话 | 114题×3次＝342，全部有效，281次成功；1次因Agent失败结束 |
-| 写入安全 | 503次写操作全部先展示、经后续确认执行；未经确认写入 0，重复写入 0 |
-| 成本与延迟 | 每会话约0.046元（含模拟用户与Judge），系统输入缓存命中86.5%，轮延迟P50 5.9秒／P95 11.2秒 |
-
-口径：τ²-bench固定提交fc0055d、retail base划分全部114题、官方用户模拟器与数据库＋自然语言断言评分；被测系统、模拟用户与Judge均为deepseek-flash（关闭思考）；默认配置（多Agent、完整消息日志上下文、按需Skill、发布前校验修订、请求清单，事实账本关闭）。主表不剔除任何题；其中15题官方参考动作本身报错，按官方口径照常计分。Judge与另一模型家族盲标的一致率为0.92（50条）。这是一次运行的结果，不是线上成功率。
-
-与上一次全量（2026-11-03，pass^1 0.781、pass^3 0.614，14次Agent失败）按任务配对：pass^1 +0.041（95%区间 0.000–0.085，边缘显著）；主要来自未执行调用不再中断会话与请求清单减少遗漏写入，代价为每会话成本约+25%、轮延迟P50约+1.3秒。
-
-### 开发过程中的小样本对比
-
-各阶段在固定小样本上与上一版本同任务同种子配对（95%区间按任务bootstrap）：完整上下文与守卫证据修正使τ-mini（40题，分层抽样）pass^1 0.65→0.79；回顾说法改按会话事件核验使0.725→0.90；发布前校验修订使自建英文安全对抗留出集（19题）0.684→1.00。每阶段的负结果（按需Skill、事实账本、自进化候选未带来显著收益）同样保留在提交说明中。
-
-### 历史结果（旧版本）
-
-| 能力 | 历史结果 | 测试范围 |
-| --- | --- | --- |
-| 六类意图 | Macro-F1 **0.9917**，119/120正确 | 150条自建回归集中的120条意图计分样本；样本参与过修复诊断 |
-| 四角色路由 | **99.30%**，142/143正确 | 同一150条回归集中的143条角色计分样本 |
-| 事务与恢复 | **10/10**场景通过 | 真实SQLite／checkpoint／MCP＋Fake模型的工程契约验证 |
-| 能力内τ-retail | **92.31%**，36/39严格成功；10/13题三次均成功 | 单模型deepseek-flash，13道原题×3次，公开虚构沙箱 |
-
-τ结果由v5中断后分两批完成，任务51重新开始会话，保留3个失败；不是全量τ基准、独立盲测或线上成功率。最新守卫修复完成后，仅做离线验证，不能将这些历史数字归为修后新成绩。历史完整本地检查为804项通过；公开包只包含不依赖私有资料的测试子集。
-
-详细分母与限制见[结果说明](evaluation/RESULTS.md)。本仓库不提供支持这些结果的逐条数据、gold、请求、对话或数据库；不能宣称一键重现历史分数。
-
-## 本地测试与评测
-
-干净发布目录中的公开测试子集已本地通过139项，无外网尝试；该计数与历史804项完整本地检查不同。
+## 🧪 Reproducing the evaluation
 
 ```powershell
-# 公开的无数据、零模型测试
+# Offline tests: no datasets, no real models, no network
 uv run --locked python -m pytest tests -q
-
-# 对自行准备的私有预测记录汇总，文件不进入Git
-uv run python -m evaluation.score_results --kind task --input data/my-run/results.jsonl --planned 39
 ```
 
-意图、角色、恢复和任务会话的输入格式、固定分母、错误／未运行记录要求见[评测方法](evaluation/README.md)。汇总工具不执行模型、业务工具或官方Judge，不能代替实际验收。
+The harness in `evaluation/harness/` builds the system under test from the production runtime and reuses the official τ² user simulator and DB/NL scoring. Each session runs in its own subprocess with its own database, checkpoint and ledger; re-running a `run-id` only fills in missing sessions.
 
-## 目录
+1. Create a separate τ environment: `uv venv .venv-tau --python 3.12`, then install `tau2` from `git+https://github.com/sierra-research/tau2-bench@fc0055dc4e0a316c3f83133267fbd6faaa770992`.
+2. Point `HARNESS_TAU_DATA` at a directory containing `tau2/domains/retail/{db.json,policy.md,tasks.json}`.
+3. Put model credentials in `.env`.
+
+```powershell
+# 14 in-scope tasks × 3 trials, global budget CNY 5
+uv run python -m evaluation.harness.run --suite tau-core --trials 3 --run-id my-run --budget-cny 5
+```
+
+Real model calls cost money — always set a budget and run a small pilot first. See the [evaluation guide (Chinese)](evaluation/README.md) for suites, paired comparison, judge calibration and the offline aggregator.
+
+## 📂 Project layout
 
 ```text
-api/          HTTP API与CLI
-agents/       Host、四角色、共享服务、状态图与发布守卫
-core/         意图识别、可选语义路由、Skills加载
-mcp_tools/    stdio工具服务、SQLite、检索和本地模型适配
-memory/       分层记忆
-monitor/      监控与指标
-evaluation/   必要评测组件、外部资产准备、方法与结果摘要
-skills/       运行时业务Skills
-tests/        不依赖私有数据的公开检查
+api/          FastAPI app and CLI entry
+agents/       Roles, agent loop and hooks, LangGraph workflow, confirmation, guard, checklist
+core/         Context engine, intent recognition, semantic routing, skill loader
+mcp_tools/    stdio MCP server/client, retail store and domain, retrieval, Qwen adapters
+memory/       Conversation memory and temporal fact ledger
+monitor/      Performance monitoring and Prometheus metrics
+evaluation/   τ² bridge, evaluation harness, metrics, ledger, asset preparation
+skills/       Runtime business skills (policy sections + procedures)
+tests/        Offline tests without private datasets
 ```
 
-## 使用边界与贡献
+## ⚠️ Scope and limitations
 
-本地沙箱不执行真实支付、退款、邮件、快递标签或真人接入。API没有生产级登录／RBAC，CORS配置面向本地使用；不要直接暴露到公网。有限模板校验不覆盖所有自然语言含义，记忆也不是授权来源。
+- No real payments, refunds, email, shipping labels or live agents — everything runs in a local sandbox.
+- The API has no production authentication/RBAC and its CORS targets local use; do not expose it to the public internet.
+- Guard predicates are limited and do not verify every natural-language claim; memory is never an authorization source.
+- Remaining τ² failures are mostly multi-action reasoning, recalling stale tool results, and user-simulator drift.
 
-提交修改前运行公开测试。复现问题时提供最小的脱敏输入、配置与错误说明，不提交密钥、客户信息、运行数据库、模型缓存或数据集。公开文档仅保留本README、英文版、必要许可声明，以及评测方法和结果摘要；开发计划、任务记录和过程性报告不属于发行物。
+## 🤝 Contributing
 
-## 许可证
+Run the offline tests before proposing changes. When reporting issues, share minimal sanitized inputs, configuration and errors — never credentials, customer records, runtime databases, model caches or datasets.
 
-[MIT](LICENSE)。外部数据与模型遵守各自条款，见[第三方说明](THIRD_PARTY_NOTICES.md)。
+## 🙏 Acknowledgements
+
+- [τ²-bench](https://github.com/sierra-research/tau2-bench) by Sierra Research for the retail domain, user simulator and scoring.
+- [LangGraph](https://github.com/langchain-ai/langgraph), [Model Context Protocol](https://modelcontextprotocol.io/), [Qwen3](https://huggingface.co/Qwen) and [ChromaDB](https://www.trychroma.com/).
+
+## 📄 License
+
+[MIT](LICENSE). External resources keep their own terms; see [third-party notices](THIRD_PARTY_NOTICES.md).

@@ -4,7 +4,10 @@
 !/.gitattributes
 !/.gitignore
 !/README.md
-!/README.en.md
+!/README.zh-CN.md
+!/assets/
+/assets/*
+!/assets/*.svg
 !/LICENSE
 !/THIRD_PARTY_NOTICES.md
 !/compose.yml
