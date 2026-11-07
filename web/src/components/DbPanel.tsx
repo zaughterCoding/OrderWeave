@@ -102,6 +102,8 @@ function Entity({ kind, id, sub, pill, pillClass, change, flash, defaultOpen, ch
   );
 }
 
+const ORDER_KNOWN = new Set(["order_id", "user_id", "status", "address", "items", "payment_history", "fulfillments"]);
+
 function OrderCard({ order, change, flash }: { order: any; change?: Change; flash?: boolean }) {
   const fields = fieldMap(change);
   const items: any[] = order.items || [];
@@ -112,7 +114,6 @@ function OrderCard({ order, change, flash }: { order: any; change?: Change; flas
       pill={order.status} change={change} flash={flash} defaultOpen={!!change} raw={order} diffs={false}>
       <dl className="kv">
         <Row label="status" fields={fields} path="status">{order.status}</Row>
-        {order.cancel_reason != null && <Row label="cancel_reason" fields={fields} path="cancel_reason">{order.cancel_reason}</Row>}
         <Row label="address" fields={fields} path="address">{address(order.address)}</Row>
         <Row label="payment_history" fields={fields} path="payment_history">
           {payments.map((p) => `${p.transaction_type} ${money(p.amount)} · ${p.payment_method_id}`).join("  |  ")}
@@ -120,8 +121,10 @@ function OrderCard({ order, change, flash }: { order: any; change?: Change; flas
         {(order.fulfillments || []).length > 0 && (
           <Row label="fulfillments" fields={fields} path="fulfillments">{order.fulfillments.map((f: any) => (f.tracking_id || []).join(",")).join(" | ")}</Row>
         )}
-        {order.exchange_items && <Row label="exchange_items" fields={fields} path="exchange_items">{short(order.exchange_items)}</Row>}
-        {order.return_items && <Row label="return_items" fields={fields} path="return_items">{short(order.return_items)}</Row>}
+        {/* 退货、换货、取消等写操作新增的字段按原样逐项展示 */}
+        {Object.keys(order).filter((k) => !ORDER_KNOWN.has(k)).sort().map((k) => (
+          <Row key={k} label={k} fields={fields} path={k}>{short(order[k], 120)}</Row>
+        ))}
       </dl>
       <div className="items">
         {items.map((item, i) => (

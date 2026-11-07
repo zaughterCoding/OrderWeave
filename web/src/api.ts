@@ -1,4 +1,4 @@
-import type { LiveEvent, SessionInfo, Snapshot } from "./model";
+import type { GraphSpec, LiveEvent, SessionInfo, Snapshot } from "./model";
 
 export interface Scenario {
   id: string;
@@ -31,6 +31,7 @@ async function json<T>(res: Response): Promise<T> {
 
 export const api = {
   scenarios: () => fetch("/api/web/scenarios").then((r) => json<{ greeting: string; items: Scenario[] }>(r)),
+  graph: (mode: string) => fetch(`/api/web/graph?mode=${mode}`).then((r) => json<GraphSpec>(r)),
   replays: () => fetch("/api/web/replays").then((r) => json<{ items: ReplayItem[] }>(r)),
   async replay(source: string, name: string): Promise<LiveEvent[]> {
     const res = await fetch(`/api/web/replays/${source}/${encodeURIComponent(name)}`);

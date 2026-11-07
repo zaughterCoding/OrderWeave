@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { api, type ReplayItem, type Scenario } from "./api";
 import { LangContext, type Lang, useT } from "./i18n";
-import { countKinds, emptyState, pendingActions, reducer, type LiveEvent } from "./model";
+import { countKinds, emptyState, pendingActions, reducer, type GraphSpec, type LiveEvent } from "./model";
 import { ChatPanel } from "./components/ChatPanel";
 import { DbPanel } from "./components/DbPanel";
 import { GraphView } from "./components/GraphView";
@@ -69,6 +69,8 @@ function Console({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) 
   const [pinnedTurn, setPinnedTurn] = useState<number | null>(null);
   const [pinnedSnap, setPinnedSnap] = useState<number | null>(null);
   const [flashSeq, setFlashSeq] = useState(0);
+  const [pendingMessage, setPendingMessage] = useState("");
+  const [idleGraph, setIdleGraph] = useState<GraphSpec | null>(null);
   const sessionRef = useRef<string | null>(null);
   const replay = useReplay(dispatch, reset);
 
@@ -78,6 +80,8 @@ function Console({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) 
   }, []);
 
   useEffect(() => { setFlashSeq((n) => n + 1); }, [state.snapshot]);
+  // 会话创建前也显示所选模式的骨架图。
+  useEffect(() => { api.graph(agentMode).then(setIdleGraph).catch(() => undefined); }, [agentMode]);
   useEffect(() => { if (toast) { const id = setTimeout(() => setToast(""), 6000); return () => clearTimeout(id); } }, [toast]);
 
   // 切到回放时自动载入第一份录制。
@@ -115,12 +119,18 @@ function Console({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) 
   async function send(text: string) {
     setBusy(true);
     setPinnedTurn(null); setPinnedSnap(null);
+    // 会话启动需要几秒，先把用户消息显示出来。
+    setPendingMessage(text);
     try {
       const id = await ensureSession();
-      await api.streamTurn(id, text, dispatch);
+      await api.streamTurn(id, text, (event) => {
+        if (event.type === "turn_start") setPendingMessage("");
+        dispatch(event);
+      });
     } catch (e) {
       setToast(String(e));
     } finally {
+      setPendingMessage("");
       setBusy(false);
     }
   }
@@ -147,7 +157,7 @@ function Console({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) 
   const viewSnapshot = viewSnap === liveTurn ? state.snapshot : state.snapshots[viewSnap] || state.snapshot;
   const viewChanges = turns.find((x) => x.n === viewSnap)?.changes || [];
   const modelCalls = useMemo(() => turns.reduce((s, x) => s + (countKinds(x).model || 0), 0), [turns]);
-  const graph = state.session?.graph || { mode: agentMode, nodes: [], edges: [] };
+  const graph = state.session?.graph || idleGraph || { mode: agentMode, nodes: [], edges: [] };
   const running = !!last?.running;
   const mode = state.session?.mode || agentMode;
 
@@ -203,7 +213,7 @@ function Console({ lang, setLang }: { lang: Lang; setLang: (l: Lang) => void }) 
         <ChatPanel greeting={state.session?.greeting || greeting} turns={turns} live={source === "live"} busy={busy || running}
           starting={starting} scenarios={scenarios} scenario={scenario} onScenario={setScenario} onSend={send}
           selected={traceTurn?.n ?? 0} onSelect={(n) => { setPinnedTurn(n); setPinnedSnap(n); }}
-          pending={pendingActions(state.snapshot)} replayBar={replayBar} />
+          pending={pendingActions(state.snapshot)} replayBar={replayBar} pendingMessage={pendingMessage} />
 
         <DbPanel snapshot={viewSnapshot} changes={viewChanges} turns={snapTurns} viewTurn={viewSnap}
           onViewTurn={(n) => setPinnedSnap(n === liveTurn ? null : n)} liveTurn={liveTurn}

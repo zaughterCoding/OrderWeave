@@ -60,21 +60,24 @@ SCENARIOS: List[Dict[str, Any]] = [
      "focus": "#W4689314",
      "messages": ["Hello, my email is sofia.li7352@example.com. I want to return the digital camera "
                   "from order #W4689314.",
-                  "Refund it to the original payment method. Yes, I confirm the return."]},
+                  "Please refund it to the original credit card.",
+                  "Yes, please proceed with the return."]},
     {"id": "exchange", "kind": "exchange_delivered_order",
      "title": {"en": "Exchange for another variant", "zh": "换成其他款式"},
      "persona": {"name": "Yusuf Hernandez", "zip": "43175", "email": "yusuf.hernandez6086@example.com"},
      "focus": "#W1633718",
      "messages": ["Hi, this is Yusuf Hernandez, zip 43175. The coffee maker in order #W1633718 is too small; "
                   "can I exchange it for a version with a larger capacity?",
-                  "Yes, that option works. Please confirm the exchange."]},
+                  "Any available option with a larger capacity is fine; keep the other features the same if possible, "
+                  "and use my original payment method for any price difference.",
+                  "Yes, please proceed with the exchange."]},
     {"id": "address", "kind": "modify_user_address",
      "title": {"en": "Update the default address", "zh": "修改默认地址"},
      "persona": {"name": "Emma Smith", "zip": "10192", "email": "emma.smith3991@example.com"},
      "focus": "emma_smith_8564",
      "messages": ["Hi, I'm Emma Smith (emma.smith3991@example.com). I moved; please change my default address "
                   "to 120 Park Avenue, Apt 5B, New York, NY 10017, USA.",
-                  "Yes, confirm the new address."]},
+                  "Yes, please proceed with the address update."]},
 ]
 
 # 工作图骨架；节点名与 agents/retail_workflow.py 编译图一致（测试校验）。
@@ -238,6 +241,14 @@ def diff_snapshots(previous: Dict[str, Any], current: Dict[str, Any],
     return changes
 
 
+def redact_paths(text: str) -> str:
+    """录制文件可能被公开分享：提示词里的本机项目路径替换为占位符。"""
+    root = str(ROOT)
+    for variant in (json.dumps(root)[1:-1], root, root.replace("\\", "/")):
+        text = text.replace(variant, "<project>")
+    return text
+
+
 # ---------------------------------------------------------------- 会话
 
 @dataclass
@@ -283,7 +294,7 @@ class WebSession:
 
     def log(self, event: Dict[str, Any]) -> None:
         with self.log_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+            handle.write(redact_paths(json.dumps(event, ensure_ascii=False, default=str)) + "\n")
 
 
 class SessionManager:
@@ -491,7 +502,9 @@ def _replay_files(sessions_root: Path) -> List[Dict[str, Any]]:
             if turns:
                 items.append({"source": source, "name": name, "turns": turns,
                               "modified": path.stat().st_mtime})
-    return sorted(items, key=lambda item: (item["source"] != "builtin", -item["modified"]))
+    # 内置回放按文件名编号排序，录制的会话最新在前。
+    return sorted(items, key=lambda item: (item["source"] != "builtin",
+                                           item["name"] if item["source"] == "builtin" else -item["modified"]))
 
 
 def _replay_path(sessions_root: Path, source: str, name: str) -> Path:

@@ -25,7 +25,7 @@ export function ChatPanel(props: {
   greeting: string; turns: Turn[]; live: boolean; busy: boolean; starting: boolean;
   scenarios: Scenario[]; scenario: Scenario | null; onScenario: (s: Scenario) => void;
   onSend: (text: string) => void; selected: number; onSelect: (n: number) => void;
-  pending: any[]; replayBar?: React.ReactNode;
+  pending: any[]; replayBar?: React.ReactNode; pendingMessage?: string;
 }) {
   const t = useT();
   const lang = useContext(LangContext);
@@ -112,6 +112,12 @@ export function ChatPanel(props: {
             </div>
           );
         })}
+        {props.pendingMessage && (
+          <>
+            <div className="msg user">{props.pendingMessage}</div>
+            <div className="msg bot typing"><i /><i /><i /></div>
+          </>
+        )}
         {props.starting && <div className="empty">{t("starting")}</div>}
       </div>
       {props.live ? (
