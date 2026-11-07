@@ -37,6 +37,12 @@ English · [简体中文](README.zh-CN.md)
 [Configuration](#%EF%B8%8F-configuration) ·
 [Evaluation](#-reproducing-the-evaluation)
 
+<br>
+
+<img src="assets/console-demo.gif" alt="OrderWeave web console: one confirmation message cancels an order, the trace lights up the LangGraph path and the database shows the order changing from pending to cancelled" width="100%">
+
+<sub>One message in the <a href="#%EF%B8%8F-web-console">web console</a>: the trace walks the LangGraph workflow live, the database turns the order from <code>pending</code> to <code>cancelled</code> with a refund, and each model call opens to its prompt and cost. (Real DeepSeek run, waits shortened.)</sub>
+
 </div>
 
 ---
@@ -54,6 +60,8 @@ It supports all seven write actions of the [τ²-bench](https://github.com/sierr
 | Account | Modify default address |
 
 On the full τ²-bench retail benchmark (114 tasks × 3 trials) it reaches **pass^1 0.822** while carrying out **503 writes with 0 unconfirmed and 0 duplicate**.
+
+A built-in [web console](#%EF%B8%8F-web-console) shows every turn as it happens: the conversation, the sandbox database changing field by field, and the agent's path through the workflow with each intermediate result.
 
 > [!NOTE]
 > OrderWeave is for research, learning and local demos. Orders come from a fictional sandbox you prepare yourself; a "return requested" is not a real refund, and a handoff to a human is only a simulated record.

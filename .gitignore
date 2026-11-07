@@ -8,6 +8,7 @@
 !/assets/
 /assets/*
 !/assets/*.svg
+!/assets/*.gif
 !/LICENSE
 !/THIRD_PARTY_NOTICES.md
 !/compose.yml

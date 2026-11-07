@@ -37,6 +37,12 @@
 [配置](#%EF%B8%8F-配置) ·
 [复现评测](#-复现评测)
 
+<br>
+
+<img src="assets/console-demo.gif" alt="OrderWeave Web 控制台：一条确认消息取消订单，链路点亮 LangGraph 路径，数据库中订单由 pending 变为 cancelled" width="100%">
+
+<sub><a href="#%EF%B8%8F-web-控制台">Web 控制台</a>中的一次输入：链路实时走过 LangGraph 工作图，数据库中订单由 <code>pending</code> 变为 <code>cancelled</code> 并记入退款，每次模型调用都可展开查看 prompt 与费用。（真实 DeepSeek 运行，等待时间已压缩。）</sub>
+
 </div>
 
 ---
@@ -54,6 +60,8 @@ OrderWeave 是一个真正**办理订单**、而不只是回答问题的电商�
 | 账户 | 修改默认地址 |
 
 在 τ²-bench retail 全量（114 题 × 3 次）上 **pass^1 达到 0.822**，执行 **503 次写入，未确认写入 0、重复写入 0**。
+
+内置 [Web 控制台](#%EF%B8%8F-web-控制台) 实时展示每一轮：对话本身、沙箱数据库逐字段的变化，以及 Agent 在工作图中的路径和每一步的中间结果。
 
 > [!NOTE]
 > 本项目面向研究、学习与本地演示。订单来自使用者自行准备的虚构沙箱；“已申请退货”不等于真实退款，转人工仅为模拟记录。
