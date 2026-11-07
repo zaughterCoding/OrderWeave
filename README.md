@@ -14,6 +14,7 @@ English · [简体中文](README.zh-CN.md)
   <img alt="MCP" src="https://img.shields.io/badge/MCP-1.12.4-000000?logo=anthropic&logoColor=white">
   <img alt="Anthropic SDK" src="https://img.shields.io/badge/Anthropic_SDK-0.40.0-D97757?logo=anthropic&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115.5-009688?logo=fastapi&logoColor=white">
+  <img alt="React" src="https://img.shields.io/badge/React-18.3-61DAFB?logo=react&logoColor=black">
   <img alt="Pydantic" src="https://img.shields.io/badge/Pydantic-2.10.3-E92063?logo=pydantic&logoColor=white">
   <br>
   <img alt="SQLite" src="https://img.shields.io/badge/SQLite-checkpoints-003B57?logo=sqlite&logoColor=white">
@@ -21,7 +22,7 @@ English · [简体中文](README.zh-CN.md)
   <img alt="Redis" src="https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white">
   <img alt="Prometheus" src="https://img.shields.io/badge/Prometheus_client-0.21.1-E6522C?logo=prometheus&logoColor=white">
   <img alt="uv" src="https://img.shields.io/badge/uv-locked-DE5FE9?logo=uv&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-177_passed-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-182_passed-2ea44f">
   <br>
   <img alt="tau2-bench retail pass^1" src="https://img.shields.io/badge/%CF%84%C2%B2--bench_retail-pass%5E1_0.822-22c55e">
   <img alt="Unconfirmed writes" src="https://img.shields.io/badge/unconfirmed_writes-0%2F503-22c55e">
@@ -32,6 +33,7 @@ English · [简体中文](README.zh-CN.md)
 [Results](#-evaluation-results) ·
 [Architecture](#%EF%B8%8F-architecture) ·
 [Quick start](#-quick-start) ·
+[Web console](#%EF%B8%8F-web-console) ·
 [Configuration](#%EF%B8%8F-configuration) ·
 [Evaluation](#-reproducing-the-evaluation)
 
@@ -66,6 +68,7 @@ On the full τ²-bench retail benchmark (114 tasks × 3 trials) it reaches **pas
 - **📚 Policy as on-demand skills.** Each action section of the fixed policy becomes a skill. The prompt lists only names and descriptions; write tools stay locked by a hook until the agent loads the matching skill with `load_skill`.
 - **📝 Request checklist.** Each turn the model proposes the changes the customer asked for; code checks quotes verbatim and derives progress only from business events. Before a transfer to a human with handleable requests still open, the agent reminds the customer once.
 - **🛡️ Pre-publish check and response guard.** Drafts are checked against current order facts, items, amounts and session events; problems return as structured feedback for one rewrite, and the publish guard stays as the last line.
+- **🖥️ Live web console.** Chat on the left, the sandbox database in the middle, and the agent's path on the right: the LangGraph skeleton lights up as the turn walks it, and every node, model call, tool call and guard check opens to its prompt, output, tokens and cost. Each write shows up as a field-level before → after diff. Recorded sessions replay offline with no model calls.
 - **📊 Built-in evaluation harness.** One command runs the official τ² user simulator and DB/NL scoring with per-session databases, a shared cost ledger, resumable runs, paired task-bootstrap comparisons and trace viewing.
 
 ## 📈 Evaluation results
@@ -243,6 +246,35 @@ Keep `user_id` and `conv_id` unchanged across turns. Take sandbox identities fro
 | `GET /monitor`, `GET /metrics` | Monitoring and Prometheus metrics |
 | `POST /search` | Optional knowledge retrieval (off in lightweight mode) |
 
+## 🖥️ Web console
+
+A three-pane console for watching the agent work: **conversation**, **database** and **trace**.
+
+- **Conversation**: four preset sandbox scenarios (cancel, return, exchange, address update) with suggested messages, or type your own. Pending confirmations are flagged.
+- **Database** (read-only): the bound customer, their orders and the products involved, plus a *session state* tab with pending actions, confirmation decisions, the request checklist and business events. Every write is highlighted as before → after; snapshots of each turn can be revisited, and the whole sandbox can be searched.
+- **Trace**: the LangGraph skeleton for the chosen mode (single / multi-agent) highlights the path the turn took, and an execution tree grows in real time — workflow nodes → roles → model calls, tools, hooks and the publish guard. Each module is collapsed; open it to see the system prompt (folded), recent messages, output, token usage, cache hits and cost.
+- **Replay**: five recorded sessions ship in `web/replays/`; every live session is also recorded to `data/web-sessions/<id>/events.jsonl` (local project paths are redacted) and can be replayed later.
+
+Each live session copies the sandbox seed into its own database and runs the same lightweight profile as the evaluation (no Redis, ChromaDB or local models), with a per-session budget of CNY 0.5. A two-turn scenario costs roughly CNY 0.005–0.01 with DeepSeek.
+
+```powershell
+# Requires Node.js 18+ once, to build the frontend
+cd web; npm ci; npm run build; cd ..
+
+# Console on http://127.0.0.1:8010 (replay works without an API key)
+uv run python -m api.web_console
+```
+
+For frontend development, run the backend as above and `npm run dev` in `web/` (Vite on port 5173, proxying `/api`).
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /api/web/sessions` | New sandbox session (`mode`: `single` / `multi`) |
+| `POST /api/web/sessions/{id}/turns` | Send a message; the turn streams back as server-sent events |
+| `GET /api/web/sessions/{id}/db?q=` | Related entities, or search the whole sandbox |
+| `GET /api/web/sessions/{id}/snapshots/{turn}` | Database snapshot after a turn |
+| `GET /api/web/replays` | Built-in and recorded sessions |
+
 ## ⚙️ Configuration
 
 | Setting | Default | Notes |
@@ -317,6 +349,7 @@ monitor/      Performance monitoring and Prometheus metrics
 evaluation/   τ² bridge, evaluation harness, metrics, ledger, asset preparation
 skills/       Runtime business skills (policy sections + procedures)
 tests/        Offline tests without private datasets
+web/          React web console and built-in replays
 ```
 
 ## ⚠️ Scope and limitations

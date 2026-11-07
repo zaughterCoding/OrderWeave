@@ -14,6 +14,7 @@
   <img alt="MCP" src="https://img.shields.io/badge/MCP-1.12.4-000000?logo=anthropic&logoColor=white">
   <img alt="Anthropic SDK" src="https://img.shields.io/badge/Anthropic_SDK-0.40.0-D97757?logo=anthropic&logoColor=white">
   <img alt="FastAPI" src="https://img.shields.io/badge/FastAPI-0.115.5-009688?logo=fastapi&logoColor=white">
+  <img alt="React" src="https://img.shields.io/badge/React-18.3-61DAFB?logo=react&logoColor=black">
   <img alt="Pydantic" src="https://img.shields.io/badge/Pydantic-2.10.3-E92063?logo=pydantic&logoColor=white">
   <br>
   <img alt="SQLite" src="https://img.shields.io/badge/SQLite-checkpoints-003B57?logo=sqlite&logoColor=white">
@@ -21,7 +22,7 @@
   <img alt="Redis" src="https://img.shields.io/badge/Redis-7-DC382D?logo=redis&logoColor=white">
   <img alt="Prometheus" src="https://img.shields.io/badge/Prometheus_client-0.21.1-E6522C?logo=prometheus&logoColor=white">
   <img alt="uv" src="https://img.shields.io/badge/uv-locked-DE5FE9?logo=uv&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-177_passed-2ea44f">
+  <img alt="Tests" src="https://img.shields.io/badge/tests-182_passed-2ea44f">
   <br>
   <img alt="tau2-bench retail pass^1" src="https://img.shields.io/badge/%CF%84%C2%B2--bench_retail-pass%5E1_0.822-22c55e">
   <img alt="Unconfirmed writes" src="https://img.shields.io/badge/unconfirmed_writes-0%2F503-22c55e">
@@ -32,6 +33,7 @@
 [评测结果](#-评测结果) ·
 [架构](#%EF%B8%8F-架构) ·
 [快速开始](#-快速开始) ·
+[Web 控制台](#%EF%B8%8F-web-控制台) ·
 [配置](#%EF%B8%8F-配置) ·
 [复现评测](#-复现评测)
 
@@ -66,6 +68,7 @@ OrderWeave 是一个真正**办理订单**、而不只是回答问题的电商�
 - **📚 政策即按需 Skill**：固定政策按动作章节拆为 Skill，Prompt 只列名称与描述；在 Agent 用 `load_skill` 加载对应 Skill 之前，写工具由钩子锁定。
 - **📝 请求清单**：每轮由模型提议用户要求的变更，代码逐字校验引用，进度只由业务事件推出；仍有可办请求未完成就要转人工时，先提醒用户一次。
 - **🛡️ 发布前校验与回复守卫**：草稿对照当前订单事实、商品、金额和会话事件检查，问题以结构化反馈交回模型修订一次，发布守卫作为最后防线。
+- **🖥️ 实时 Web 控制台**：左侧对话、中间沙箱数据库、右侧 Agent 链路。LangGraph 骨架随本轮执行逐步点亮，每个节点、模型调用、工具调用与守卫检查都可展开查看 prompt、输出、token 与费用；每次写入以字段级“旧值 → 新值”呈现。录制的会话可离线回放，不调用模型。
 - **📊 内置评测 harness**：一条命令调用官方 τ² 用户模拟器与 DB／NL 评分，每会话独立数据库、共享费用账本、可断点续跑，支持按题配对 bootstrap 对比与轨迹查看。
 
 ## 📈 评测结果
@@ -243,6 +246,35 @@ Invoke-RestMethod http://127.0.0.1:8000/chat -Method Post -ContentType "applicat
 | `GET /monitor`、`GET /metrics` | 监控与 Prometheus 指标 |
 | `POST /search` | 可选知识检索（轻量模式下关闭） |
 
+## 🖥️ Web 控制台
+
+三列控制台，直观观察 Agent 如何工作：**对话**、**数据库**、**链路**。
+
+- **对话**：四个预置沙箱场景（取消、退货、换货、改地址）及建议话术，也可自由输入；待确认的操作会醒目标出。
+- **数据库**（只读）：已绑定的用户、其订单与涉及商品；“会话状态”页展示待确认动作、确认判定、请求清单与业务事件。每次写入以“旧值 → 新值”高亮，可回看每轮快照，也可搜索整个沙箱。
+- **链路**：按所选模式（单 / 多智能体）显示 LangGraph 骨架并点亮本轮走过的路径；执行树实时生长——工作图节点 → 角色 → 模型调用、工具、钩子与发布守卫。每个模块默认折叠，展开可查看系统提示（折叠显示）、最近消息、输出、token 用量、缓存命中与费用。
+- **回放**：`web/replays/` 内置五段录制；每个实时会话也会录制到 `data/web-sessions/<id>/events.jsonl`（本机项目路径已脱敏），之后可回放。
+
+每个实时会话都会把沙箱种子复制为独立数据库，使用与评测相同的轻量配置（不需要 Redis、ChromaDB 或本地模型），单会话预算 0.5 元。使用 DeepSeek 时，两轮的场景约 0.005—0.01 元。
+
+```powershell
+# 首次需要 Node.js 18+ 构建前端
+cd web; npm ci; npm run build; cd ..
+
+# 控制台：http://127.0.0.1:8010（回放无需 API Key）
+uv run python -m api.web_console
+```
+
+前端开发时按上面启动后端，再在 `web/` 下运行 `npm run dev`（Vite 端口 5173，`/api` 自动代理）。
+
+| 接口 | 用途 |
+| --- | --- |
+| `POST /api/web/sessions` | 新建沙箱会话（`mode`：`single` / `multi`） |
+| `POST /api/web/sessions/{id}/turns` | 发送消息，本轮事件以 SSE 流式返回 |
+| `GET /api/web/sessions/{id}/db?q=` | 相关实体，或搜索整个沙箱 |
+| `GET /api/web/sessions/{id}/snapshots/{turn}` | 某轮结束后的数据库快照 |
+| `GET /api/web/replays` | 内置与已录制的会话 |
+
 ## ⚙️ 配置
 
 | 配置项 | 默认值 | 说明 |
@@ -317,6 +349,7 @@ monitor/      性能监控与 Prometheus 指标
 evaluation/   τ² 桥接、评测 harness、指标、账本、资产准备
 skills/       运行时业务 Skill（政策章节＋办理流程）
 tests/        不依赖私有数据集的离线测试
+web/          React Web 控制台与内置回放
 ```
 
 ## ⚠️ 适用范围与限制

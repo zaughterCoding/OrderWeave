@@ -241,6 +241,24 @@ def diff_snapshots(previous: Dict[str, Any], current: Dict[str, Any],
     return changes
 
 
+def asset_paths() -> tuple:
+    """种子与政策：优先用 .env 的 RETAIL_SEED_PATH／RETAIL_POLICY_PATH（快速开始的准备目录），否则用评测数据目录。"""
+    from evaluation.harness import config as cfg
+
+    def pick(name: str, default: Path) -> Path:
+        value = os.getenv(name, "").strip()
+        if not value:
+            return default
+        path = Path(value).expanduser()
+        return (path if path.is_absolute() else ROOT / path).resolve()
+
+    seed, policy = pick("RETAIL_SEED_PATH", cfg.SEED_PATH), pick("RETAIL_POLICY_PATH", cfg.POLICY_PATH)
+    for path in (seed, policy):
+        if not path.is_file():
+            raise RuntimeError(f"sandbox asset not found: {path}; run `uv run python -m evaluation.prepare_assets --download`")
+    return seed, policy
+
+
 def redact_paths(text: str) -> str:
     """录制文件可能被公开分享：提示词里的本机项目路径替换为占位符。"""
     root = str(ROOT)
@@ -312,7 +330,7 @@ class SessionManager:
         path = self.root / f"_template-{language}" / "retail.sqlite"
         if not path.exists():
             path.parent.mkdir(parents=True, exist_ok=True)
-            RetailStore(path, cfg.SEED_PATH, language=language)
+            RetailStore(path, asset_paths()[0], language=language)
         return path
 
     async def create(self, mode: str, language: str) -> WebSession:
@@ -368,8 +386,9 @@ async def build_session_runtime(folder: Path, mode: str, language: str) -> Any:
     from evaluation.harness import config as cfg
 
     model = cfg.model_settings()
+    seed_path, policy_path = asset_paths()
     config = RetailRuntimeConfig(
-        db_path=folder / "retail.sqlite", seed_path=cfg.SEED_PATH, policy_path=cfg.POLICY_PATH,
+        db_path=folder / "retail.sqlite", seed_path=seed_path, policy_path=policy_path,
         knowledge_path=folder / "unused-knowledge.jsonl", knowledge_collection="web_unused",
         ledger_path=folder / "ledger.sqlite", event_log_path=folder / "service-events.jsonl",
         budget_cny=SESSION_BUDGET_CNY, input_price_cny_per_mtok=cfg.INPUT_CNY_PER_MTOK,
