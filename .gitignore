@@ -78,6 +78,16 @@
 !/tests/test_qwen_reranker.py
 !/tests/test_public_release.py
 !/tests/test_web_console.py
+!/web/
+/web/*
+!/web/package.json
+!/web/package-lock.json
+!/web/index.html
+!/web/tsconfig.json
+!/web/vite.config.ts
+!/web/src/
+!/web/public/
+!/web/replays/
 
 # 运行与评测资料不分发；忽略规则不会清除旧Git历史。
 /docs/
@@ -104,3 +114,5 @@ __pycache__/
 .venv-tau/
 venv/
 logs/
+# Web 控制台内置演示回放（公开τ沙箱数据录制）
+!/web/replays/*.jsonl
