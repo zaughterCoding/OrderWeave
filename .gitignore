@@ -77,6 +77,7 @@
 !/tests/test_json_stage_budgets.py
 !/tests/test_qwen_reranker.py
 !/tests/test_public_release.py
+!/tests/test_web_console.py
 
 # 运行与评测资料不分发；忽略规则不会清除旧Git历史。
 /docs/

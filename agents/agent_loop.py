@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
 from agents.tools import validate_tool_input
+from monitor import live_events
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,17 @@ def _usage(resp: Any) -> Dict[str, int]:
             "cache_write": read("cache_creation_input_tokens"), "output": read("output_tokens")}
 
 
-async def run_tool_loop(
+async def run_tool_loop(agent: Any, req: Any, messages: List[Dict[str, Any]], tools: Dict[str, Any],
+                        hooks: Sequence[LoopHook], *, system: str, stop_check: Any) -> LoopResult:
+    """执行工具循环；stop_check(req, ex) 为真时异常直接上抛（预算等全局停止）。"""
+    with live_events.span("agent", agent.agent_type.value, tools=sorted(tools),
+                          hooks=[h.name for h in hooks]) as live:
+        loop_result = await _run_tool_loop(agent, req, messages, tools, hooks, system=system, stop_check=stop_check)
+        live.set(content=loop_result.content, tools_used=loop_result.tools_used)
+        return loop_result
+
+
+async def _run_tool_loop(
     agent: Any,
     req: Any,
     messages: List[Dict[str, Any]],
@@ -180,6 +191,7 @@ async def run_tool_loop(
                     # 草稿未发出：带上具体问题让模型改写一次；修订对话不写入日志。
                     revisions_left -= 1
                     ctx.spans.append({"kind": "revision", "agent": agent_name, "feedback": feedback[:500]})
+                    live_events.emit("revision", agent_name, draft=draft, feedback=feedback)
                     messages.append({"role": "assistant", "content": [{"type": "text", "text": draft or "(empty)"}]})
                     messages.append({"role": "user", "content": [{"type": "text", "text": feedback}]})
                     continue
@@ -272,6 +284,10 @@ async def run_tool_loop(
                 if getattr(agent, "capture_tool_results", False):
                     trace["result"] = value
                 tool_traces.append(trace)
+                live_events.emit("tool", name, agent=agent_name, input=dict(args), result=value,
+                                 success=call_success, result_success=result_success, error=error_text,
+                                 blocked_by=blocked_by, skipped=skipped, not_executed=not_executed,
+                                 latency_ms=latency)
                 ctx.spans.append({"kind": "tool", "agent": agent_name, "tool": name, "success": call_success,
                                   "result_success": result_success, "blocked_by": blocked_by,
                                   "latency_ms": latency})

@@ -18,6 +18,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+from monitor import live_events
 from evaluation.retail_budget import (
     INPUT_COUNT_BASIS,
     REQUEST_FORMAT_OVERHEAD_TOKENS,
@@ -587,6 +588,29 @@ class RetailLedger:
         return [dict(row) for row in rows]
 
 
+def _live_blocks(content: Any) -> List[Dict[str, Any]]:
+    """把响应内容块转为控制台可展示的文本与工具调用。"""
+    blocks: List[Dict[str, Any]] = []
+    for block in content or []:
+        get = (lambda k: block.get(k)) if isinstance(block, dict) else (lambda k: getattr(block, k, None))
+        kind = get("type")
+        if kind == "text" and get("text"):
+            blocks.append({"type": "text", "text": get("text")})
+        elif kind == "tool_use":
+            blocks.append({"type": "tool_use", "name": get("name"), "input": get("input") or {}})
+    return blocks
+
+
+def _live_request(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """请求摘要：完整系统提示与最近消息；完整消息日志过长，只给末尾几条与总数。"""
+    if not live_events.active():
+        return {}
+    messages = list(kwargs.get("messages") or [])
+    return {"model": kwargs.get("model"), "system": kwargs.get("system") or "",
+            "messages_total": len(messages), "messages_tail": messages[-4:],
+            "tools": [t.get("name") for t in kwargs.get("tools") or [] if isinstance(t, dict)]}
+
+
 class _BudgetedMessages:
     def __init__(
         self,
@@ -613,20 +637,29 @@ class _BudgetedMessages:
             self._ledger.consume_turn_request(self._stage)
         reservation = self._ledger.reserve(self._stage, kwargs)
         started = time.monotonic()
-        try:
-            response = await self._inner.create(**kwargs)
-        except Exception as ex:
-            self._ledger.settle_failure(
+        with live_events.span("model", self._stage, **_live_request(kwargs)) as live:
+            try:
+                response = await self._inner.create(**kwargs)
+            except Exception as ex:
+                self._ledger.settle_failure(
+                    reservation,
+                    str(ex),
+                    (time.monotonic() - started) * 1000,
+                )
+                raise
+            charged = self._ledger.settle_success(
                 reservation,
-                str(ex),
+                getattr(response, "usage", None),
                 (time.monotonic() - started) * 1000,
             )
-            raise
-        self._ledger.settle_success(
-            reservation,
-            getattr(response, "usage", None),
-            (time.monotonic() - started) * 1000,
-        )
+            if live.id is not None:
+                input_main, output, cache_read, cache_write = self._ledger._usage_values(
+                    getattr(response, "usage", None))
+                live.set(output=_live_blocks(getattr(response, "content", None)),
+                         stop_reason=getattr(response, "stop_reason", None),
+                         usage={"input": input_main, "output": output,
+                                "cache_read": cache_read, "cache_write": cache_write},
+                         cost_cny=charged)
         return response
 
 

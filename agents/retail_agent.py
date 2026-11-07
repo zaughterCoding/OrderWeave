@@ -35,6 +35,7 @@ from agents.retail_tools import RETAIL_READ_ONLY_TOOLS, retail_tool_scope, retai
 from agents.retail_hooks import single_agent_hooks
 from agents.retail_response_guard import constrain_response
 from mcp_tools.retail_store import RetailStore, SupportStateError
+from monitor import live_events
 
 logger = logging.getLogger(__name__)
 
@@ -416,8 +417,10 @@ class RetailService:
 
         history = self.store.visible_history(client_user_id, conv_id)
         previous = next((h["content"] for h in reversed(history) if h.get("role") == "assistant"), "")
-        decisions = await classify_confirmations(self.confirmation_client, self.confirmation_model,
-                                                 message, previous, displayed)
+        with live_events.span("step", "confirmation_judge", pending=[p.get("op_id") for p in displayed]) as live:
+            decisions = await classify_confirmations(self.confirmation_client, self.confirmation_model,
+                                                     message, previous, displayed)
+            live.set(decisions=decisions)
         if decisions is not None:
             self.store.record_confirmation_decisions(client_user_id, conv_id, turn, decisions, "classifier")
 
@@ -432,10 +435,13 @@ class RetailService:
             return {"skipped": "already_processed"}
         history = self.store.visible_history(client_user_id, conv_id)
         previous = next((h["content"] for h in reversed(history) if h.get("role") == "assistant"), "")
-        ops = await extract(self.fact_client, self.confirmation_model, facts, previous, message)
+        with live_events.span("step", "task_facts") as live:
+            ops = await extract(self.fact_client, self.confirmation_model, facts, previous, message)
+            live.set(ops=ops)
         if ops is None:
             return {"error": "extraction_failed"}
         out = apply_ops(facts, ops, message, turn)
+        live_events.emit("check", "task_facts_validate", accepted=out["accepted"], rejected=out["rejected"])
         self.store.save_task_facts(client_user_id, conv_id, out["facts"], turn)
         return {"accepted": [a["action"] for a in out["accepted"]],
                 "rejected": [r["reason"] for r in out["rejected"]]}
@@ -451,10 +457,13 @@ class RetailService:
             return {"skipped": "already_processed"}
         history = self.store.visible_history(client_user_id, conv_id)
         previous = next((h["content"] for h in reversed(history) if h.get("role") == "assistant"), "")
-        ops = await extract(self.plan_client, self.confirmation_model, plan, previous, message)
+        with live_events.span("step", "request_plan") as live:
+            ops = await extract(self.plan_client, self.confirmation_model, plan, previous, message)
+            live.set(ops=ops)
         if ops is None:
             return {"error": "extraction_failed"}
         out = apply_ops(plan, ops, message, previous, turn, after_event_id)
+        live_events.emit("check", "request_plan_validate", accepted=out["accepted"], rejected=out["rejected"])
         self.store.save_request_plan(client_user_id, conv_id, out["plan"], turn)
         return {"accepted": [a["action"] for a in out["accepted"]],
                 "rejected": [r["reason"] for r in out["rejected"]]}
@@ -648,6 +657,7 @@ class RetailService:
             if context_text:
                 state["memory"] = context_text
             user_content = engine.user_blocks(turn, state, message)
+            live_events.emit("context", "compile", compaction=compaction, state=state, user_blocks=user_content)
             # 完整历史已在消息中，不再注入背景消息对；各角色按自身工具集渲染同一份日志。
             request.context = ""
             request.transcript = []
@@ -750,6 +760,7 @@ class RetailService:
             language=self.language,
         )
         guarded.record["facts_read_ms"] = round(facts_read_ms, 3)
+        live_events.emit("guard", "response_guard", draft=text, final=guarded.text, record=guarded.record)
         text = guarded.text
         if self.plan_client is not None:
             from agents.retail_plan import reminder

@@ -13,6 +13,7 @@ from typing import Any, TypedDict
 
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.errors import GraphInterrupt
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 from langsmith import tracing_context
@@ -21,6 +22,7 @@ from agents.agent_orchestrator import AgentResponse, AgentType, OrchestratorResu
 from agents.retail_handoff import RoleHandoff, RoleOutcome, build_role_handoff, role_outcome
 from agents.retail_support import analyze_message
 from mcp_tools.retail_store import evaluate_confirmation
+from monitor import live_events
 
 
 class RetailGraphState(TypedDict, total=False):
@@ -70,11 +72,11 @@ class RetailWorkflow:
         saver = AsyncSqliteSaver(self._connection)
         builder = StateGraph(RetailGraphState)
         for name in ("prepare_state", "route_agent", "run_agent", "leave_return", "cancel_return", "update_result", "wait_user", "resume_input", "recover_result"):
-            builder.add_node(name, getattr(self, "_" + name))
+            builder.add_node(name, self._live_node(name, getattr(self, "_" + name)))
         for name in ("select_role", "handoff_role", "compose_roles"):
-            builder.add_node(name, getattr(self, "_" + name))
+            builder.add_node(name, self._live_node(name, getattr(self, "_" + name)))
         for role in ("general", "technical", "billing", "escalation"):
-            builder.add_node(role, partial(self._run_role, role=role))
+            builder.add_node(role, self._live_node(role, partial(self._run_role, role=role)))
             builder.add_edge(role, "handoff_role")
         builder.add_conditional_edges(START, lambda s: "recover_result" if s.get("phase") == "recovering" else "prepare_state")
         builder.add_edge("prepare_state", "route_agent")
@@ -90,6 +92,21 @@ class RetailWorkflow:
         builder.add_edge("resume_input", "prepare_state")
         builder.add_edge("recover_result", END)
         self._graph = builder.compile(checkpointer=saver)
+
+    @staticmethod
+    def _live_node(name, fn):
+        """节点进出发实时事件；只观测，不改变节点返回值。"""
+        async def run(state):
+            with live_events.span("node", name, phase=state.get("phase"), route=state.get("route")) as live:
+                try:
+                    out = await fn(state)
+                except GraphInterrupt:
+                    live.status = "waiting"
+                    raise
+                if live.id is not None and isinstance(out, dict):
+                    live.set(**{k: v for k, v in out.items() if k != "node_path"})
+                return out
+        return run
 
     @staticmethod
     def _step(state, name, **values):
@@ -125,6 +142,10 @@ class RetailWorkflow:
                 call["response"] = agent.finish_turn(req, prepared, call["agent_started"])
                 return self._step(state, "select_role", next_role="update_result")
             supporting = [r for r in prepared.supporting_agents if r != prepared.primary_agent][:2]
+            live_events.emit("route", "select_role", primary=prepared.primary_agent.value,
+                             supporting=[r.value for r in supporting], reason=prepared.reason,
+                             confidence=getattr(prepared, "confidence", None),
+                             intent=getattr(req.intent, "value", req.intent), intent_group=req.intent_group)
             call.update(decision=prepared, supporting=supporting, responses=[],
                         previous_role_result=call.get("previous_role_result", {}))
             queue = [role.value for role in supporting] + [prepared.primary_agent.value]
