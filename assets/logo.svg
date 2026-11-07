@@ -1,27 +1,37 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="OrderWeave">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#3730a3"/><stop offset="1" stop-color="#0f172a"/></linearGradient>
-    <linearGradient id="warp" gradientUnits="userSpaceOnUse" x1="0" y1="46" x2="0" y2="210"><stop offset="0" stop-color="#67e8f9"/><stop offset="1" stop-color="#0e7490"/></linearGradient>
-    <linearGradient id="weft" gradientUnits="userSpaceOnUse" x1="46" y1="0" x2="210" y2="0"><stop offset="0" stop-color="#fde68a"/><stop offset="1" stop-color="#d97706"/></linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#ecfdf5"/>
+    </linearGradient>
+    <linearGradient id="w1" gradientUnits="userSpaceOnUse" x1="0" y1="60" x2="0" y2="196">
+      <stop offset="0" stop-color="#6ee7b7"/>
+      <stop offset="1" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="w2" gradientUnits="userSpaceOnUse" x1="0" y1="60" x2="0" y2="196">
+      <stop offset="0" stop-color="#86efac"/>
+      <stop offset="1" stop-color="#16a34a"/>
+    </linearGradient>
+    <linearGradient id="w3" gradientUnits="userSpaceOnUse" x1="0" y1="60" x2="0" y2="196">
+      <stop offset="0" stop-color="#d9f99d"/>
+      <stop offset="1" stop-color="#65a30d"/>
+    </linearGradient>
+    <linearGradient id="weft" gradientUnits="userSpaceOnUse" x1="48" y1="0" x2="208" y2="0">
+      <stop offset="0" stop-color="#064e3b"/>
+      <stop offset="1" stop-color="#10b981"/>
+    </linearGradient>
   </defs>
-  <rect width="256" height="256" rx="56" fill="url(#bg)"/>
-  <g fill="none" stroke-width="30">
-    <path d="M46 78H210" stroke="url(#weft)" stroke-linecap="round"/>
-    <path d="M46 128H210" stroke="url(#weft)" stroke-linecap="round"/>
-    <path d="M46 178H210" stroke="url(#weft)" stroke-linecap="round"/>
-    <path d="M78 46V210" stroke="#1b1a45" stroke-width="40" stroke-linecap="round"/>
-    <path d="M78 46V210" stroke="url(#warp)" stroke-linecap="round"/>
-    <path d="M128 46V210" stroke="#1b1a45" stroke-width="40" stroke-linecap="round"/>
-    <path d="M128 46V210" stroke="url(#warp)" stroke-linecap="round"/>
-    <path d="M178 46V210" stroke="#1b1a45" stroke-width="40" stroke-linecap="round"/>
-    <path d="M178 46V210" stroke="url(#warp)" stroke-linecap="round"/>
-    <path d="M58 128H98" stroke="#1b1a45" stroke-width="40"/>
-    <path d="M57 128H99" stroke="url(#weft)"/>
-    <path d="M108 78H148" stroke="#1b1a45" stroke-width="40"/>
-    <path d="M107 78H149" stroke="url(#weft)"/>
-    <path d="M108 178H148" stroke="#1b1a45" stroke-width="40"/>
-    <path d="M107 178H149" stroke="url(#weft)"/>
-    <path d="M158 128H198" stroke="#1b1a45" stroke-width="40"/>
-    <path d="M157 128H199" stroke="url(#weft)"/>
+  <rect x="4" y="4" width="248" height="248" rx="56" fill="url(#bg)" stroke="#d1fae5" stroke-width="4"/>
+  <!-- 斜切让三根经线像向前的速度线 -->
+  <g fill="none" stroke-linecap="round" transform="translate(36 0) skewX(-18)">
+    <path d="M90 66V190" stroke="url(#w1)" stroke-width="26"/>
+    <path d="M130 66V190" stroke="url(#w2)" stroke-width="26"/>
+    <path d="M170 66V190" stroke="url(#w3)" stroke-width="26"/>
+    <!-- 纬线：一道上扬弧线，压过第一、三根 -->
+    <path d="M50 158C96 158 150 98 210 98" stroke="#ffffff" stroke-width="38"/>
+    <path d="M50 158C96 158 150 98 210 98" stroke="url(#weft)" stroke-width="26"/>
+    <!-- 中间交点让经线压回纬线，形成上下交织 -->
+    <path d="M130 96V160" stroke="#ffffff" stroke-width="38" stroke-linecap="butt"/>
+    <path d="M130 92V164" stroke="url(#w2)" stroke-width="26" stroke-linecap="butt"/>
   </g>
 </svg>
